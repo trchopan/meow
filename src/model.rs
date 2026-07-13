@@ -1,0 +1,106 @@
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, atomic::AtomicU8},
+};
+
+use clap::ValueEnum;
+use iroh::{EndpointId, endpoint::Connection};
+use rdev::EventType;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Side {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActiveTarget {
+    Local,
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl ActiveTarget {
+    pub(crate) fn to_u8(self) -> u8 {
+        match self {
+            Self::Local => 0,
+            Self::Left => 1,
+            Self::Right => 2,
+            Self::Up => 3,
+            Self::Down => 4,
+        }
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Left,
+            2 => Self::Right,
+            3 => Self::Up,
+            4 => Self::Down,
+            _ => Self::Local,
+        }
+    }
+
+    pub(crate) fn to_side(self) -> Option<Side> {
+        match self {
+            Self::Local => None,
+            Self::Left => Some(Side::Left),
+            Self::Right => Some(Side::Right),
+            Self::Up => Some(Side::Up),
+            Self::Down => Some(Side::Down),
+        }
+    }
+}
+
+impl From<Side> for ActiveTarget {
+    fn from(value: Side) -> Self {
+        match value {
+            Side::Left => Self::Left,
+            Side::Right => Self::Right,
+            Side::Up => Self::Up,
+            Side::Down => Self::Down,
+        }
+    }
+}
+
+impl fmt::Display for ActiveTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Local => "local",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+        };
+        write!(f, "{s}")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturedInput {
+    pub(crate) target: ActiveTarget,
+    pub(crate) event: EventType,
+}
+
+#[derive(Clone)]
+pub(crate) struct RemotePeer {
+    pub(crate) connection: Connection,
+    pub(crate) remote_id: EndpointId,
+    pub(crate) name: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostState {
+    pub(crate) endpoint_id: EndpointId,
+    pub(crate) active_target: Arc<AtomicU8>,
+    pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
+}
