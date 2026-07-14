@@ -4,6 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -13,10 +14,13 @@ use tracing::{info, warn};
 
 use crate::{
     host_mouse,
-    model::{ActiveTarget, CapturedEvent, CapturedInput},
+    model::{ActiveTarget, CapturedEvent, CapturedInput, ScreenEdge},
 };
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
+const EDGE_TOLERANCE_PX: f64 = 2.0;
+const EDGE_PUSH_THRESHOLD_PX: f64 = 16.0;
+const EDGE_PUSH_RESET_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub(crate) struct DetachChord {
@@ -38,6 +42,7 @@ pub(crate) fn run_input_grab(
 ) -> Result<()> {
     let pressed_keys: Arc<Mutex<HashSet<Key>>> = Arc::new(Mutex::new(HashSet::new()));
     let last_mouse_pos: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
+    let local_edge_push: Arc<Mutex<EdgePushTracker>> = Arc::new(Mutex::new(EdgePushTracker::new()));
 
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         {
@@ -54,13 +59,6 @@ pub(crate) fn run_input_grab(
         }
 
         let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
-
-        if matches!(target, ActiveTarget::Local) {
-            if let EventType::MouseMove { x, y } = event.event_type {
-                let mut last_pos = last_mouse_pos.lock().expect("mouse pos mutex poisoned");
-                *last_pos = Some((x, y));
-            }
-        }
 
         let (is_ctrl_down, is_alt_down, is_meta_down, is_shift_down) = {
             let keys = pressed_keys.lock().expect("pressed key mutex poisoned");
@@ -102,7 +100,37 @@ pub(crate) fn run_input_grab(
         }
 
         match target {
-            ActiveTarget::Local => Some(event),
+            ActiveTarget::Local => {
+                if let EventType::MouseMove { x, y } = event.event_type {
+                    let (dx, dy) = {
+                        let mut last_pos = last_mouse_pos.lock().expect("mouse pos mutex poisoned");
+                        let (dx, dy) = if let Some((last_x, last_y)) = *last_pos {
+                            (x - last_x, y - last_y)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        *last_pos = Some((x, y));
+                        (dx, dy)
+                    };
+
+                    let now = Instant::now();
+                    let mut edge_push = local_edge_push.lock().expect("local edge mutex poisoned");
+                    edge_push.reset_if_stale(now);
+                    let push = detect_host_edge_push(x, y, dx, dy);
+                    if let Some((edge, push_amount)) = push {
+                        if edge_push.register_outward_push(edge, push_amount, now) {
+                            let _ = tx.send(CapturedInput {
+                                target: ActiveTarget::Local,
+                                event: CapturedEvent::HostEdgeReached { edge },
+                            });
+                        }
+                    } else {
+                        edge_push.reset();
+                    }
+                }
+
+                Some(event)
+            }
             _ => {
                 let captured_event = match event.event_type {
                     EventType::MouseMove { x, y } => {
@@ -264,6 +292,76 @@ pub(crate) fn default_detach_key() -> String {
 pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
     const MAX_RELATIVE_MOUSE_DELTA: i32 = 10_000;
     (delta.round() as i32).clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA)
+}
+
+fn detect_host_edge_push(x: f64, y: f64, dx: f64, dy: f64) -> Option<(ScreenEdge, f64)> {
+    let (width, height) = rdev::display_size().unwrap_or((0, 0));
+    let max_x = width.saturating_sub(1) as f64;
+    let max_y = height.saturating_sub(1) as f64;
+
+    if dx < 0.0 && x <= EDGE_TOLERANCE_PX {
+        return Some((ScreenEdge::Left, -dx));
+    }
+    if dx > 0.0 && x >= (max_x - EDGE_TOLERANCE_PX).max(0.0) {
+        return Some((ScreenEdge::Right, dx));
+    }
+    if dy < 0.0 && y <= EDGE_TOLERANCE_PX {
+        return Some((ScreenEdge::Up, -dy));
+    }
+    if dy > 0.0 && y >= (max_y - EDGE_TOLERANCE_PX).max(0.0) {
+        return Some((ScreenEdge::Down, dy));
+    }
+
+    None
+}
+
+struct EdgePushTracker {
+    edge: Option<ScreenEdge>,
+    accumulated_px: f64,
+    last_update: Option<Instant>,
+}
+
+impl EdgePushTracker {
+    fn new() -> Self {
+        Self {
+            edge: None,
+            accumulated_px: 0.0,
+            last_update: None,
+        }
+    }
+
+    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: f64, now: Instant) -> bool {
+        if push_px <= 0.0 {
+            return false;
+        }
+
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.accumulated_px = 0.0;
+        }
+
+        self.accumulated_px += push_px;
+        self.last_update = Some(now);
+        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
+            self.accumulated_px = 0.0;
+            return true;
+        }
+        false
+    }
+
+    fn reset_if_stale(&mut self, now: Instant) {
+        if let Some(last_update) = self.last_update
+            && now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT
+        {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.edge = None;
+        self.accumulated_px = 0.0;
+        self.last_update = None;
+    }
 }
 
 #[cfg(test)]

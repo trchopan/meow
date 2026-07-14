@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use crate::model::Side;
+use crate::model::{RemotePointerMode, Side};
 
 #[derive(Parser, Debug)]
 #[command(name = "meow", version, about = "Control nearby machines with iroh")]
@@ -22,8 +22,15 @@ pub(crate) enum Command {
     Left,
     Up,
     Down,
+    PointerMode(PointerModeArgs),
     Status,
     Stop,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct PointerModeArgs {
+    #[arg(value_enum)]
+    pub(crate) mode: RemotePointerMode,
 }
 
 #[derive(Debug, clap::Args)]

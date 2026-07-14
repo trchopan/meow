@@ -26,6 +26,7 @@ pub(crate) fn print_status_response(message: &str, status: Option<&StatusPayload
     if let Some(status) = status {
         println!("endpoint: {}", status.endpoint_id);
         println!("active: {}", status.active);
+        println!("pointer_mode: {}", status.pointer_mode);
         println!("attached: {}", format_attached_sides(&status.attached));
     }
 }

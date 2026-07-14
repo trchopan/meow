@@ -50,10 +50,12 @@ cargo run -- host
    ```sh
    meow local
    meow right
-   meow left
-   meow up
-   meow down
-   ```
+    meow left
+    meow up
+    meow down
+    meow pointer-mode edge-to-edge
+    meow pointer-mode confine
+    ```
 
 ## Commands
 
@@ -63,6 +65,7 @@ Daemon and control commands:
 meow host
 meow status
 meow stop
+meow pointer-mode <edge-to-edge|confine>
 meow reset-identity
 meow rotate-secret
 meow test-inject
@@ -79,6 +82,20 @@ meow attach <host-id> <secret> --side <left|right|up|down>
 When input is currently forwarded to a remote machine, press `ctrl+alt+cmd+l` on the host to force control back to local.
 
 You can customize this by editing `detach_key` in `host_state.json`.
+
+## Pointer mode
+
+`meow` supports two remote pointer behaviors:
+
+- `edge-to-edge` (default): moving to a host edge switches control to the connected client on that side; reaching the client edge facing back toward the host returns control to local host input.
+- `confine`: keep control on the remote even at client edges; use the host detach chord to return to local.
+
+Set mode while host daemon is running:
+
+```sh
+meow pointer-mode edge-to-edge
+meow pointer-mode confine
+```
 
 ## State files
 
@@ -99,7 +116,8 @@ Example `host_state.json`:
   "schema_version": 1,
   "endpoint_id": "...",
   "attach_secret": "...",
-  "detach_key": "ctrl+alt+cmd+l"
+  "detach_key": "ctrl+alt+cmd+l",
+  "remote_pointer_mode": "edge_to_edge"
 }
 ```
 

@@ -10,15 +10,16 @@ use tracing::{error, info, warn};
 
 use crate::{
     host_mouse,
-    model::{ActiveTarget, HostState, Side},
+    model::{ActiveTarget, HostState, RemotePointerMode, Side},
     presentation::print_status_response,
-    state::socket_path,
+    state::{host_state_path, load_or_create_host_state, socket_path, write_host_state_file},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum IpcCommand {
     Switch { target: ActiveTarget },
+    PointerMode { mode: RemotePointerMode },
     Status,
     Stop,
 }
@@ -34,6 +35,7 @@ pub(crate) struct IpcResponse {
 pub(crate) struct StatusPayload {
     pub(crate) endpoint_id: String,
     pub(crate) active: ActiveTarget,
+    pub(crate) pointer_mode: RemotePointerMode,
     pub(crate) attached: Vec<Side>,
 }
 
@@ -86,6 +88,7 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
 
     let response = match command {
         IpcCommand::Switch { target } => switch_target(&state, target).await,
+        IpcCommand::PointerMode { mode } => set_pointer_mode(&state, mode).await,
         IpcCommand::Status => IpcResponse {
             ok: true,
             message: "host daemon is running".to_string(),
@@ -131,6 +134,32 @@ async fn switch_target(state: &HostState, target: ActiveTarget) -> IpcResponse {
         message: format!("switched target to {target}"),
         status: Some(status_payload(state).await),
     }
+}
+
+async fn set_pointer_mode(state: &HostState, mode: RemotePointerMode) -> IpcResponse {
+    state
+        .remote_pointer_mode
+        .store(mode.to_u8(), Ordering::Relaxed);
+
+    match persist_pointer_mode(state.endpoint_id, mode) {
+        Ok(()) => IpcResponse {
+            ok: true,
+            message: format!("set pointer mode to {mode}"),
+            status: Some(status_payload(state).await),
+        },
+        Err(err) => IpcResponse {
+            ok: false,
+            message: format!("failed to persist pointer mode: {err:#}"),
+            status: Some(status_payload(state).await),
+        },
+    }
+}
+
+fn persist_pointer_mode(endpoint_id: iroh::EndpointId, mode: RemotePointerMode) -> Result<()> {
+    let path = host_state_path()?;
+    let mut persisted = load_or_create_host_state(endpoint_id)?;
+    persisted.remote_pointer_mode = mode;
+    write_host_state_file(&path, &persisted)
 }
 
 pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, context: &str) {
@@ -190,6 +219,7 @@ async fn status_payload(state: &HostState) -> StatusPayload {
     StatusPayload {
         endpoint_id: state.endpoint_id.to_string(),
         active: ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)),
+        pointer_mode: RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed)),
         attached,
     }
 }

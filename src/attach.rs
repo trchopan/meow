@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use enigo::{Enigo, MouseControllable};
@@ -10,10 +10,16 @@ use uuid::Uuid;
 
 use crate::{
     cli::AttachArgs,
+    model::ScreenEdge,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, MAX_MSG_SIZE, WireMessage, read_framed, write_framed,
+        ALPN, AuthRequest, AuthResponse, MAX_MSG_SIZE, WireMessage, read_framed, send_wire_message,
+        write_framed,
     },
 };
+
+const EDGE_TOLERANCE_PX: i32 = 2;
+const EDGE_PUSH_THRESHOLD_PX: i32 = 16;
+const EDGE_PUSH_RESET_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let host_id = EndpointId::from_str(&args.host_id).context("invalid host endpoint id")?;
@@ -50,6 +56,8 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         .probe_received
         .then(|| ClientReceiveProbe::new(&mut enigo, args.probe_duration_secs));
     let probe_start = Instant::now();
+    let mut last_signaled_edge: Option<ScreenEdge> = None;
+    let mut edge_push = EdgePushTracker::new();
 
     loop {
         if let Some(probe) = probe.as_ref()
@@ -94,10 +102,132 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 }
                 debug!("client received relative mouse move: dx={dx}, dy={dy}");
                 if probe.is_none() && !args.no_inject {
+                    let before = enigo.mouse_location();
                     enigo.mouse_move_relative(dx, dy);
+                    let after = enigo.mouse_location();
+                    let display = enigo.main_display_size();
+                    edge_push.reset_if_stale(Instant::now());
+                    let push = detect_client_edge_push(before, after, display, dx, dy);
+                    let Some((edge, push_amount)) = push else {
+                        edge_push.reset();
+                        last_signaled_edge = None;
+                        continue;
+                    };
+
+                    if edge_push.register_outward_push(edge, push_amount, Instant::now())
+                        && Some(edge) != last_signaled_edge
+                    {
+                        let message = WireMessage::ClientEdgeReached { edge };
+                        if let Err(err) = send_wire_message(&connection, &message).await {
+                            warn!("failed sending edge feedback to host: {err:#}");
+                        } else {
+                            debug!("sent edge feedback to host: {:?}", edge);
+                            last_signaled_edge = Some(edge);
+                        }
+                    }
                 }
             }
+            WireMessage::ClientEdgeReached { .. } => {
+                debug!("ignoring unexpected host->client edge feedback message");
+            }
         }
+    }
+}
+
+fn detect_client_edge_push(
+    before: (i32, i32),
+    after: (i32, i32),
+    display: (i32, i32),
+    dx: i32,
+    dy: i32,
+) -> Option<(ScreenEdge, i32)> {
+    let max_x = display.0.saturating_sub(1);
+    let max_y = display.1.saturating_sub(1);
+    let actual_dx = after.0 - before.0;
+    let actual_dy = after.1 - before.1;
+
+    if dx < 0 && after.0 <= EDGE_TOLERANCE_PX {
+        let requested = -dx;
+        let actual_outward = (-actual_dx).max(0);
+        let blocked = requested.saturating_sub(actual_outward);
+        if blocked > 0 {
+            return Some((ScreenEdge::Left, blocked));
+        }
+    }
+    if dx > 0 && after.0 >= max_x.saturating_sub(EDGE_TOLERANCE_PX) {
+        let requested = dx;
+        let actual_outward = actual_dx.max(0);
+        let blocked = requested.saturating_sub(actual_outward);
+        if blocked > 0 {
+            return Some((ScreenEdge::Right, blocked));
+        }
+    }
+    if dy < 0 && after.1 <= EDGE_TOLERANCE_PX {
+        let requested = -dy;
+        let actual_outward = (-actual_dy).max(0);
+        let blocked = requested.saturating_sub(actual_outward);
+        if blocked > 0 {
+            return Some((ScreenEdge::Up, blocked));
+        }
+    }
+    if dy > 0 && after.1 >= max_y.saturating_sub(EDGE_TOLERANCE_PX) {
+        let requested = dy;
+        let actual_outward = actual_dy.max(0);
+        let blocked = requested.saturating_sub(actual_outward);
+        if blocked > 0 {
+            return Some((ScreenEdge::Down, blocked));
+        }
+    }
+
+    None
+}
+
+struct EdgePushTracker {
+    edge: Option<ScreenEdge>,
+    accumulated_px: i32,
+    last_update: Option<Instant>,
+}
+
+impl EdgePushTracker {
+    fn new() -> Self {
+        Self {
+            edge: None,
+            accumulated_px: 0,
+            last_update: None,
+        }
+    }
+
+    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: i32, now: Instant) -> bool {
+        if push_px <= 0 {
+            return false;
+        }
+
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.accumulated_px = 0;
+        }
+
+        self.accumulated_px = self.accumulated_px.saturating_add(push_px);
+        self.last_update = Some(now);
+        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
+            self.accumulated_px = 0;
+            return true;
+        }
+        false
+    }
+
+    fn reset_if_stale(&mut self, now: Instant) {
+        if let Some(last_update) = self.last_update
+            && now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT
+        {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.edge = None;
+        self.accumulated_px = 0;
+        self.last_update = None;
     }
 }
 

@@ -3,7 +3,7 @@ use iroh::endpoint::Connection;
 use rdev::EventType;
 use serde::{Deserialize, Serialize};
 
-use crate::model::Side;
+use crate::model::{ScreenEdge, Side};
 
 pub(crate) const ALPN: &[u8] = b"meow/remote-input/0";
 pub(crate) const MAX_MSG_SIZE: usize = 1024 * 1024;
@@ -25,6 +25,7 @@ pub(crate) struct AuthResponse {
 pub(crate) enum WireMessage {
     Input { event: EventType },
     MouseMoveRelative { dx: i32, dy: i32 },
+    ClientEdgeReached { edge: ScreenEdge },
 }
 
 pub(crate) async fn send_wire_message(

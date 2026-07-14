@@ -20,7 +20,10 @@ use crate::{
     ipc::{IpcCommand, apply_target_change, cleanup_stale_socket, run_control_socket, send_ipc},
     macos_mouse_delta::run_macos_mouse_delta_capture,
     macos_permissions::ensure_host_permissions_on_startup,
-    model::{ActiveTarget, CapturedEvent, CapturedInput, HostState, RemotePeer, Side},
+    model::{
+        ActiveTarget, CapturedEvent, CapturedInput, HostState, RemotePeer, RemotePointerMode,
+        ScreenEdge, Side,
+    },
     presentation::print_host_ready,
     protocol::{
         ALPN, AuthRequest, AuthResponse, WireMessage, read_framed, send_wire_message, write_framed,
@@ -61,6 +64,7 @@ pub(crate) async fn run_host() -> Result<()> {
     })?;
 
     let active_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
+    let remote_pointer_mode = Arc::new(AtomicU8::new(persisted_state.remote_pointer_mode.to_u8()));
     let pointer_lock_active = Arc::new(AtomicBool::new(false));
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
@@ -71,6 +75,7 @@ pub(crate) async fn run_host() -> Result<()> {
     let state = HostState {
         endpoint_id,
         active_target: active_target.clone(),
+        remote_pointer_mode: remote_pointer_mode.clone(),
         pointer_lock_active: pointer_lock_active.clone(),
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
@@ -176,6 +181,26 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
         auth.side, auth.name
     );
 
+    let feedback_state = state.clone();
+    let feedback_connection = connection.clone();
+    let feedback_side = auth.side;
+    let feedback_name = auth.name.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_client_feedback_loop(
+            feedback_state,
+            feedback_connection,
+            feedback_side,
+            &feedback_name,
+        )
+        .await
+        {
+            debug!(
+                "client feedback loop exited for {:?} ({}): {err:#}",
+                feedback_side, feedback_name
+            );
+        }
+    });
+
     let remotes = state.remotes.clone();
     tokio::spawn(async move {
         connection.closed().await;
@@ -197,6 +222,59 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     Ok(())
 }
 
+async fn run_client_feedback_loop(
+    state: HostState,
+    connection: iroh::endpoint::Connection,
+    side: Side,
+    peer_name: &str,
+) -> Result<()> {
+    loop {
+        let mut recv = connection.accept_uni().await?;
+        let bytes = recv.read_to_end(crate::protocol::MAX_MSG_SIZE).await?;
+        let message: WireMessage = bincode::deserialize(&bytes)?;
+        match message {
+            WireMessage::ClientEdgeReached { edge } => {
+                maybe_switch_to_local_on_edge(&state, side, edge, peer_name);
+            }
+            WireMessage::Input { .. } | WireMessage::MouseMoveRelative { .. } => {
+                debug!("ignoring unexpected client->host forwarded message from {peer_name}");
+            }
+        }
+    }
+}
+
+fn maybe_switch_to_local_on_edge(state: &HostState, side: Side, edge: ScreenEdge, peer_name: &str) {
+    let mode = RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed));
+    if mode != RemotePointerMode::EdgeToEdge {
+        return;
+    }
+
+    let active = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+    if active.to_side() != Some(side) {
+        return;
+    }
+
+    if !is_host_facing_edge(side, edge) {
+        return;
+    }
+
+    apply_target_change(state, ActiveTarget::Local, "client edge reached");
+    info!(
+        "switched to local after host-facing edge {:?} from {:?} ({})",
+        edge, side, peer_name
+    );
+}
+
+fn is_host_facing_edge(side: Side, edge: ScreenEdge) -> bool {
+    matches!(
+        (side, edge),
+        (Side::Right, ScreenEdge::Left)
+            | (Side::Left, ScreenEdge::Right)
+            | (Side::Up, ScreenEdge::Down)
+            | (Side::Down, ScreenEdge::Up)
+    )
+}
+
 async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state: HostState) {
     use tokio::time::{self, MissedTickBehavior};
 
@@ -215,12 +293,14 @@ async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state:
                     break;
                 };
 
-                let Some(side) = captured.target.to_side() else {
-                    continue;
-                };
-
                 match captured.event {
+                    CapturedEvent::HostEdgeReached { edge } => {
+                        maybe_switch_to_remote_on_host_edge(&state, edge).await;
+                    }
                     CapturedEvent::Raw(event) => {
+                        let Some(side) = captured.target.to_side() else {
+                            continue;
+                        };
                         flush_relative_for_side(&state, &mut pending_relative, side).await;
                         let message = WireMessage::Input { event };
                         if !send_to_side(&state, side, &message).await {
@@ -228,6 +308,9 @@ async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state:
                         }
                     }
                     CapturedEvent::MouseMoveRelative { dx, dy } => {
+                        let Some(side) = captured.target.to_side() else {
+                            continue;
+                        };
                         if dx == 0 && dy == 0 {
                             continue;
                         }
@@ -289,6 +372,35 @@ async fn send_to_side(state: &HostState, side: Side, message: &WireMessage) -> b
     }
 
     true
+}
+
+async fn maybe_switch_to_remote_on_host_edge(state: &HostState, edge: ScreenEdge) {
+    let mode = RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed));
+    if mode != RemotePointerMode::EdgeToEdge {
+        return;
+    }
+
+    let active = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+    if !matches!(active, ActiveTarget::Local) {
+        return;
+    }
+
+    let side = match edge {
+        ScreenEdge::Left => Side::Left,
+        ScreenEdge::Right => Side::Right,
+        ScreenEdge::Up => Side::Up,
+        ScreenEdge::Down => Side::Down,
+    };
+
+    let has_remote = {
+        let remotes = state.remotes.read().await;
+        remotes.contains_key(&side)
+    };
+    if !has_remote {
+        return;
+    }
+
+    apply_target_change(state, ActiveTarget::from(side), "host edge reached");
 }
 
 fn saturating_add_i32(lhs: i32, rhs: i32) -> i32 {

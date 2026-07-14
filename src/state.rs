@@ -10,7 +10,12 @@ use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 
 use crate::input::{default_detach_key, parse_detach_chord};
+use crate::model::RemotePointerMode;
 use crate::presentation::{print_identity_reset_complete, print_rotate_secret_complete};
+
+fn default_remote_pointer_mode() -> RemotePointerMode {
+    RemotePointerMode::EdgeToEdge
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedHostState {
@@ -19,6 +24,8 @@ pub(crate) struct PersistedHostState {
     pub(crate) attach_secret: String,
     #[serde(default = "default_detach_key")]
     pub(crate) detach_key: String,
+    #[serde(default = "default_remote_pointer_mode")]
+    pub(crate) remote_pointer_mode: RemotePointerMode,
 }
 
 pub(crate) fn app_data_dir() -> Result<PathBuf> {
@@ -149,6 +156,7 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
         endpoint_id: endpoint_id.to_string(),
         attach_secret: random_secret(),
         detach_key: default_detach_key(),
+        remote_pointer_mode: default_remote_pointer_mode(),
     };
     write_host_state_file(&state_path, &state)?;
     Ok(state)
@@ -227,6 +235,7 @@ mod tests {
             endpoint_id: endpoint_id.to_string(),
             attach_secret: "   ".to_string(),
             detach_key: " ".to_string(),
+            remote_pointer_mode: RemotePointerMode::Confine,
         };
 
         let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
@@ -234,6 +243,7 @@ mod tests {
         assert!(changed);
         assert!(!repaired.attach_secret.trim().is_empty());
         assert_eq!(repaired.detach_key, default_detach_key());
+        assert_eq!(repaired.remote_pointer_mode, RemotePointerMode::Confine);
     }
 
     #[test]
@@ -244,6 +254,7 @@ mod tests {
             endpoint_id: "old-endpoint".to_string(),
             attach_secret: "secret".to_string(),
             detach_key: default_detach_key(),
+            remote_pointer_mode: default_remote_pointer_mode(),
         };
 
         let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
@@ -260,6 +271,7 @@ mod tests {
             endpoint_id: endpoint_id.to_string(),
             attach_secret: "already-good".to_string(),
             detach_key: default_detach_key(),
+            remote_pointer_mode: default_remote_pointer_mode(),
         };
 
         let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
@@ -268,5 +280,6 @@ mod tests {
         assert_eq!(repaired.endpoint_id, endpoint_id.to_string());
         assert_eq!(repaired.attach_secret, "already-good");
         assert_eq!(repaired.detach_key, default_detach_key());
+        assert_eq!(repaired.remote_pointer_mode, default_remote_pointer_mode());
     }
 }

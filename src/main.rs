@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
         Command::Left => send_switch(ActiveTarget::Left).await,
         Command::Up => send_switch(ActiveTarget::Up).await,
         Command::Down => send_switch(ActiveTarget::Down).await,
+        Command::PointerMode(args) => send_ipc(IpcCommand::PointerMode { mode: args.mode }).await,
         Command::Status => send_ipc(IpcCommand::Status).await,
         Command::Stop => send_ipc(IpcCommand::Stop).await,
     }

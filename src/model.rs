@@ -22,6 +22,50 @@ pub(crate) enum Side {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemotePointerMode {
+    #[serde(alias = "return_on_edge")]
+    #[value(alias = "return-on-edge")]
+    EdgeToEdge,
+    Confine,
+}
+
+impl RemotePointerMode {
+    pub(crate) fn to_u8(self) -> u8 {
+        match self {
+            Self::EdgeToEdge => 0,
+            Self::Confine => 1,
+        }
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Confine,
+            _ => Self::EdgeToEdge,
+        }
+    }
+}
+
+impl fmt::Display for RemotePointerMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::EdgeToEdge => "edge-to-edge",
+            Self::Confine => "confine",
+        };
+        write!(f, "{s}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScreenEdge {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ActiveTarget {
@@ -98,6 +142,7 @@ pub(crate) struct CapturedInput {
 pub(crate) enum CapturedEvent {
     Raw(EventType),
     MouseMoveRelative { dx: i32, dy: i32 },
+    HostEdgeReached { edge: ScreenEdge },
 }
 
 #[derive(Clone)]
@@ -111,6 +156,7 @@ pub(crate) struct RemotePeer {
 pub(crate) struct HostState {
     pub(crate) endpoint_id: EndpointId,
     pub(crate) active_target: Arc<AtomicU8>,
+    pub(crate) remote_pointer_mode: Arc<AtomicU8>,
     pub(crate) pointer_lock_active: Arc<AtomicBool>,
     pub(crate) pointer_hidden: Arc<AtomicBool>,
     pub(crate) pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
