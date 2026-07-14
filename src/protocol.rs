@@ -24,6 +24,7 @@ pub(crate) struct AuthResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum WireMessage {
     Input { event: EventType },
+    MouseMoveRelative { dx: i32, dy: i32 },
 }
 
 pub(crate) async fn send_wire_message(

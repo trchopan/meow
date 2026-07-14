@@ -1,6 +1,8 @@
 use std::str::FromStr;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use enigo::{Enigo, MouseControllable};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::presets};
 use rdev::{EventType, Key, simulate};
 use tracing::{debug, info, warn};
@@ -43,7 +45,21 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     println!("Attached to host as {:?}", args.side);
     info!("client attach complete, waiting for forwarded events");
 
+    let mut enigo = Enigo::new();
+    let mut probe = args
+        .probe_received
+        .then(|| ClientReceiveProbe::new(&mut enigo, args.probe_duration_secs));
+    let probe_start = Instant::now();
+
     loop {
+        if let Some(probe) = probe.as_ref()
+            && probe.is_finished(probe_start)
+        {
+            probe.print_summary();
+            println!("probe complete");
+            return Ok(());
+        }
+
         let mut recv = connection.accept_uni().await?;
         let bytes = recv.read_to_end(MAX_MSG_SIZE).await?;
         debug!(
@@ -53,14 +69,188 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         let message: WireMessage = bincode::deserialize(&bytes)?;
         match message {
             WireMessage::Input { event } => {
+                if let Some(probe) = probe.as_mut() {
+                    probe.on_input_event(&event, bytes.len(), probe_start.elapsed());
+                }
                 debug!("client received input event: {:?}", event);
-                if let Err(err) = simulate(&event) {
-                    warn!("failed injecting input event: {err:?}");
-                } else {
-                    debug!("client simulate ok for event: {:?}", event);
+                if !args.no_inject {
+                    if let Err(err) = simulate(&event) {
+                        warn!("failed injecting input event: {err:?}");
+                    } else {
+                        debug!("client simulate ok for event: {:?}", event);
+                    }
+                }
+            }
+            WireMessage::MouseMoveRelative { dx, dy } => {
+                if let Some(probe) = probe.as_mut() {
+                    probe.on_relative_mouse(
+                        dx,
+                        dy,
+                        bytes.len(),
+                        &mut enigo,
+                        probe_start.elapsed(),
+                        args.no_inject,
+                    );
+                }
+                debug!("client received relative mouse move: dx={dx}, dy={dy}");
+                if probe.is_none() && !args.no_inject {
+                    enigo.mouse_move_relative(dx, dy);
                 }
             }
         }
+    }
+}
+
+struct ClientReceiveProbe {
+    start_cursor: (i32, i32),
+    display_size: (i32, i32),
+    duration_secs: u64,
+    total_messages: u64,
+    relative_messages: u64,
+    input_messages: u64,
+    sum_dx: i64,
+    sum_dy: i64,
+    sum_abs_dx: u64,
+    sum_abs_dy: u64,
+    sum_cursor_dx: i64,
+    sum_cursor_dy: i64,
+    edge_clamps: u64,
+    zero_delta_messages: u64,
+    max_abs_dx: i32,
+    max_abs_dy: i32,
+}
+
+impl ClientReceiveProbe {
+    fn new(enigo: &mut Enigo, duration_secs: u64) -> Self {
+        let display_size = enigo.main_display_size();
+        let start_cursor = enigo.mouse_location();
+        println!(
+            "client probe start: duration={}s display=({},{}) cursor_start=({},{})",
+            duration_secs, display_size.0, display_size.1, start_cursor.0, start_cursor.1
+        );
+        Self {
+            start_cursor,
+            display_size,
+            duration_secs,
+            total_messages: 0,
+            relative_messages: 0,
+            input_messages: 0,
+            sum_dx: 0,
+            sum_dy: 0,
+            sum_abs_dx: 0,
+            sum_abs_dy: 0,
+            sum_cursor_dx: 0,
+            sum_cursor_dy: 0,
+            edge_clamps: 0,
+            zero_delta_messages: 0,
+            max_abs_dx: 0,
+            max_abs_dy: 0,
+        }
+    }
+
+    fn is_finished(&self, probe_start: Instant) -> bool {
+        self.duration_secs > 0 && probe_start.elapsed().as_secs() >= self.duration_secs
+    }
+
+    fn on_input_event(&mut self, event: &EventType, bytes_len: usize, elapsed: std::time::Duration) {
+        self.total_messages += 1;
+        self.input_messages += 1;
+        println!(
+            "probe t={:.3}s msg={} bytes={} type=input event={:?}",
+            elapsed.as_secs_f64(),
+            self.total_messages,
+            bytes_len,
+            event
+        );
+    }
+
+    fn on_relative_mouse(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        bytes_len: usize,
+        enigo: &mut Enigo,
+        elapsed: std::time::Duration,
+        no_inject: bool,
+    ) {
+        self.total_messages += 1;
+        self.relative_messages += 1;
+        self.sum_dx += dx as i64;
+        self.sum_dy += dy as i64;
+        self.sum_abs_dx += dx.unsigned_abs() as u64;
+        self.sum_abs_dy += dy.unsigned_abs() as u64;
+        self.max_abs_dx = self.max_abs_dx.max(dx.abs());
+        self.max_abs_dy = self.max_abs_dy.max(dy.abs());
+        if dx == 0 && dy == 0 {
+            self.zero_delta_messages += 1;
+        }
+
+        let before = enigo.mouse_location();
+        let (width, height) = self.display_size;
+        let expected_x = (before.0 + dx).clamp(0, width.saturating_sub(1));
+        let expected_y = (before.1 + dy).clamp(0, height.saturating_sub(1));
+
+        if !no_inject {
+            enigo.mouse_move_relative(dx, dy);
+        }
+
+        let after = enigo.mouse_location();
+        let actual_dx = after.0 - before.0;
+        let actual_dy = after.1 - before.1;
+        self.sum_cursor_dx += actual_dx as i64;
+        self.sum_cursor_dy += actual_dy as i64;
+
+        let hit_edge = after.0 <= 0
+            || after.1 <= 0
+            || after.0 >= width.saturating_sub(1)
+            || after.1 >= height.saturating_sub(1)
+            || after.0 != expected_x
+            || after.1 != expected_y;
+        if hit_edge {
+            self.edge_clamps += 1;
+        }
+
+        println!(
+            "probe t={:.3}s msg={} bytes={} type=rel dx={} dy={} before=({}, {}) after=({}, {}) actual=({}, {}) edge={} sum_abs=({}, {})",
+            elapsed.as_secs_f64(),
+            self.total_messages,
+            bytes_len,
+            dx,
+            dy,
+            before.0,
+            before.1,
+            after.0,
+            after.1,
+            actual_dx,
+            actual_dy,
+            hit_edge,
+            self.sum_abs_dx,
+            self.sum_abs_dy
+        );
+    }
+
+    fn print_summary(&self) {
+        println!("client probe summary:");
+        println!("  display_size=({}, {})", self.display_size.0, self.display_size.1);
+        println!("  start_cursor=({}, {})", self.start_cursor.0, self.start_cursor.1);
+        println!("  total_messages={}", self.total_messages);
+        println!("  relative_messages={}", self.relative_messages);
+        println!("  input_messages={}", self.input_messages);
+        println!("  sum_dx={} sum_dy={}", self.sum_dx, self.sum_dy);
+        println!(
+            "  sum_abs_dx={} sum_abs_dy={}",
+            self.sum_abs_dx, self.sum_abs_dy
+        );
+        println!(
+            "  sum_cursor_dx={} sum_cursor_dy={}",
+            self.sum_cursor_dx, self.sum_cursor_dy
+        );
+        println!("  edge_clamps={}", self.edge_clamps);
+        println!("  zero_delta_messages={}", self.zero_delta_messages);
+        println!(
+            "  max_abs_dx={} max_abs_dy={}",
+            self.max_abs_dx, self.max_abs_dy
+        );
     }
 }
 

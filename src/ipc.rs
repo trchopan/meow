@@ -6,9 +6,10 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
+    host_mouse,
     model::{ActiveTarget, HostState, Side},
     presentation::print_status_response,
     state::socket_path,
@@ -91,6 +92,7 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
             status: Some(status_payload(&state).await),
         },
         IpcCommand::Stop => {
+            apply_target_change(&state, ActiveTarget::Local, "daemon stop");
             let response = IpcResponse {
                 ok: true,
                 message: "stopping host daemon".to_string(),
@@ -123,13 +125,50 @@ async fn switch_target(state: &HostState, target: ActiveTarget) -> IpcResponse {
         }
     }
 
-    state.active_target.store(target.to_u8(), Ordering::Relaxed);
-    info!("switched active target to {} via control command", target);
+    apply_target_change(state, target, "control command");
     IpcResponse {
         ok: true,
         message: format!("switched target to {target}"),
         status: Some(status_payload(state).await),
     }
+}
+
+pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, context: &str) {
+    state.active_target.store(target.to_u8(), Ordering::Relaxed);
+
+    let should_lock = target.to_side().is_some();
+    let was_locked = state.pointer_lock_active.swap(should_lock, Ordering::Relaxed);
+
+    if should_lock && !was_locked {
+        match host_mouse::current_pointer_position() {
+            Ok((x, y)) => {
+                let mut pinned = state
+                    .pinned_pointer_pos
+                    .lock()
+                    .expect("pinned pointer mutex poisoned");
+                *pinned = Some((x, y));
+            }
+            Err(err) => {
+                warn!("failed reading current pointer position: {err:#}");
+            }
+        }
+    }
+
+    if was_locked != should_lock
+        && let Err(err) = host_mouse::set_pointer_dissociation(should_lock)
+    {
+        warn!("failed to update pointer dissociation enabled={should_lock}: {err:#}");
+    }
+
+    if !should_lock {
+        let mut pinned = state
+            .pinned_pointer_pos
+            .lock()
+            .expect("pinned pointer mutex poisoned");
+        *pinned = None;
+    }
+
+    info!("switched active target to {} via {}", target, context);
 }
 
 async fn status_payload(state: &HostState) -> StatusPayload {

@@ -2,16 +2,19 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
 use anyhow::{Result, anyhow, bail};
 use rdev::{EventType, Key, grab};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::model::{ActiveTarget, CapturedInput};
+use crate::{
+    host_mouse,
+    model::{ActiveTarget, CapturedEvent, CapturedInput},
+};
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
 
@@ -28,9 +31,12 @@ pub(crate) struct DetachChord {
 pub(crate) fn run_input_grab(
     tx: mpsc::UnboundedSender<CapturedInput>,
     active_target: Arc<AtomicU8>,
+    pointer_lock_active: Arc<AtomicBool>,
+    pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     detach_chord: DetachChord,
 ) -> Result<()> {
     let pressed_keys: Arc<Mutex<HashSet<Key>>> = Arc::new(Mutex::new(HashSet::new()));
+    let last_mouse_pos: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
 
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         {
@@ -47,6 +53,13 @@ pub(crate) fn run_input_grab(
         }
 
         let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
+
+        if matches!(target, ActiveTarget::Local) {
+            if let EventType::MouseMove { x, y } = event.event_type {
+                let mut last_pos = last_mouse_pos.lock().expect("mouse pos mutex poisoned");
+                *last_pos = Some((x, y));
+            }
+        }
 
         let (is_ctrl_down, is_alt_down, is_meta_down, is_shift_down) = {
             let keys = pressed_keys.lock().expect("pressed key mutex poisoned");
@@ -65,6 +78,16 @@ pub(crate) fn run_input_grab(
         {
             let previous_target = target;
             active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+            pointer_lock_active.store(false, Ordering::Relaxed);
+            if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+                warn!("failed to disable pointer dissociation after detach chord: {err:#}");
+            }
+            {
+                let mut pinned = pinned_pointer_pos
+                    .lock()
+                    .expect("pinned pointer mutex poisoned");
+                *pinned = None;
+            }
             info!(
                 "escape chord {} detected in-grab; switched target from {} to local",
                 detach_chord.config_value, previous_target
@@ -75,9 +98,56 @@ pub(crate) fn run_input_grab(
         match target {
             ActiveTarget::Local => Some(event),
             _ => {
+                let captured_event = match event.event_type {
+                    EventType::MouseMove { x, y } => {
+                        #[cfg(target_os = "macos")]
+                        if pointer_lock_active.load(Ordering::Relaxed) {
+                            return None;
+                        }
+
+                        let (dx, dy) = if pointer_lock_active.load(Ordering::Relaxed) {
+                            let pinned = {
+                                let pinned = pinned_pointer_pos
+                                    .lock()
+                                    .expect("pinned pointer mutex poisoned");
+                                *pinned
+                            };
+
+                            if let Some((pin_x, pin_y)) = pinned {
+                                let dx = x - pin_x;
+                                let dy = y - pin_y;
+                                if let Err(err) = host_mouse::warp_pointer(pin_x, pin_y) {
+                                    warn!(
+                                        "failed to warp pointer to pinned position ({pin_x:.2},{pin_y:.2}): {err:#}"
+                                    );
+                                }
+                                (dx, dy)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            let mut last_pos =
+                                last_mouse_pos.lock().expect("mouse pos mutex poisoned");
+                            let (dx, dy) = if let Some((last_x, last_y)) = *last_pos {
+                                (x - last_x, y - last_y)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            *last_pos = Some((x, y));
+                            (dx, dy)
+                        };
+
+                        CapturedEvent::MouseMoveRelative {
+                            dx: clamp_relative_delta(dx),
+                            dy: clamp_relative_delta(dy),
+                        }
+                    }
+                    other => CapturedEvent::Raw(other),
+                };
+
                 let _ = tx.send(CapturedInput {
                     target,
-                    event: event.event_type.clone(),
+                    event: captured_event,
                 });
                 None
             }
@@ -183,6 +253,11 @@ pub(crate) fn parse_detach_key(token: &str) -> Result<Key> {
 
 pub(crate) fn default_detach_key() -> String {
     DEFAULT_DETACH_KEY.to_string()
+}
+
+pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
+    const MAX_RELATIVE_MOUSE_DELTA: i32 = 10_000;
+    (delta.round() as i32).clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA)
 }
 
 #[cfg(test)]
