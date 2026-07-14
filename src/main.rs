@@ -7,11 +7,11 @@ mod host;
 mod host_mouse;
 mod input;
 mod ipc;
-mod macos_permissions;
 mod macos_mouse_delta;
+mod macos_permissions;
 mod model;
-mod probe;
 mod presentation;
+mod probe;
 mod protocol;
 mod state;
 

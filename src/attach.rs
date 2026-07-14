@@ -152,7 +152,12 @@ impl ClientReceiveProbe {
         self.duration_secs > 0 && probe_start.elapsed().as_secs() >= self.duration_secs
     }
 
-    fn on_input_event(&mut self, event: &EventType, bytes_len: usize, elapsed: std::time::Duration) {
+    fn on_input_event(
+        &mut self,
+        event: &EventType,
+        bytes_len: usize,
+        elapsed: std::time::Duration,
+    ) {
         self.total_messages += 1;
         self.input_messages += 1;
         println!(
@@ -231,8 +236,14 @@ impl ClientReceiveProbe {
 
     fn print_summary(&self) {
         println!("client probe summary:");
-        println!("  display_size=({}, {})", self.display_size.0, self.display_size.1);
-        println!("  start_cursor=({}, {})", self.start_cursor.0, self.start_cursor.1);
+        println!(
+            "  display_size=({}, {})",
+            self.display_size.0, self.display_size.1
+        );
+        println!(
+            "  start_cursor=({}, {})",
+            self.start_cursor.0, self.start_cursor.1
+        );
         println!("  total_messages={}", self.total_messages);
         println!("  relative_messages={}", self.relative_messages);
         println!("  input_messages={}", self.input_messages);

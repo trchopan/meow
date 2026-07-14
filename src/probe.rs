@@ -168,7 +168,9 @@ mod macos {
     use super::*;
 
     pub(crate) async fn run(_args: ProbePointerLockArgs) -> Result<()> {
-        Err(anyhow!("probe-pointer-lock is currently supported on macOS only"))
+        Err(anyhow!(
+            "probe-pointer-lock is currently supported on macOS only"
+        ))
     }
 }
 
