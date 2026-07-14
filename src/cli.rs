@@ -13,9 +13,11 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Host,
     Attach(AttachArgs),
+    #[command(hide = true)]
     ProbePointerLock(ProbePointerLockArgs),
     ResetIdentity,
     RotateSecret,
+    #[command(hide = true)]
     TestInject,
     Local,
     Right,
@@ -39,11 +41,11 @@ pub(crate) struct AttachArgs {
     pub(crate) secret: String,
     #[arg(long, value_enum)]
     pub(crate) side: Side,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, hide = true)]
     pub(crate) probe_received: bool,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, hide = true)]
     pub(crate) probe_duration_secs: u64,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, hide = true)]
     pub(crate) no_inject: bool,
 }
 

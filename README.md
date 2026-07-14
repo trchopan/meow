@@ -68,7 +68,6 @@ meow stop
 meow pointer-mode <edge-to-edge|confine>
 meow reset-identity
 meow rotate-secret
-meow test-inject
 ```
 
 Attach command:
@@ -127,16 +126,24 @@ Use `meow reset-identity` (while daemon is stopped) to remove identity files and
 
 Use `meow rotate-secret` (while daemon is stopped) to keep the same host id and generate a new attach secret.
 
-`meow test-inject` is a local diagnostic command. It moves the mouse slightly and types `meowtest` to verify input injection permissions.
-
 ## Troubleshooting
 
 - `host daemon is not running`: start host with `meow host`
 - attach rejected: verify host id and secret are current
 - input injection issues: re-check Accessibility/Input Monitoring permissions
-- injection verification: run `meow test-inject`
 - verbose logs:
 
   ```sh
   RUST_LOG=meow=debug meow host
   ```
+
+## Developer diagnostics
+
+These commands/flags are intentionally hidden from the default CLI help but remain available for debugging:
+
+```sh
+meow test-inject
+meow probe-pointer-lock --duration-secs 10
+meow attach <host-id> <secret> --side right --probe-received --probe-duration-secs 10
+meow attach <host-id> <secret> --side right --no-inject
+```
