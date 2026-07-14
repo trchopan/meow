@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
@@ -7,6 +7,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::{
+    host_mouse,
     input::clamp_relative_delta,
     model::{ActiveTarget, CapturedEvent, CapturedInput},
 };
@@ -16,6 +17,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     tx: mpsc::UnboundedSender<CapturedInput>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
+    pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
 ) -> Result<()> {
     use anyhow::anyhow;
     use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
@@ -60,8 +62,19 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 warn!("failed to queue macOS relative mouse delta for forwarding");
             }
 
-            event.set_type(CGEventType::Null);
-            Some(event.clone())
+            let pinned = {
+                let pinned = pinned_pointer_pos
+                    .lock()
+                    .expect("pinned pointer mutex poisoned");
+                *pinned
+            };
+            if let Some((pin_x, pin_y)) = pinned
+                && let Err(err) = host_mouse::warp_pointer(pin_x, pin_y)
+            {
+                warn!("failed to warp pointer to pinned position ({pin_x:.2},{pin_y:.2}): {err:#}");
+            }
+
+            None
         },
     )
     .map_err(|_| anyhow!("failed to create macOS mouse CGEventTap"))?;
@@ -84,6 +97,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _tx: mpsc::UnboundedSender<CapturedInput>,
     _active_target: Arc<AtomicU8>,
     _pointer_lock_active: Arc<AtomicBool>,
+    _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
 ) -> Result<()> {
     Ok(())
 }

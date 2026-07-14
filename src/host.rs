@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 use crate::{
     input::{parse_detach_chord, run_input_grab},
     ipc::{IpcCommand, apply_target_change, cleanup_stale_socket, run_control_socket, send_ipc},
-    macos_permissions::ensure_host_permissions_on_startup,
     macos_mouse_delta::run_macos_mouse_delta_capture,
+    macos_permissions::ensure_host_permissions_on_startup,
     model::{ActiveTarget, CapturedEvent, CapturedInput, HostState, RemotePeer, Side},
     presentation::print_host_ready,
     protocol::{
@@ -62,6 +62,7 @@ pub(crate) async fn run_host() -> Result<()> {
 
     let active_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let pointer_lock_active = Arc::new(AtomicBool::new(false));
+    let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -71,6 +72,7 @@ pub(crate) async fn run_host() -> Result<()> {
         endpoint_id,
         active_target: active_target.clone(),
         pointer_lock_active: pointer_lock_active.clone(),
+        pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
         remotes: remotes.clone(),
     };
@@ -87,6 +89,7 @@ pub(crate) async fn run_host() -> Result<()> {
             input_tx,
             input_active_target,
             input_pointer_lock_active,
+            pointer_hidden,
             input_pinned_pointer_pos,
             input_detach_chord,
         ) {
@@ -96,20 +99,19 @@ pub(crate) async fn run_host() -> Result<()> {
 
     let mouse_delta_active_target = active_target.clone();
     let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
+    let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
     std::thread::spawn(move || {
         if let Err(err) = run_macos_mouse_delta_capture(
             mouse_delta_tx,
             mouse_delta_active_target,
             mouse_delta_pointer_lock_active,
+            mouse_delta_pinned_pointer_pos,
         ) {
             error!("macOS mouse delta capture stopped: {err:#}");
         }
     });
 
-    tokio::spawn(run_forward_loop(
-        input_rx,
-        state.clone(),
-    ));
+    tokio::spawn(run_forward_loop(input_rx, state.clone()));
 
     let control_state = state.clone();
     tokio::spawn(async move {
@@ -133,11 +135,7 @@ pub(crate) async fn run_host() -> Result<()> {
     }
 }
 
-async fn handle_incoming(
-    incoming: Incoming,
-    state: HostState,
-    secret: &str,
-) -> Result<()> {
+async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> Result<()> {
     let connection = incoming.accept()?.await?;
     let remote_id = connection.remote_id();
     let (mut send, mut recv) = connection.accept_bi().await?;
@@ -199,10 +197,7 @@ async fn handle_incoming(
     Ok(())
 }
 
-async fn run_forward_loop(
-    mut rx: mpsc::UnboundedReceiver<CapturedInput>,
-    state: HostState,
-) {
+async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state: HostState) {
     use tokio::time::{self, MissedTickBehavior};
 
     let mut pending_relative: HashMap<Side, (i32, i32)> = HashMap::new();
@@ -246,7 +241,10 @@ async fn run_forward_loop(
     }
 }
 
-async fn flush_pending_relative(state: &HostState, pending_relative: &mut HashMap<Side, (i32, i32)>) {
+async fn flush_pending_relative(
+    state: &HostState,
+    pending_relative: &mut HashMap<Side, (i32, i32)>,
+) {
     let sides = pending_relative.keys().copied().collect::<Vec<_>>();
     for side in sides {
         flush_relative_for_side(state, pending_relative, side).await;

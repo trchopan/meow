@@ -32,6 +32,26 @@ mod imp {
         let location = event.location();
         Ok((location.x, location.y))
     }
+
+    pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {
+        let display = CGDisplay::main();
+        let result = if visible {
+            display.show_cursor()
+        } else {
+            display.hide_cursor()
+        };
+        result.map_err(|err| {
+            anyhow!(
+                "{} failed with code {}",
+                if visible {
+                    "CGDisplayShowCursor"
+                } else {
+                    "CGDisplayHideCursor"
+                },
+                err
+            )
+        })
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -49,6 +69,10 @@ mod imp {
     pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
         Ok((0.0, 0.0))
     }
+
+    pub(crate) fn set_pointer_visible(_visible: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn set_pointer_dissociation(enabled: bool) -> Result<()> {
@@ -61,4 +85,8 @@ pub(crate) fn warp_pointer(x: f64, y: f64) -> Result<()> {
 
 pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
     imp::current_pointer_position()
+}
+
+pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {
+    imp::set_pointer_visible(visible)
 }

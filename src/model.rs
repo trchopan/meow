@@ -112,6 +112,7 @@ pub(crate) struct HostState {
     pub(crate) endpoint_id: EndpointId,
     pub(crate) active_target: Arc<AtomicU8>,
     pub(crate) pointer_lock_active: Arc<AtomicBool>,
+    pub(crate) pointer_hidden: Arc<AtomicBool>,
     pub(crate) pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
 }

@@ -137,7 +137,9 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     state.active_target.store(target.to_u8(), Ordering::Relaxed);
 
     let should_lock = target.to_side().is_some();
-    let was_locked = state.pointer_lock_active.swap(should_lock, Ordering::Relaxed);
+    let was_locked = state
+        .pointer_lock_active
+        .swap(should_lock, Ordering::Relaxed);
 
     if should_lock && !was_locked {
         match host_mouse::current_pointer_position() {
@@ -158,6 +160,15 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
         && let Err(err) = host_mouse::set_pointer_dissociation(should_lock)
     {
         warn!("failed to update pointer dissociation enabled={should_lock}: {err:#}");
+    }
+
+    let should_hide = should_lock;
+    let was_hidden = state.pointer_hidden.swap(should_hide, Ordering::Relaxed);
+    if was_hidden != should_hide
+        && let Err(err) = host_mouse::set_pointer_visible(!should_hide)
+    {
+        warn!("failed to update pointer visibility hidden={should_hide}: {err:#}");
+        state.pointer_hidden.store(was_hidden, Ordering::Relaxed);
     }
 
     if !should_lock {

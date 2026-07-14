@@ -32,6 +32,7 @@ pub(crate) fn run_input_grab(
     tx: mpsc::UnboundedSender<CapturedInput>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
+    pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     detach_chord: DetachChord,
 ) -> Result<()> {
@@ -81,6 +82,11 @@ pub(crate) fn run_input_grab(
             pointer_lock_active.store(false, Ordering::Relaxed);
             if let Err(err) = host_mouse::set_pointer_dissociation(false) {
                 warn!("failed to disable pointer dissociation after detach chord: {err:#}");
+            }
+            let was_hidden = pointer_hidden.swap(false, Ordering::Relaxed);
+            if was_hidden && let Err(err) = host_mouse::set_pointer_visible(true) {
+                warn!("failed to show pointer after detach chord: {err:#}");
+                pointer_hidden.store(true, Ordering::Relaxed);
             }
             {
                 let mut pinned = pinned_pointer_pos
