@@ -49,6 +49,15 @@ Comprehensive handbook for coding agents working in this repository.
    - `cargo run -- dev-smoke --duration-secs 5 --side right`
 5. Use remote/manual QA only when required for permissions or real-device behavior.
 
+## Git Conventions
+
+- Follow Conventional Commits where possible, e.g. `feat: ...`, `fix: ...`, `docs: ...`.
+- Use a scope only when it adds clarity, e.g. `feat(host): ...`, `fix(input): ...`, `docs(readme): ...`.
+- Inspect `git status` and `git diff` before committing.
+- Stage only intended files; do not include generated/local artifacts.
+- Do not commit local environment files, editor state, build outputs, caches, or `target/`.
+- Do not commit generated feature plans by default; promote only durable product or engineering decisions into committed docs.
+
 ## Repository Map
 
 - `src/main.rs`: CLI entrypoint and top-level command dispatch.
