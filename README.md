@@ -2,14 +2,39 @@
 
 macOS-first keyboard and mouse sharing over iroh.
 
+## Development Status
+
+`meow` is currently in the **development** stage.
+
+- APIs, CLI behavior, and wire protocol details may change between releases.
+- Stability and ergonomics are still being improved.
+- `meow` is macOS-first today; other platforms are unsupported for now.
+
+## What It Does
+
+`meow` runs a host daemon on the machine with your physical keyboard/mouse, then forwards input to attached machines over iroh.
+
+You can switch active targets from the host with directional commands (`meow right`, `meow left`, etc.) or return to local control (`meow local`).
+
+## Features
+
+- Keyboard and mouse forwarding over iroh.
+- Directional target switching (`left`, `right`, `up`, `down`).
+- Two remote pointer modes: `edge-to-edge` and `confine`.
+- Local detach chord for fast return to host input.
+- Persistent host identity and attach secret.
+- Local control socket for status and runtime control commands.
+
 ## Requirements
 
-- macOS host and client machines
-- Rust toolchain (`cargo`, `rustc`) to build
-- Accessibility permission for the app launching `meow` (Terminal, iTerm, etc.)
-- Input Monitoring permission may also be required, depending on setup
+- macOS host and client machines.
+- Rust toolchain (`cargo`, `rustc`) to build from source.
+- Accessibility permission for the app launching `meow` (Terminal, iTerm, etc.).
+- Input Monitoring permission may also be required, depending on setup.
 
-## Build
+## Install From Source
+
+Build a release binary:
 
 ```sh
 cargo build --release
@@ -27,32 +52,7 @@ You can also run directly with Cargo during development:
 cargo run -- host
 ```
 
-## Development workflow
-
-Fast local gate:
-
-```sh
-make check
-```
-
-Individual steps:
-
-```sh
-make fmt
-make lint
-make test
-make build
-```
-
-Local one-machine smoke:
-
-```sh
-cargo run -- dev-smoke --duration-secs 5 --side right
-```
-
-This runs a host + attach probe on the same machine with a temporary isolated state directory.
-
-## Quick start
+## Quick Start
 
 1. On the machine with the physical keyboard/mouse (host), start the daemon:
 
@@ -75,12 +75,17 @@ This runs a host + attach probe on the same machine with a temporary isolated st
    ```sh
    meow local
    meow right
-    meow left
-    meow up
-    meow down
-    meow pointer-mode edge-to-edge
-    meow pointer-mode confine
-    ```
+   meow left
+   meow up
+   meow down
+   ```
+
+5. Optionally switch pointer mode while the host daemon is running:
+
+   ```sh
+   meow pointer-mode edge-to-edge
+   meow pointer-mode confine
+   ```
 
 ## Commands
 
@@ -90,6 +95,11 @@ Daemon and control commands:
 meow host
 meow status
 meow stop
+meow local
+meow right
+meow left
+meow up
+meow down
 meow pointer-mode <edge-to-edge|confine>
 meow reset-identity
 meow rotate-secret
@@ -101,27 +111,27 @@ Attach command:
 meow attach <host-id> <secret> --side <left|right|up|down>
 ```
 
-## Escape chord
-
-When input is currently forwarded to a remote machine, press `ctrl+alt+cmd+l` on the host to force control back to local.
-
-You can customize this by editing `detach_key` in `host_state.json`.
-
-## Pointer mode
+## Pointer Modes
 
 `meow` supports two remote pointer behaviors:
 
 - `edge-to-edge` (default): moving to a host edge switches control to the connected client on that side; reaching the client edge facing back toward the host returns control to local host input.
-- `confine`: keep control on the remote even at client edges; use the host detach chord to return to local.
+- `confine`: keeps control on the remote even at client edges; use the host detach chord to return to local.
 
-Set mode while host daemon is running:
+Set mode while the host daemon is running:
 
 ```sh
 meow pointer-mode edge-to-edge
 meow pointer-mode confine
 ```
 
-## State files
+## Escape Chord
+
+When input is forwarded to a remote machine, press `ctrl+alt+cmd+l` on the host to force control back to local.
+
+You can customize this by editing `detach_key` in `host_state.json`.
+
+## State Files
 
 `meow` stores host state in:
 
@@ -135,9 +145,9 @@ Override this location for development/testing:
 MEOW_STATE_DIR=/tmp/meow-dev meow host
 ```
 
-- `host.key`: persistent host private key (keeps host endpoint id stable)
-- `host_state.json`: persisted metadata, including attach secret and detach key chord
-- `meow.sock`: local Unix socket used for host daemon control
+- `host.key`: persistent host private key (keeps host endpoint id stable).
+- `host_state.json`: persisted metadata, including attach secret and detach key chord.
+- `meow.sock`: local Unix socket used for host daemon control.
 
 Example `host_state.json`:
 
@@ -159,18 +169,43 @@ Use `meow rotate-secret` (while daemon is stopped) to keep the same host id and 
 
 ## Troubleshooting
 
-- `host daemon is not running`: start host with `meow host`
-- attach rejected: verify host id and secret are current
-- input injection issues: re-check Accessibility/Input Monitoring permissions
-- verbose logs:
+- `host daemon is not running`: start host with `meow host`.
+- Attach rejected: verify host id and secret are current.
+- Input injection issues: re-check Accessibility and Input Monitoring permissions.
+- Verbose logs:
 
   ```sh
   RUST_LOG=meow=debug meow host
   ```
 
-## Developer diagnostics
+## Development
 
-These commands/flags are intentionally hidden from the default CLI help but remain available for debugging:
+Fast local gate:
+
+```sh
+make check
+```
+
+Individual steps:
+
+```sh
+make fmt
+make lint
+make test
+make build
+```
+
+Local one-machine smoke test:
+
+```sh
+cargo run -- dev-smoke --duration-secs 5 --side right
+```
+
+This runs a host + attach probe on the same machine with a temporary isolated state directory.
+
+## Developer Diagnostics
+
+These commands and flags are intentionally hidden from default CLI help, but remain available for debugging:
 
 ```sh
 meow test-inject
@@ -179,3 +214,16 @@ meow attach <host-id> <secret> --side right --probe-received --probe-duration-se
 meow attach <host-id> <secret> --side right --no-inject
 meow dev-smoke --duration-secs 5 --side right
 ```
+
+## Security And Privacy
+
+`meow` is an input-forwarding tool and interacts with privileged OS APIs.
+
+- It captures local keyboard and mouse input on the host while forwarding is active.
+- It can inject input events on attached machines.
+- Run it only on machines and networks you trust.
+- Keep your session secret private.
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.
