@@ -248,6 +248,12 @@ struct ClientReceiveProbe {
     zero_delta_messages: u64,
     max_abs_dx: i32,
     max_abs_dy: i32,
+    total_bytes: u64,
+    min_bytes: Option<usize>,
+    max_bytes: usize,
+    first_message_elapsed: Option<std::time::Duration>,
+    last_message_elapsed: Option<std::time::Duration>,
+    max_inter_message_gap: std::time::Duration,
 }
 
 impl ClientReceiveProbe {
@@ -275,6 +281,12 @@ impl ClientReceiveProbe {
             zero_delta_messages: 0,
             max_abs_dx: 0,
             max_abs_dy: 0,
+            total_bytes: 0,
+            min_bytes: None,
+            max_bytes: 0,
+            first_message_elapsed: None,
+            last_message_elapsed: None,
+            max_inter_message_gap: std::time::Duration::ZERO,
         }
     }
 
@@ -288,6 +300,7 @@ impl ClientReceiveProbe {
         bytes_len: usize,
         elapsed: std::time::Duration,
     ) {
+        self.note_message(bytes_len, elapsed);
         self.total_messages += 1;
         self.input_messages += 1;
         println!(
@@ -308,6 +321,7 @@ impl ClientReceiveProbe {
         elapsed: std::time::Duration,
         no_inject: bool,
     ) {
+        self.note_message(bytes_len, elapsed);
         self.total_messages += 1;
         self.relative_messages += 1;
         self.sum_dx += dx as i64;
@@ -365,6 +379,19 @@ impl ClientReceiveProbe {
     }
 
     fn print_summary(&self) {
+        let observed_secs = self
+            .last_message_elapsed
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs_f64()
+            .max(0.001);
+        let msg_rate = self.total_messages as f64 / observed_secs;
+        let byte_rate = self.total_bytes as f64 / observed_secs;
+        let avg_bytes = if self.total_messages == 0 {
+            0.0
+        } else {
+            self.total_bytes as f64 / self.total_messages as f64
+        };
+
         println!("client probe summary:");
         println!(
             "  display_size=({}, {})",
@@ -392,6 +419,45 @@ impl ClientReceiveProbe {
             "  max_abs_dx={} max_abs_dy={}",
             self.max_abs_dx, self.max_abs_dy
         );
+        println!(
+            "  bytes_total={} avg_bytes_per_msg={:.2}",
+            self.total_bytes, avg_bytes
+        );
+        println!(
+            "  bytes_min={} bytes_max={}",
+            self.min_bytes.unwrap_or(0),
+            self.max_bytes
+        );
+        println!("  msg_rate_per_sec={:.2}", msg_rate);
+        println!("  bytes_rate_per_sec={:.2}", byte_rate);
+        println!(
+            "  first_msg_t={:.3}s last_msg_t={:.3}s max_inter_msg_gap={:.3}s",
+            self.first_message_elapsed
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_secs_f64(),
+            self.last_message_elapsed
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_secs_f64(),
+            self.max_inter_message_gap.as_secs_f64()
+        );
+    }
+
+    fn note_message(&mut self, bytes_len: usize, elapsed: std::time::Duration) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes_len as u64);
+        self.max_bytes = self.max_bytes.max(bytes_len);
+        self.min_bytes = Some(match self.min_bytes {
+            Some(current) => current.min(bytes_len),
+            None => bytes_len,
+        });
+
+        if self.first_message_elapsed.is_none() {
+            self.first_message_elapsed = Some(elapsed);
+        }
+        if let Some(last) = self.last_message_elapsed {
+            let gap = elapsed.saturating_sub(last);
+            self.max_inter_message_gap = self.max_inter_message_gap.max(gap);
+        }
+        self.last_message_elapsed = Some(elapsed);
     }
 }
 
@@ -449,4 +515,27 @@ pub(crate) async fn run_test_inject() -> Result<()> {
 
     println!("test-inject finished");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_client_edge_push_left_when_blocked() {
+        let edge = detect_client_edge_push((1, 100), (0, 100), (1920, 1080), -20, 0);
+        assert_eq!(edge, Some((ScreenEdge::Left, 19)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_right_when_blocked() {
+        let edge = detect_client_edge_push((1918, 100), (1919, 100), (1920, 1080), 12, 0);
+        assert_eq!(edge, Some((ScreenEdge::Right, 11)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_none_when_not_at_edge() {
+        let edge = detect_client_edge_push((100, 100), (104, 100), (1920, 1080), 4, 0);
+        assert_eq!(edge, None);
+    }
 }

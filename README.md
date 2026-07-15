@@ -27,6 +27,31 @@ You can also run directly with Cargo during development:
 cargo run -- host
 ```
 
+## Development workflow
+
+Fast local gate:
+
+```sh
+make check
+```
+
+Individual steps:
+
+```sh
+make fmt
+make lint
+make test
+make build
+```
+
+Local one-machine smoke:
+
+```sh
+cargo run -- dev-smoke --duration-secs 5 --side right
+```
+
+This runs a host + attach probe on the same machine with a temporary isolated state directory.
+
 ## Quick start
 
 1. On the machine with the physical keyboard/mouse (host), start the daemon:
@@ -104,6 +129,12 @@ meow pointer-mode confine
 ~/.local/share/meow/
 ```
 
+Override this location for development/testing:
+
+```sh
+MEOW_STATE_DIR=/tmp/meow-dev meow host
+```
+
 - `host.key`: persistent host private key (keeps host endpoint id stable)
 - `host_state.json`: persisted metadata, including attach secret and detach key chord
 - `meow.sock`: local Unix socket used for host daemon control
@@ -146,4 +177,5 @@ meow test-inject
 meow probe-pointer-lock --duration-secs 10
 meow attach <host-id> <secret> --side right --probe-received --probe-duration-secs 10
 meow attach <host-id> <secret> --side right --no-inject
+meow dev-smoke --duration-secs 5 --side right
 ```

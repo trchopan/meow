@@ -12,6 +12,7 @@ use iroh::{
     Endpoint,
     endpoint::{Incoming, presets},
 };
+use rdev::{EventType, Key};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -32,7 +33,11 @@ use crate::{
 };
 
 pub(crate) async fn run_host() -> Result<()> {
-    ensure_host_permissions_on_startup()?;
+    if !dev_smoke_enabled() {
+        ensure_host_permissions_on_startup()?;
+    } else {
+        info!("running host in dev smoke mode");
+    }
 
     if crate::ipc::is_daemon_running().await {
         println!("meow host daemon already running");
@@ -83,38 +88,42 @@ pub(crate) async fn run_host() -> Result<()> {
     };
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<CapturedInput>();
-    let mouse_delta_tx = input_tx.clone();
+    if dev_smoke_enabled() {
+        tokio::spawn(run_dev_synthetic_input(input_tx.clone(), state.clone()));
+    } else {
+        let mouse_delta_tx = input_tx.clone();
 
-    let input_active_target = active_target.clone();
-    let input_pointer_lock_active = pointer_lock_active.clone();
-    let input_pinned_pointer_pos = pinned_pointer_pos.clone();
-    let input_detach_chord = detach_chord.clone();
-    std::thread::spawn(move || {
-        if let Err(err) = run_input_grab(
-            input_tx,
-            input_active_target,
-            input_pointer_lock_active,
-            pointer_hidden,
-            input_pinned_pointer_pos,
-            input_detach_chord,
-        ) {
-            error!("input grab stopped: {err:#}");
-        }
-    });
+        let input_active_target = active_target.clone();
+        let input_pointer_lock_active = pointer_lock_active.clone();
+        let input_pinned_pointer_pos = pinned_pointer_pos.clone();
+        let input_detach_chord = detach_chord.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = run_input_grab(
+                input_tx,
+                input_active_target,
+                input_pointer_lock_active,
+                pointer_hidden,
+                input_pinned_pointer_pos,
+                input_detach_chord,
+            ) {
+                error!("input grab stopped: {err:#}");
+            }
+        });
 
-    let mouse_delta_active_target = active_target.clone();
-    let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
-    let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
-    std::thread::spawn(move || {
-        if let Err(err) = run_macos_mouse_delta_capture(
-            mouse_delta_tx,
-            mouse_delta_active_target,
-            mouse_delta_pointer_lock_active,
-            mouse_delta_pinned_pointer_pos,
-        ) {
-            error!("macOS mouse delta capture stopped: {err:#}");
-        }
-    });
+        let mouse_delta_active_target = active_target.clone();
+        let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
+        let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = run_macos_mouse_delta_capture(
+                mouse_delta_tx,
+                mouse_delta_active_target,
+                mouse_delta_pointer_lock_active,
+                mouse_delta_pinned_pointer_pos,
+            ) {
+                error!("macOS mouse delta capture stopped: {err:#}");
+            }
+        });
+    }
 
     tokio::spawn(run_forward_loop(input_rx, state.clone()));
 
@@ -385,12 +394,7 @@ async fn maybe_switch_to_remote_on_host_edge(state: &HostState, edge: ScreenEdge
         return;
     }
 
-    let side = match edge {
-        ScreenEdge::Left => Side::Left,
-        ScreenEdge::Right => Side::Right,
-        ScreenEdge::Up => Side::Up,
-        ScreenEdge::Down => Side::Down,
-    };
+    let side = side_from_edge(edge);
 
     let has_remote = {
         let remotes = state.remotes.read().await;
@@ -405,4 +409,94 @@ async fn maybe_switch_to_remote_on_host_edge(state: &HostState, edge: ScreenEdge
 
 fn saturating_add_i32(lhs: i32, rhs: i32) -> i32 {
     lhs.saturating_add(rhs)
+}
+
+fn side_from_edge(edge: ScreenEdge) -> Side {
+    match edge {
+        ScreenEdge::Left => Side::Left,
+        ScreenEdge::Right => Side::Right,
+        ScreenEdge::Up => Side::Up,
+        ScreenEdge::Down => Side::Down,
+    }
+}
+
+fn dev_smoke_enabled() -> bool {
+    std::env::var("MEOW_DEV_SMOKE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn dev_smoke_side() -> Side {
+    match std::env::var("MEOW_DEV_SIDE") {
+        Ok(v) if v.eq_ignore_ascii_case("left") => Side::Left,
+        Ok(v) if v.eq_ignore_ascii_case("up") => Side::Up,
+        Ok(v) if v.eq_ignore_ascii_case("down") => Side::Down,
+        _ => Side::Right,
+    }
+}
+
+async fn run_dev_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, state: HostState) {
+    use tokio::time::{Duration, sleep};
+
+    let side = dev_smoke_side();
+    info!("dev smoke synthetic input active for side {:?}", side);
+
+    let mut seq_idx: u64 = 0;
+    loop {
+        let attached = {
+            let remotes = state.remotes.read().await;
+            remotes.contains_key(&side)
+        };
+
+        if attached {
+            let target = ActiveTarget::from(side);
+            let event = match seq_idx % 16 {
+                0 => CapturedEvent::Raw(EventType::KeyPress(Key::KeyM)),
+                1 => CapturedEvent::Raw(EventType::KeyRelease(Key::KeyM)),
+                2 => CapturedEvent::Raw(EventType::KeyPress(Key::KeyE)),
+                3 => CapturedEvent::Raw(EventType::KeyRelease(Key::KeyE)),
+                _ => CapturedEvent::MouseMoveRelative {
+                    dx: if seq_idx.is_multiple_of(2) { 4 } else { -3 },
+                    dy: if seq_idx.is_multiple_of(3) { 2 } else { -2 },
+                },
+            };
+
+            if tx.send(CapturedInput { target, event }).is_err() {
+                break;
+            }
+            seq_idx = seq_idx.saturating_add(1);
+            sleep(Duration::from_millis(12)).await;
+        } else {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_facing_edge_matches_layout() {
+        assert!(is_host_facing_edge(Side::Right, ScreenEdge::Left));
+        assert!(is_host_facing_edge(Side::Left, ScreenEdge::Right));
+        assert!(is_host_facing_edge(Side::Up, ScreenEdge::Down));
+        assert!(is_host_facing_edge(Side::Down, ScreenEdge::Up));
+        assert!(!is_host_facing_edge(Side::Right, ScreenEdge::Right));
+        assert!(!is_host_facing_edge(Side::Up, ScreenEdge::Up));
+    }
+
+    #[test]
+    fn saturating_add_protects_overflow() {
+        assert_eq!(saturating_add_i32(i32::MAX, 10), i32::MAX);
+        assert_eq!(saturating_add_i32(i32::MIN, -10), i32::MIN);
+    }
+
+    #[test]
+    fn screen_edge_maps_to_side() {
+        assert_eq!(side_from_edge(ScreenEdge::Left), Side::Left);
+        assert_eq!(side_from_edge(ScreenEdge::Right), Side::Right);
+        assert_eq!(side_from_edge(ScreenEdge::Up), Side::Up);
+        assert_eq!(side_from_edge(ScreenEdge::Down), Side::Down);
+    }
 }

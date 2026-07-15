@@ -45,12 +45,12 @@ mod imp {
             return Ok(());
         }
 
-        if missing.iter().any(|p| *p == "Accessibility") {
+        if missing.contains(&"Accessibility") {
             let _ = open_settings_url(
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
             );
         }
-        if missing.iter().any(|p| *p == "Input Monitoring") {
+        if missing.contains(&"Input Monitoring") {
             let _ = open_settings_url(
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
             );

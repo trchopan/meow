@@ -3,6 +3,7 @@ use clap::Parser;
 
 mod attach;
 mod cli;
+mod dev;
 mod host;
 mod host_mouse;
 mod input;
@@ -17,6 +18,7 @@ mod state;
 
 use attach::{run_attach, run_test_inject};
 use cli::{Cli, Command};
+use dev::run_dev_smoke;
 use host::run_host;
 use ipc::{IpcCommand, send_ipc, send_switch};
 use model::ActiveTarget;
@@ -36,6 +38,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Host => run_host().await,
         Command::Attach(args) => run_attach(args).await,
+        Command::DevSmoke(args) => run_dev_smoke(args).await,
         Command::ProbePointerLock(args) => run_probe_pointer_lock(args).await,
         Command::ResetIdentity => reset_identity().await,
         Command::RotateSecret => rotate_secret().await,

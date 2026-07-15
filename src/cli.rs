@@ -14,6 +14,8 @@ pub(crate) enum Command {
     Host,
     Attach(AttachArgs),
     #[command(hide = true)]
+    DevSmoke(DevSmokeArgs),
+    #[command(hide = true)]
     ProbePointerLock(ProbePointerLockArgs),
     ResetIdentity,
     RotateSecret,
@@ -27,6 +29,14 @@ pub(crate) enum Command {
     PointerMode(PointerModeArgs),
     Status,
     Stop,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DevSmokeArgs {
+    #[arg(long, default_value_t = 5)]
+    pub(crate) duration_secs: u64,
+    #[arg(long, value_enum, default_value_t = Side::Right)]
+    pub(crate) side: Side,
 }
 
 #[derive(Debug, clap::Args)]

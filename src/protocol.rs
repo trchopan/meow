@@ -56,10 +56,46 @@ pub(crate) async fn read_framed<T: for<'de> Deserialize<'de>>(
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_MSG_SIZE {
-        bail!("framed message too large: {len}");
-    }
+    ensure_frame_len(len)?;
     let mut bytes = vec![0u8; len];
     stream.read_exact(&mut bytes).await?;
     Ok(bincode::deserialize(&bytes)?)
+}
+
+fn ensure_frame_len(len: usize) -> Result<()> {
+    if len > MAX_MSG_SIZE {
+        bail!("framed message too large: {len}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_frame_len_accepts_limits() {
+        assert!(ensure_frame_len(0).is_ok());
+        assert!(ensure_frame_len(MAX_MSG_SIZE).is_ok());
+    }
+
+    #[test]
+    fn ensure_frame_len_rejects_oversize() {
+        let err = ensure_frame_len(MAX_MSG_SIZE + 1).expect_err("must reject oversize frame");
+        assert!(err.to_string().contains("framed message too large"));
+    }
+
+    #[test]
+    fn wire_message_round_trip_serde() {
+        let msg = WireMessage::MouseMoveRelative { dx: -42, dy: 17 };
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let round_trip: WireMessage = bincode::deserialize(&bytes).expect("deserialize");
+        match round_trip {
+            WireMessage::MouseMoveRelative { dx, dy } => {
+                assert_eq!(dx, -42);
+                assert_eq!(dy, 17);
+            }
+            _ => panic!("unexpected wire message variant"),
+        }
+    }
 }

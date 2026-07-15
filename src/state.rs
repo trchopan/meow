@@ -29,6 +29,11 @@ pub(crate) struct PersistedHostState {
 }
 
 pub(crate) fn app_data_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("MEOW_STATE_DIR")
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
     Ok(home.join(".local").join("share").join("meow"))
 }
@@ -120,7 +125,7 @@ fn write_secret_key_file(path: &Path, key: &[u8; 32]) -> Result<()> {
             .with_context(|| format!("failed to create {}", path.display()))?;
         file.write_all(key)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -176,7 +181,7 @@ pub(crate) fn write_host_state_file(path: &Path, state: &PersistedHostState) -> 
             .with_context(|| format!("failed to create {}", path.display()))?;
         file.write_all(&bytes)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
