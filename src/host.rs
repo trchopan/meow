@@ -33,10 +33,10 @@ use crate::{
 };
 
 pub(crate) async fn run_host() -> Result<()> {
-    if !dev_smoke_enabled() {
+    if !skip_permissions_for_synthetic_mode() {
         ensure_host_permissions_on_startup()?;
     } else {
-        info!("running host in dev smoke mode");
+        info!("running host in synthetic input mode");
     }
 
     if crate::ipc::is_daemon_running().await {
@@ -88,7 +88,9 @@ pub(crate) async fn run_host() -> Result<()> {
     };
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<CapturedInput>();
-    if dev_smoke_enabled() {
+    if bench_flush_enabled() {
+        tokio::spawn(run_bench_synthetic_input(input_tx.clone(), state.clone()));
+    } else if dev_smoke_enabled() {
         tokio::spawn(run_dev_synthetic_input(input_tx.clone(), state.clone()));
     } else {
         let mouse_delta_tx = input_tx.clone();
@@ -288,8 +290,10 @@ async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state:
     use tokio::time::{self, MissedTickBehavior};
 
     let mut pending_relative: HashMap<Side, (i32, i32)> = HashMap::new();
-    let mut flush_tick = time::interval(Duration::from_millis(6));
+    let flush_tick_ms = configured_flush_tick_ms();
+    let mut flush_tick = time::interval(Duration::from_millis(flush_tick_ms));
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    debug!("relative flush tick configured to {}ms", flush_tick_ms);
 
     loop {
         tokio::select! {
@@ -426,6 +430,33 @@ fn dev_smoke_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn bench_flush_enabled() -> bool {
+    std::env::var("MEOW_BENCH_FLUSH")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn skip_permissions_for_synthetic_mode() -> bool {
+    dev_smoke_enabled() || bench_flush_enabled()
+}
+
+fn configured_flush_tick_ms() -> u64 {
+    const DEFAULT_FLUSH_TICK_MS: u64 = 2;
+    match std::env::var("MEOW_FLUSH_TICK_MS") {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            Ok(_) | Err(_) => {
+                warn!(
+                    "invalid MEOW_FLUSH_TICK_MS value {:?}; using default {}ms",
+                    raw, DEFAULT_FLUSH_TICK_MS
+                );
+                DEFAULT_FLUSH_TICK_MS
+            }
+        },
+        Err(_) => DEFAULT_FLUSH_TICK_MS,
+    }
+}
+
 fn dev_smoke_side() -> Side {
     match std::env::var("MEOW_DEV_SIDE") {
         Ok(v) if v.eq_ignore_ascii_case("left") => Side::Left,
@@ -468,6 +499,74 @@ async fn run_dev_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, state
             sleep(Duration::from_millis(12)).await;
         } else {
             sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+fn bench_side() -> Side {
+    match std::env::var("MEOW_BENCH_SIDE") {
+        Ok(v) if v.eq_ignore_ascii_case("left") => Side::Left,
+        Ok(v) if v.eq_ignore_ascii_case("up") => Side::Up,
+        Ok(v) if v.eq_ignore_ascii_case("down") => Side::Down,
+        _ => Side::Right,
+    }
+}
+
+fn bench_event_rate_hz() -> u64 {
+    std::env::var("MEOW_BENCH_EVENT_RATE_HZ")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1000)
+}
+
+fn bench_axis_delta(var_name: &str, default: i32) -> i32 {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+async fn run_bench_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, state: HostState) {
+    use tokio::time::{Duration, sleep};
+
+    let side = bench_side();
+    let event_rate_hz = bench_event_rate_hz();
+    let interval = Duration::from_nanos((1_000_000_000u64 / event_rate_hz).max(1));
+    let dx = bench_axis_delta("MEOW_BENCH_DX", 3);
+    let dy = bench_axis_delta("MEOW_BENCH_DY", 2);
+    info!(
+        "bench synthetic input active side={:?} rate_hz={} dx={} dy={}",
+        side, event_rate_hz, dx, dy
+    );
+
+    let mut seq_idx: u64 = 0;
+    loop {
+        let attached = {
+            let remotes = state.remotes.read().await;
+            remotes.contains_key(&side)
+        };
+
+        if attached {
+            let signed_dx = if seq_idx.is_multiple_of(2) { dx } else { -dx };
+            let signed_dy = if seq_idx.is_multiple_of(3) { dy } else { -dy };
+            let event = CapturedEvent::MouseMoveRelative {
+                dx: signed_dx,
+                dy: signed_dy,
+            };
+            if tx
+                .send(CapturedInput {
+                    target: ActiveTarget::from(side),
+                    event,
+                })
+                .is_err()
+            {
+                break;
+            }
+            seq_idx = seq_idx.saturating_add(1);
+            sleep(interval).await;
+        } else {
+            sleep(Duration::from_millis(10)).await;
         }
     }
 }

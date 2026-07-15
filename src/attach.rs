@@ -52,9 +52,13 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     info!("client attach complete, waiting for forwarded events");
 
     let mut enigo = Enigo::new();
-    let mut probe = args
-        .probe_received
-        .then(|| ClientReceiveProbe::new(&mut enigo, args.probe_duration_secs));
+    let mut probe = args.probe_received.then(|| {
+        ClientReceiveProbe::new(
+            &mut enigo,
+            args.probe_duration_secs,
+            !args.probe_summary_only,
+        )
+    });
     let probe_start = Instant::now();
     let mut last_signaled_edge: Option<ScreenEdge> = None;
     let mut edge_push = EdgePushTracker::new();
@@ -254,10 +258,12 @@ struct ClientReceiveProbe {
     first_message_elapsed: Option<std::time::Duration>,
     last_message_elapsed: Option<std::time::Duration>,
     max_inter_message_gap: std::time::Duration,
+    inter_message_gaps_ms: Vec<f64>,
+    verbose_events: bool,
 }
 
 impl ClientReceiveProbe {
-    fn new(enigo: &mut Enigo, duration_secs: u64) -> Self {
+    fn new(enigo: &mut Enigo, duration_secs: u64, verbose_events: bool) -> Self {
         let display_size = enigo.main_display_size();
         let start_cursor = enigo.mouse_location();
         println!(
@@ -287,6 +293,8 @@ impl ClientReceiveProbe {
             first_message_elapsed: None,
             last_message_elapsed: None,
             max_inter_message_gap: std::time::Duration::ZERO,
+            inter_message_gaps_ms: Vec::new(),
+            verbose_events,
         }
     }
 
@@ -303,13 +311,15 @@ impl ClientReceiveProbe {
         self.note_message(bytes_len, elapsed);
         self.total_messages += 1;
         self.input_messages += 1;
-        println!(
-            "probe t={:.3}s msg={} bytes={} type=input event={:?}",
-            elapsed.as_secs_f64(),
-            self.total_messages,
-            bytes_len,
-            event
-        );
+        if self.verbose_events {
+            println!(
+                "probe t={:.3}s msg={} bytes={} type=input event={:?}",
+                elapsed.as_secs_f64(),
+                self.total_messages,
+                bytes_len,
+                event
+            );
+        }
     }
 
     fn on_relative_mouse(
@@ -359,23 +369,25 @@ impl ClientReceiveProbe {
             self.edge_clamps += 1;
         }
 
-        println!(
-            "probe t={:.3}s msg={} bytes={} type=rel dx={} dy={} before=({}, {}) after=({}, {}) actual=({}, {}) edge={} sum_abs=({}, {})",
-            elapsed.as_secs_f64(),
-            self.total_messages,
-            bytes_len,
-            dx,
-            dy,
-            before.0,
-            before.1,
-            after.0,
-            after.1,
-            actual_dx,
-            actual_dy,
-            hit_edge,
-            self.sum_abs_dx,
-            self.sum_abs_dy
-        );
+        if self.verbose_events {
+            println!(
+                "probe t={:.3}s msg={} bytes={} type=rel dx={} dy={} before=({}, {}) after=({}, {}) actual=({}, {}) edge={} sum_abs=({}, {})",
+                elapsed.as_secs_f64(),
+                self.total_messages,
+                bytes_len,
+                dx,
+                dy,
+                before.0,
+                before.1,
+                after.0,
+                after.1,
+                actual_dx,
+                actual_dy,
+                hit_edge,
+                self.sum_abs_dx,
+                self.sum_abs_dy
+            );
+        }
     }
 
     fn print_summary(&self) {
@@ -391,6 +403,9 @@ impl ClientReceiveProbe {
         } else {
             self.total_bytes as f64 / self.total_messages as f64
         };
+        let p50_gap_ms = percentile(&self.inter_message_gaps_ms, 50.0);
+        let p95_gap_ms = percentile(&self.inter_message_gaps_ms, 95.0);
+        let p99_gap_ms = percentile(&self.inter_message_gaps_ms, 99.0);
 
         println!("client probe summary:");
         println!(
@@ -440,6 +455,10 @@ impl ClientReceiveProbe {
                 .as_secs_f64(),
             self.max_inter_message_gap.as_secs_f64()
         );
+        println!(
+            "  inter_msg_gap_ms_p50={:.3} inter_msg_gap_ms_p95={:.3} inter_msg_gap_ms_p99={:.3}",
+            p50_gap_ms, p95_gap_ms, p99_gap_ms
+        );
     }
 
     fn note_message(&mut self, bytes_len: usize, elapsed: std::time::Duration) {
@@ -456,9 +475,20 @@ impl ClientReceiveProbe {
         if let Some(last) = self.last_message_elapsed {
             let gap = elapsed.saturating_sub(last);
             self.max_inter_message_gap = self.max_inter_message_gap.max(gap);
+            self.inter_message_gaps_ms.push(gap.as_secs_f64() * 1000.0);
         }
         self.last_message_elapsed = Some(elapsed);
     }
+}
+
+fn percentile(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let rank = ((percentile / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[rank]
 }
 
 pub(crate) async fn run_test_inject() -> Result<()> {

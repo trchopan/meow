@@ -18,7 +18,7 @@ mod state;
 
 use attach::{run_attach, run_test_inject};
 use cli::{Cli, Command};
-use dev::run_dev_smoke;
+use dev::{run_bench_flush, run_dev_smoke};
 use host::run_host;
 use ipc::{IpcCommand, send_ipc, send_switch};
 use model::ActiveTarget;
@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
         Command::ResetIdentity => reset_identity().await,
         Command::RotateSecret => rotate_secret().await,
         Command::TestInject => run_test_inject().await,
+        Command::BenchFlush(args) => run_bench_flush(args).await,
         Command::Local => send_switch(ActiveTarget::Local).await,
         Command::Right => send_switch(ActiveTarget::Right).await,
         Command::Left => send_switch(ActiveTarget::Left).await,

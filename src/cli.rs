@@ -21,6 +21,8 @@ pub(crate) enum Command {
     RotateSecret,
     #[command(hide = true)]
     TestInject,
+    #[command(hide = true)]
+    BenchFlush(BenchFlushArgs),
     Local,
     Right,
     Left,
@@ -37,6 +39,26 @@ pub(crate) struct DevSmokeArgs {
     pub(crate) duration_secs: u64,
     #[arg(long, value_enum, default_value_t = Side::Right)]
     pub(crate) side: Side,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct BenchFlushArgs {
+    #[arg(long, default_value_t = 30)]
+    pub(crate) duration_secs: u64,
+    #[arg(long, value_enum, default_value_t = Side::Right)]
+    pub(crate) side: Side,
+    #[arg(long, default_value_t = 1000)]
+    pub(crate) event_rate_hz: u64,
+    #[arg(long, default_value_t = 5)]
+    pub(crate) runs: u64,
+    #[arg(long, default_value_t = 6)]
+    pub(crate) flush_a_ms: u64,
+    #[arg(long, default_value_t = 2)]
+    pub(crate) flush_b_ms: u64,
+    #[arg(long, default_value_t = 3)]
+    pub(crate) dx: i32,
+    #[arg(long, default_value_t = 2)]
+    pub(crate) dy: i32,
 }
 
 #[derive(Debug, clap::Args)]
@@ -57,6 +79,8 @@ pub(crate) struct AttachArgs {
     pub(crate) probe_duration_secs: u64,
     #[arg(long, default_value_t = false, hide = true)]
     pub(crate) no_inject: bool,
+    #[arg(long, default_value_t = false, hide = true)]
+    pub(crate) probe_summary_only: bool,
 }
 
 #[derive(Debug, clap::Args)]
