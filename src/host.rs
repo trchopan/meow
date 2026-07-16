@@ -14,6 +14,7 @@ use iroh::{
 };
 use rdev::{EventType, Key};
 use tokio::sync::mpsc;
+use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -27,7 +28,8 @@ use crate::{
     },
     presentation::print_host_ready,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, WireMessage, read_framed, send_wire_message, write_framed,
+        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, read_framed,
+        write_framed,
     },
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
 };
@@ -128,6 +130,7 @@ pub(crate) async fn run_host() -> Result<()> {
     }
 
     tokio::spawn(run_forward_loop(input_rx, state.clone()));
+    tokio::spawn(run_target_transition_guard(state.clone()));
 
     let control_state = state.clone();
     tokio::spawn(async move {
@@ -166,18 +169,6 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
         bail!("invalid secret from {remote_id}")
     }
 
-    {
-        let mut remotes = state.remotes.write().await;
-        remotes.insert(
-            auth.side,
-            RemotePeer {
-                connection: connection.clone(),
-                remote_id,
-                name: auth.name.clone(),
-            },
-        );
-    }
-
     write_framed(
         &mut send,
         &AuthResponse {
@@ -186,6 +177,39 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
         },
     )
     .await?;
+
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<HostToClientMessage>();
+    tokio::spawn(async move {
+        while let Some(message) = input_rx.recv().await {
+            if let Err(err) = write_framed(&mut send, &message).await {
+                debug!("host->client writer stream ended: {err:#}");
+                break;
+            }
+        }
+    });
+
+    {
+        let mut remotes = state.remotes.write().await;
+        let previous = remotes.insert(
+            auth.side,
+            RemotePeer {
+                input_tx,
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                remote_id,
+                name: auth.name.clone(),
+            },
+        );
+        if let Some(previous) = previous {
+            let seq = previous.next_seq.fetch_add(1, Ordering::Relaxed);
+            let _ = previous
+                .input_tx
+                .send(HostToClientMessage::ReleaseAll { seq });
+            info!(
+                "replaced existing remote on {:?}: old={} new={}",
+                auth.side, previous.remote_id, remote_id
+            );
+        }
+    }
 
     info!(
         "remote attached: {:?} ({remote_id}) name={}",
@@ -242,13 +266,10 @@ async fn run_client_feedback_loop(
     loop {
         let mut recv = connection.accept_uni().await?;
         let bytes = recv.read_to_end(crate::protocol::MAX_MSG_SIZE).await?;
-        let message: WireMessage = bincode::deserialize(&bytes)?;
+        let message: ClientToHostMessage = bincode::deserialize(&bytes)?;
         match message {
-            WireMessage::ClientEdgeReached { edge } => {
+            ClientToHostMessage::ClientEdgeReached { edge } => {
                 maybe_switch_to_local_on_edge(&state, side, edge, peer_name);
-            }
-            WireMessage::Input { .. } | WireMessage::MouseMoveRelative { .. } => {
-                debug!("ignoring unexpected client->host forwarded message from {peer_name}");
             }
         }
     }
@@ -315,8 +336,11 @@ async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state:
                             continue;
                         };
                         flush_relative_for_side(&state, &mut pending_relative, side).await;
-                        let message = WireMessage::Input { event };
-                        if !send_to_side(&state, side, &message).await {
+                        let message = HostToClientMessage::Input {
+                            seq: 0,
+                            event,
+                        };
+                        if !send_to_side(&state, side, message).await {
                             continue;
                         }
                     }
@@ -358,11 +382,11 @@ async fn flush_relative_for_side(
     if dx == 0 && dy == 0 {
         return;
     }
-    let message = WireMessage::MouseMoveRelative { dx, dy };
-    let _ = send_to_side(state, side, &message).await;
+    let message = HostToClientMessage::MouseMoveRelative { seq: 0, dx, dy };
+    let _ = send_to_side(state, side, message).await;
 }
 
-async fn send_to_side(state: &HostState, side: Side, message: &WireMessage) -> bool {
+async fn send_to_side(state: &HostState, side: Side, message: HostToClientMessage) -> bool {
     let peer = {
         let remotes = state.remotes.read().await;
         remotes.get(&side).cloned()
@@ -377,14 +401,65 @@ async fn send_to_side(state: &HostState, side: Side, message: &WireMessage) -> b
         return false;
     };
 
+    let seq = peer.next_seq.fetch_add(1, Ordering::Relaxed);
+    let with_seq = assign_sequence(message, seq);
+
     debug!("forwarding input event to {:?} ({})", side, peer.name);
-    if let Err(err) = send_wire_message(&peer.connection, message).await {
-        warn!("failed forwarding to {:?} ({}): {err:#}", side, peer.name);
+    if peer.input_tx.send(with_seq).is_err() {
+        warn!(
+            "failed forwarding to {:?} ({}): writer channel closed",
+            side, peer.name
+        );
         apply_target_change(state, ActiveTarget::Local, "forwarding failure");
         return false;
     }
 
     true
+}
+
+fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessage {
+    match message {
+        HostToClientMessage::Input { event, .. } => HostToClientMessage::Input { seq, event },
+        HostToClientMessage::MouseMoveRelative { dx, dy, .. } => {
+            HostToClientMessage::MouseMoveRelative { seq, dx, dy }
+        }
+        HostToClientMessage::ReleaseAll { .. } => HostToClientMessage::ReleaseAll { seq },
+    }
+}
+
+async fn run_target_transition_guard(state: HostState) {
+    let mut last_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+    loop {
+        time::sleep(Duration::from_millis(5)).await;
+        let current = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+        if current == last_target {
+            continue;
+        }
+
+        if let Some(previous_side) = last_target.to_side()
+            && current.to_side() != Some(previous_side)
+        {
+            send_release_all_to_side(&state, previous_side).await;
+        }
+        last_target = current;
+    }
+}
+
+async fn send_release_all_to_side(state: &HostState, side: Side) {
+    let peer = {
+        let remotes = state.remotes.read().await;
+        remotes.get(&side).cloned()
+    };
+
+    let Some(peer) = peer else {
+        return;
+    };
+
+    let seq = peer.next_seq.fetch_add(1, Ordering::Relaxed);
+    let message = HostToClientMessage::ReleaseAll { seq };
+    if peer.input_tx.send(message).is_err() {
+        warn!("failed sending release-all to {:?} ({})", side, peer.name);
+    }
 }
 
 async fn maybe_switch_to_remote_on_host_edge(state: &HostState, edge: ScreenEdge) {

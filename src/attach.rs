@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use enigo::{Enigo, MouseControllable};
+use enigo::{Enigo, MouseButton, MouseControllable};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::presets};
-use rdev::{EventType, Key, simulate};
+use rdev::{Button, EventType, Key, simulate};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -12,8 +13,8 @@ use crate::{
     cli::AttachArgs,
     model::ScreenEdge,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, MAX_MSG_SIZE, WireMessage, read_framed, send_wire_message,
-        write_framed,
+        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, read_framed,
+        read_framed_with_size, send_client_feedback, write_framed,
     },
 };
 
@@ -62,47 +63,64 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let probe_start = Instant::now();
     let mut last_signaled_edge: Option<ScreenEdge> = None;
     let mut edge_push = EdgePushTracker::new();
+    let mut input_state = ClientInputState::default();
+    let mut sequence_tracker = SequenceTracker::default();
 
-    loop {
+    let mut probe_completed = false;
+    let run_result: Result<()> = loop {
         if let Some(probe) = probe.as_ref()
             && probe.is_finished(probe_start)
         {
-            probe.print_summary();
-            println!("probe complete");
-            return Ok(());
+            probe_completed = true;
+            break Ok(());
         }
 
-        let mut recv = connection.accept_uni().await?;
-        let bytes = recv.read_to_end(MAX_MSG_SIZE).await?;
-        debug!(
-            "client received {} byte(s) on forwarded stream",
-            bytes.len()
-        );
-        let message: WireMessage = bincode::deserialize(&bytes)?;
+        let (message, frame_size): (HostToClientMessage, usize) =
+            match read_framed_with_size(&mut recv).await {
+                Ok(frame) => frame,
+                Err(err) => break Err(err),
+            };
+        debug!("client received {} byte(s) on forwarded stream", frame_size);
+        let elapsed = probe_start.elapsed();
         match message {
-            WireMessage::Input { event } => {
+            HostToClientMessage::Input { seq, event } => {
+                let seq_status = sequence_tracker.observe(seq);
+                let meta = ProbeMessageMeta {
+                    seq,
+                    bytes_len: frame_size,
+                    elapsed,
+                };
                 if let Some(probe) = probe.as_mut() {
-                    probe.on_input_event(&event, bytes.len(), probe_start.elapsed());
+                    probe.note_sequence(seq_status);
+                    probe.on_input_event(
+                        &event,
+                        meta,
+                        &mut enigo,
+                        &mut input_state,
+                        args.no_inject,
+                    );
+                    probe.note_held_counts(&input_state);
                 }
                 debug!("client received input event: {:?}", event);
-                if !args.no_inject {
-                    if let Err(err) = simulate(&event) {
-                        warn!("failed injecting input event: {err:?}");
+                if probe.is_none() && !args.no_inject {
+                    if let Err(err) = inject_input_event(&event, &mut enigo, &mut input_state) {
+                        warn!("failed injecting input event: {err}");
                     } else {
-                        debug!("client simulate ok for event: {:?}", event);
+                        debug!("client injection ok for event: {:?}", event);
                     }
                 }
             }
-            WireMessage::MouseMoveRelative { dx, dy } => {
+            HostToClientMessage::MouseMoveRelative { seq, dx, dy } => {
+                let seq_status = sequence_tracker.observe(seq);
+                let meta = ProbeMessageMeta {
+                    seq,
+                    bytes_len: frame_size,
+                    elapsed,
+                };
                 if let Some(probe) = probe.as_mut() {
-                    probe.on_relative_mouse(
-                        dx,
-                        dy,
-                        bytes.len(),
-                        &mut enigo,
-                        probe_start.elapsed(),
-                        args.no_inject,
-                    );
+                    probe.note_sequence(seq_status);
+                    probe.on_relative_mouse(dx, dy, meta, &mut enigo, args.no_inject);
+                    probe.note_held_counts(&input_state);
                 }
                 debug!("client received relative mouse move: dx={dx}, dy={dy}");
                 if probe.is_none() && !args.no_inject {
@@ -121,8 +139,8 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     if edge_push.register_outward_push(edge, push_amount, Instant::now())
                         && Some(edge) != last_signaled_edge
                     {
-                        let message = WireMessage::ClientEdgeReached { edge };
-                        if let Err(err) = send_wire_message(&connection, &message).await {
+                        let message = ClientToHostMessage::ClientEdgeReached { edge };
+                        if let Err(err) = send_client_feedback(&connection, &message).await {
                             warn!("failed sending edge feedback to host: {err:#}");
                         } else {
                             debug!("sent edge feedback to host: {:?}", edge);
@@ -131,11 +149,46 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     }
                 }
             }
-            WireMessage::ClientEdgeReached { .. } => {
-                debug!("ignoring unexpected host->client edge feedback message");
+            HostToClientMessage::ReleaseAll { seq } => {
+                let seq_status = sequence_tracker.observe(seq);
+                if let Some(probe) = probe.as_mut() {
+                    probe.note_sequence(seq_status);
+                    probe.on_release_all(
+                        seq,
+                        frame_size,
+                        &mut enigo,
+                        &mut input_state,
+                        elapsed,
+                        args.no_inject,
+                    );
+                    probe.note_held_counts(&input_state);
+                } else if !args.no_inject {
+                    let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+                    if failures > 0 {
+                        warn!("release-all had {failures} injection failure(s)");
+                    }
+                }
             }
         }
+    };
+
+    if !args.no_inject {
+        let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+        if failures > 0 {
+            warn!("attach cleanup had {failures} injection failure(s)");
+        }
     }
+
+    if let Some(probe) = probe.as_mut() {
+        probe.note_held_counts(&input_state);
+        if probe_completed {
+            probe.print_summary();
+            println!("probe complete");
+            return Ok(());
+        }
+    }
+
+    run_result
 }
 
 fn detect_client_edge_push(
@@ -184,6 +237,168 @@ fn detect_client_edge_push(
     }
 
     None
+}
+
+fn inject_input_event(
+    event: &EventType,
+    enigo: &mut Enigo,
+    state: &mut ClientInputState,
+) -> Result<()> {
+    if let Some((button, pressed)) = map_mouse_button_event(event) {
+        if pressed {
+            enigo.mouse_down(button);
+        } else {
+            enigo.mouse_up(button);
+        }
+        if let EventType::ButtonPress(raw_button) = event {
+            state.pressed_buttons.insert(*raw_button);
+        } else if let EventType::ButtonRelease(raw_button) = event {
+            state.pressed_buttons.remove(raw_button);
+        }
+        return Ok(());
+    }
+
+    simulate(event).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    match event {
+        EventType::KeyPress(key) => {
+            state.pressed_keys.insert(*key);
+        }
+        EventType::KeyRelease(key) => {
+            state.pressed_keys.remove(key);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn map_mouse_button_event(event: &EventType) -> Option<(MouseButton, bool)> {
+    match event {
+        EventType::ButtonPress(button) => {
+            map_rdev_mouse_button(*button).map(|mapped| (mapped, true))
+        }
+        EventType::ButtonRelease(button) => {
+            map_rdev_mouse_button(*button).map(|mapped| (mapped, false))
+        }
+        _ => None,
+    }
+}
+
+fn map_rdev_mouse_button(button: Button) -> Option<MouseButton> {
+    match button {
+        Button::Left => Some(MouseButton::Left),
+        Button::Middle => Some(MouseButton::Middle),
+        Button::Right => Some(MouseButton::Right),
+        Button::Unknown(_) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeButtonEvent {
+    pressed: bool,
+    middle: bool,
+}
+
+fn classify_probe_button_event(event: &EventType) -> Option<ProbeButtonEvent> {
+    match event {
+        EventType::ButtonPress(button) => Some(ProbeButtonEvent {
+            pressed: true,
+            middle: matches!(button, Button::Middle),
+        }),
+        EventType::ButtonRelease(button) => Some(ProbeButtonEvent {
+            pressed: false,
+            middle: matches!(button, Button::Middle),
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceStatus {
+    InOrder,
+    Gap { missing: u64 },
+    DuplicateOrOutOfOrder,
+}
+
+#[derive(Default)]
+struct SequenceTracker {
+    last_seq: Option<u64>,
+}
+
+impl SequenceTracker {
+    fn observe(&mut self, seq: u64) -> SequenceStatus {
+        let status = match self.last_seq {
+            None => SequenceStatus::InOrder,
+            Some(last) if seq == last.saturating_add(1) => SequenceStatus::InOrder,
+            Some(last) if seq > last.saturating_add(1) => SequenceStatus::Gap {
+                missing: seq.saturating_sub(last).saturating_sub(1),
+            },
+            Some(_) => SequenceStatus::DuplicateOrOutOfOrder,
+        };
+        if self.last_seq.is_none_or(|last| seq > last) {
+            self.last_seq = Some(seq);
+        }
+        status
+    }
+}
+
+#[derive(Default)]
+struct ClientInputState {
+    pressed_keys: HashSet<Key>,
+    pressed_buttons: HashSet<Button>,
+}
+
+fn release_all_pressed_inputs(enigo: &mut Enigo, state: &mut ClientInputState) -> u64 {
+    let mut failures = 0u64;
+
+    let mut buttons = state.pressed_buttons.iter().copied().collect::<Vec<_>>();
+    buttons.sort_by_key(button_release_order);
+    for button in buttons {
+        if let Some(mapped) = map_rdev_mouse_button(button) {
+            enigo.mouse_up(mapped);
+        }
+        state.pressed_buttons.remove(&button);
+    }
+
+    let mut keys = state.pressed_keys.iter().copied().collect::<Vec<_>>();
+    keys.sort_by_key(key_release_order);
+    for key in keys {
+        let event = EventType::KeyRelease(key);
+        if let Err(err) = simulate(&event) {
+            warn!("failed releasing stuck key {:?}: {err:?}", key);
+            failures = failures.saturating_add(1);
+            continue;
+        }
+        state.pressed_keys.remove(&key);
+    }
+
+    failures
+}
+
+fn button_release_order(button: &Button) -> u8 {
+    match button {
+        Button::Left => 0,
+        Button::Middle => 1,
+        Button::Right => 2,
+        Button::Unknown(_) => 3,
+    }
+}
+
+fn key_release_order(key: &Key) -> u8 {
+    if is_modifier_key(*key) { 1 } else { 0 }
+}
+
+fn is_modifier_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::Alt
+            | Key::AltGr
+            | Key::MetaLeft
+            | Key::MetaRight
+    )
 }
 
 struct EdgePushTracker {
@@ -242,6 +457,16 @@ struct ClientReceiveProbe {
     total_messages: u64,
     relative_messages: u64,
     input_messages: u64,
+    input_button_presses: u64,
+    input_button_releases: u64,
+    middle_button_presses: u64,
+    middle_button_releases: u64,
+    input_injection_failures: u64,
+    release_all_messages: u64,
+    sequence_gaps: u64,
+    sequence_out_of_order: u64,
+    held_keys: usize,
+    held_buttons: usize,
     sum_dx: i64,
     sum_dy: i64,
     sum_abs_dx: u64,
@@ -262,6 +487,13 @@ struct ClientReceiveProbe {
     verbose_events: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ProbeMessageMeta {
+    seq: u64,
+    bytes_len: usize,
+    elapsed: std::time::Duration,
+}
+
 impl ClientReceiveProbe {
     fn new(enigo: &mut Enigo, duration_secs: u64, verbose_events: bool) -> Self {
         let display_size = enigo.main_display_size();
@@ -277,6 +509,16 @@ impl ClientReceiveProbe {
             total_messages: 0,
             relative_messages: 0,
             input_messages: 0,
+            input_button_presses: 0,
+            input_button_releases: 0,
+            middle_button_presses: 0,
+            middle_button_releases: 0,
+            input_injection_failures: 0,
+            release_all_messages: 0,
+            sequence_gaps: 0,
+            sequence_out_of_order: 0,
+            held_keys: 0,
+            held_buttons: 0,
             sum_dx: 0,
             sum_dy: 0,
             sum_abs_dx: 0,
@@ -305,19 +547,47 @@ impl ClientReceiveProbe {
     fn on_input_event(
         &mut self,
         event: &EventType,
-        bytes_len: usize,
-        elapsed: std::time::Duration,
+        meta: ProbeMessageMeta,
+        enigo: &mut Enigo,
+        input_state: &mut ClientInputState,
+        no_inject: bool,
     ) {
-        self.note_message(bytes_len, elapsed);
+        self.note_message(meta.bytes_len, meta.elapsed);
         self.total_messages += 1;
         self.input_messages += 1;
+        if let Some(button_event) = classify_probe_button_event(event) {
+            if button_event.pressed {
+                self.input_button_presses += 1;
+                if button_event.middle {
+                    self.middle_button_presses += 1;
+                }
+            } else {
+                self.input_button_releases += 1;
+                if button_event.middle {
+                    self.middle_button_releases += 1;
+                }
+            }
+        }
+
+        let injection_status = if no_inject {
+            "skip"
+        } else if let Err(err) = inject_input_event(event, enigo, input_state) {
+            self.input_injection_failures += 1;
+            warn!("probe failed injecting input event {:?}: {err}", event);
+            "fail"
+        } else {
+            "ok"
+        };
+
         if self.verbose_events {
             println!(
-                "probe t={:.3}s msg={} bytes={} type=input event={:?}",
-                elapsed.as_secs_f64(),
+                "probe t={:.3}s msg={} seq={} bytes={} type=input event={:?} inject={}",
+                meta.elapsed.as_secs_f64(),
                 self.total_messages,
-                bytes_len,
-                event
+                meta.seq,
+                meta.bytes_len,
+                event,
+                injection_status
             );
         }
     }
@@ -326,12 +596,11 @@ impl ClientReceiveProbe {
         &mut self,
         dx: i32,
         dy: i32,
-        bytes_len: usize,
+        meta: ProbeMessageMeta,
         enigo: &mut Enigo,
-        elapsed: std::time::Duration,
         no_inject: bool,
     ) {
-        self.note_message(bytes_len, elapsed);
+        self.note_message(meta.bytes_len, meta.elapsed);
         self.total_messages += 1;
         self.relative_messages += 1;
         self.sum_dx += dx as i64;
@@ -371,10 +640,11 @@ impl ClientReceiveProbe {
 
         if self.verbose_events {
             println!(
-                "probe t={:.3}s msg={} bytes={} type=rel dx={} dy={} before=({}, {}) after=({}, {}) actual=({}, {}) edge={} sum_abs=({}, {})",
-                elapsed.as_secs_f64(),
+                "probe t={:.3}s msg={} seq={} bytes={} type=rel dx={} dy={} before=({}, {}) after=({}, {}) actual=({}, {}) edge={} sum_abs=({}, {})",
+                meta.elapsed.as_secs_f64(),
                 self.total_messages,
-                bytes_len,
+                meta.seq,
+                meta.bytes_len,
                 dx,
                 dy,
                 before.0,
@@ -388,6 +658,56 @@ impl ClientReceiveProbe {
                 self.sum_abs_dy
             );
         }
+    }
+
+    fn on_release_all(
+        &mut self,
+        seq: u64,
+        bytes_len: usize,
+        enigo: &mut Enigo,
+        input_state: &mut ClientInputState,
+        elapsed: std::time::Duration,
+        no_inject: bool,
+    ) {
+        self.note_message(bytes_len, elapsed);
+        self.total_messages += 1;
+        self.release_all_messages += 1;
+
+        let status = if no_inject {
+            "skip"
+        } else {
+            let failures = release_all_pressed_inputs(enigo, input_state);
+            self.input_injection_failures = self.input_injection_failures.saturating_add(failures);
+            if failures == 0 { "ok" } else { "fail" }
+        };
+
+        if self.verbose_events {
+            println!(
+                "probe t={:.3}s msg={} seq={} bytes={} type=release_all inject={}",
+                elapsed.as_secs_f64(),
+                self.total_messages,
+                seq,
+                bytes_len,
+                status
+            );
+        }
+    }
+
+    fn note_sequence(&mut self, status: SequenceStatus) {
+        match status {
+            SequenceStatus::InOrder => {}
+            SequenceStatus::Gap { missing } => {
+                self.sequence_gaps = self.sequence_gaps.saturating_add(missing);
+            }
+            SequenceStatus::DuplicateOrOutOfOrder => {
+                self.sequence_out_of_order = self.sequence_out_of_order.saturating_add(1);
+            }
+        }
+    }
+
+    fn note_held_counts(&mut self, input_state: &ClientInputState) {
+        self.held_keys = input_state.pressed_keys.len();
+        self.held_buttons = input_state.pressed_buttons.len();
     }
 
     fn print_summary(&self) {
@@ -419,6 +739,25 @@ impl ClientReceiveProbe {
         println!("  total_messages={}", self.total_messages);
         println!("  relative_messages={}", self.relative_messages);
         println!("  input_messages={}", self.input_messages);
+        println!(
+            "  input_button_presses={} input_button_releases={}",
+            self.input_button_presses, self.input_button_releases
+        );
+        println!(
+            "  middle_button_presses={} middle_button_releases={}",
+            self.middle_button_presses, self.middle_button_releases
+        );
+        println!(
+            "  input_injection_failures={}",
+            self.input_injection_failures
+        );
+        println!("  release_all_messages={}", self.release_all_messages);
+        println!("  sequence_gaps={}", self.sequence_gaps);
+        println!("  sequence_out_of_order={}", self.sequence_out_of_order);
+        println!(
+            "  held_keys_end={} held_buttons_end={}",
+            self.held_keys, self.held_buttons
+        );
         println!("  sum_dx={} sum_dy={}", self.sum_dx, self.sum_dy);
         println!(
             "  sum_abs_dx={} sum_abs_dy={}",
@@ -567,5 +906,73 @@ mod tests {
     fn detect_client_edge_push_none_when_not_at_edge() {
         let edge = detect_client_edge_push((100, 100), (104, 100), (1920, 1080), 4, 0);
         assert_eq!(edge, None);
+    }
+
+    #[test]
+    fn map_mouse_button_event_maps_middle_press() {
+        let mapped = map_mouse_button_event(&EventType::ButtonPress(Button::Middle));
+        assert_eq!(mapped, Some((MouseButton::Middle, true)));
+    }
+
+    #[test]
+    fn map_mouse_button_event_maps_left_release() {
+        let mapped = map_mouse_button_event(&EventType::ButtonRelease(Button::Left));
+        assert_eq!(mapped, Some((MouseButton::Left, false)));
+    }
+
+    #[test]
+    fn map_mouse_button_event_ignores_unknown_button() {
+        let mapped = map_mouse_button_event(&EventType::ButtonPress(Button::Unknown(8)));
+        assert_eq!(mapped, None);
+    }
+
+    #[test]
+    fn map_mouse_button_event_ignores_non_button_event() {
+        let mapped = map_mouse_button_event(&EventType::KeyPress(Key::KeyA));
+        assert_eq!(mapped, None);
+    }
+
+    #[test]
+    fn classify_probe_button_event_tracks_middle_press() {
+        let event = classify_probe_button_event(&EventType::ButtonPress(Button::Middle));
+        assert_eq!(
+            event,
+            Some(ProbeButtonEvent {
+                pressed: true,
+                middle: true,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_probe_button_event_tracks_release_non_middle() {
+        let event = classify_probe_button_event(&EventType::ButtonRelease(Button::Left));
+        assert_eq!(
+            event,
+            Some(ProbeButtonEvent {
+                pressed: false,
+                middle: false,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_probe_button_event_ignores_non_button_event() {
+        let event = classify_probe_button_event(&EventType::KeyPress(Key::KeyA));
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn sequence_tracker_detects_gap_and_out_of_order() {
+        let mut tracker = SequenceTracker::default();
+        assert_eq!(tracker.observe(1), SequenceStatus::InOrder);
+        assert_eq!(tracker.observe(3), SequenceStatus::Gap { missing: 1 });
+        assert_eq!(tracker.observe(2), SequenceStatus::DuplicateOrOutOfOrder);
+    }
+
+    #[test]
+    fn key_release_order_puts_modifiers_last() {
+        assert!(key_release_order(&Key::KeyA) < key_release_order(&Key::MetaLeft));
+        assert!(key_release_order(&Key::KeyA) < key_release_order(&Key::ControlLeft));
     }
 }

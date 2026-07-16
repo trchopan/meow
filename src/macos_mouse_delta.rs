@@ -36,12 +36,27 @@ pub(crate) fn run_macos_mouse_delta_capture(
             CGEventType::LeftMouseDragged,
             CGEventType::RightMouseDragged,
             CGEventType::OtherMouseDragged,
+            CGEventType::OtherMouseDown,
+            CGEventType::OtherMouseUp,
         ],
-        move |_proxy, _event_type, event: &CGEvent| {
+        move |_proxy, event_type, event: &CGEvent| {
             let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
             let is_remote = target.to_side().is_some();
             if !is_remote || !pointer_lock_active.load(Ordering::Relaxed) {
                 return Some(event.clone());
+            }
+
+            if let Some(button_event) = map_other_mouse_button_event(event_type, event) {
+                if tx
+                    .send(CapturedInput {
+                        target,
+                        event: CapturedEvent::Raw(button_event),
+                    })
+                    .is_err()
+                {
+                    warn!("failed to queue macOS middle mouse button event for forwarding");
+                }
+                return None;
             }
 
             let dx = clamp_relative_delta(
@@ -92,6 +107,26 @@ pub(crate) fn run_macos_mouse_delta_capture(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn map_other_mouse_button_event(
+    event_type: core_graphics::event::CGEventType,
+    event: &core_graphics::event::CGEvent,
+) -> Option<rdev::EventType> {
+    use core_graphics::event::{CGEventType, EventField};
+    use rdev::{Button, EventType};
+
+    let button_number = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+    if button_number != 2 {
+        return None;
+    }
+
+    match event_type {
+        CGEventType::OtherMouseDown => Some(EventType::ButtonPress(Button::Middle)),
+        CGEventType::OtherMouseUp => Some(EventType::ButtonRelease(Button::Middle)),
+        _ => None,
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_macos_mouse_delta_capture(
     _tx: mpsc::UnboundedSender<CapturedInput>,
@@ -100,4 +135,32 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
 ) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn map_other_mouse_button_event_maps_middle_press() {
+        use core_graphics::event::{CGEvent, CGEventType, CGMouseButton, EventField};
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        use core_graphics::geometry::CGPoint;
+        use rdev::{Button, EventType};
+
+        let source =
+            CGEventSource::new(CGEventSourceStateID::CombinedSessionState).expect("event source");
+        let event = CGEvent::new_mouse_event(
+            source,
+            CGEventType::OtherMouseDown,
+            CGPoint::new(100.0, 200.0),
+            CGMouseButton::Center,
+        )
+        .expect("mouse event");
+        event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, 2);
+
+        let mapped = map_other_mouse_button_event(CGEventType::OtherMouseDown, &event);
+        assert_eq!(mapped, Some(EventType::ButtonPress(Button::Middle)));
+    }
 }

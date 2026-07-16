@@ -3,15 +3,18 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8},
+        atomic::{AtomicBool, AtomicU8, AtomicU64},
     },
 };
 
 use clap::ValueEnum;
-use iroh::{EndpointId, endpoint::Connection};
+use iroh::EndpointId;
 use rdev::EventType;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
+
+use crate::protocol::HostToClientMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -147,7 +150,8 @@ pub(crate) enum CapturedEvent {
 
 #[derive(Clone)]
 pub(crate) struct RemotePeer {
-    pub(crate) connection: Connection,
+    pub(crate) input_tx: mpsc::UnboundedSender<HostToClientMessage>,
+    pub(crate) next_seq: Arc<AtomicU64>,
     pub(crate) remote_id: EndpointId,
     pub(crate) name: String,
 }
