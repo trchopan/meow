@@ -250,6 +250,10 @@ fn inject_input_event(
     enigo: &mut Enigo,
     state: &mut ClientInputState,
 ) -> Result<()> {
+    if should_skip_client_key_event(event) {
+        return Ok(());
+    }
+
     if let Some((button, pressed)) = map_mouse_button_event(event) {
         if pressed {
             enigo.mouse_down(button);
@@ -296,6 +300,22 @@ fn map_rdev_mouse_button(button: Button) -> Option<MouseButton> {
         Button::Right => Some(MouseButton::Right),
         Button::Unknown(_) => None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn should_skip_client_key_event(event: &EventType) -> bool {
+    matches!(
+        event,
+        EventType::KeyPress(Key::Function)
+            | EventType::KeyRelease(Key::Function)
+            | EventType::KeyPress(Key::Unknown(63))
+            | EventType::KeyRelease(Key::Unknown(63))
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn should_skip_client_key_event(_event: &EventType) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +389,10 @@ fn release_all_pressed_inputs(enigo: &mut Enigo, state: &mut ClientInputState) -
     keys.sort_by_key(key_release_order);
     for key in keys {
         let event = EventType::KeyRelease(key);
+        if should_skip_client_key_event(&event) {
+            state.pressed_keys.remove(&key);
+            continue;
+        }
         if let Err(err) = simulate(&event) {
             warn!("failed releasing stuck key {:?}: {err:?}", key);
             failures = failures.saturating_add(1);
@@ -980,5 +1004,47 @@ mod tests {
     fn key_release_order_puts_modifiers_last() {
         assert!(key_release_order(&Key::KeyA) < key_release_order(&Key::MetaLeft));
         assert!(key_release_order(&Key::KeyA) < key_release_order(&Key::ControlLeft));
+    }
+
+    #[test]
+    fn should_skip_client_key_event_for_function_key_is_platform_specific() {
+        let press = EventType::KeyPress(Key::Function);
+        let release = EventType::KeyRelease(Key::Function);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(should_skip_client_key_event(&press));
+            assert!(should_skip_client_key_event(&release));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!should_skip_client_key_event(&press));
+            assert!(!should_skip_client_key_event(&release));
+        }
+    }
+
+    #[test]
+    fn should_skip_client_key_event_keeps_non_function_keys() {
+        let event = EventType::KeyPress(Key::KeyA);
+        assert!(!should_skip_client_key_event(&event));
+    }
+
+    #[test]
+    fn should_skip_client_key_event_for_raw_function_keycode_on_macos() {
+        let press = EventType::KeyPress(Key::Unknown(63));
+        let release = EventType::KeyRelease(Key::Unknown(63));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(should_skip_client_key_event(&press));
+            assert!(should_skip_client_key_event(&release));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!should_skip_client_key_event(&press));
+            assert!(!should_skip_client_key_event(&release));
+        }
     }
 }
