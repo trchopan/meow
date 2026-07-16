@@ -12,7 +12,7 @@ macOS-first keyboard and mouse sharing over iroh.
 
 ## What It Does
 
-`meow` runs a host daemon on the machine with your physical keyboard/mouse, then forwards input to attached machines over iroh.
+`meow` runs a host daemon on the machine with your physical keyboard/mouse, then forwards input to attached machines over [iroh](https://www.iroh.computer).
 
 You can switch active targets from the host with directional commands (`meow right`, `meow left`, etc.) or return to local control (`meow local`).
 
