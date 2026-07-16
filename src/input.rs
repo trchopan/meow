@@ -10,11 +10,12 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use rdev::{EventType, Key, grab};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{info, warn};
 
 use crate::{
     host_mouse,
-    model::{ActiveTarget, CapturedEvent, CapturedInput, ScreenEdge},
+    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats, ScreenEdge},
 };
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
@@ -33,13 +34,22 @@ pub(crate) struct DetachChord {
 }
 
 pub(crate) fn run_input_grab(
-    tx: mpsc::UnboundedSender<CapturedInput>,
+    tx: mpsc::Sender<CapturedInput>,
+    runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     detach_chord: DetachChord,
 ) -> Result<()> {
+    let send_ctx = CaptureSendContext {
+        runtime_stats: runtime_stats.clone(),
+        active_target: active_target.clone(),
+        pointer_lock_active: pointer_lock_active.clone(),
+        pointer_hidden: pointer_hidden.clone(),
+        pinned_pointer_pos: pinned_pointer_pos.clone(),
+    };
+
     let pressed_keys: Arc<Mutex<HashSet<Key>>> = Arc::new(Mutex::new(HashSet::new()));
     let last_mouse_pos: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
     let local_edge_push: Arc<Mutex<EdgePushTracker>> = Arc::new(Mutex::new(EdgePushTracker::new()));
@@ -119,10 +129,14 @@ pub(crate) fn run_input_grab(
                     let push = detect_host_edge_push(x, y, dx, dy);
                     if let Some((edge, push_amount)) = push {
                         if edge_push.register_outward_push(edge, push_amount, now) {
-                            let _ = tx.send(CapturedInput {
-                                target: ActiveTarget::Local,
-                                event: CapturedEvent::HostEdgeReached { edge },
-                            });
+                            try_send_captured_input(
+                                &tx,
+                                &send_ctx,
+                                CapturedInput {
+                                    target: ActiveTarget::Local,
+                                    event: CapturedEvent::HostEdgeReached { edge },
+                                },
+                            );
                         }
                     } else {
                         edge_push.reset();
@@ -179,16 +193,100 @@ pub(crate) fn run_input_grab(
                     other => CapturedEvent::Raw(other),
                 };
 
-                let _ = tx.send(CapturedInput {
-                    target,
-                    event: captured_event,
-                });
+                let drop_if_full =
+                    matches!(&captured_event, CapturedEvent::MouseMoveRelative { .. });
+                try_send_captured_input_with_policy(
+                    &tx,
+                    &send_ctx,
+                    CapturedInput {
+                        target,
+                        event: captured_event,
+                    },
+                    drop_if_full,
+                );
                 None
             }
         }
     };
 
     grab(callback).map_err(|e| anyhow!("input grab failed: {e:?}"))
+}
+
+fn try_send_captured_input(
+    tx: &mpsc::Sender<CapturedInput>,
+    send_ctx: &CaptureSendContext,
+    captured: CapturedInput,
+) {
+    try_send_captured_input_with_policy(tx, send_ctx, captured, false);
+}
+
+fn try_send_captured_input_with_policy(
+    tx: &mpsc::Sender<CapturedInput>,
+    send_ctx: &CaptureSendContext,
+    captured: CapturedInput,
+    drop_if_full: bool,
+) {
+    match tx.try_send(captured) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) if drop_if_full => {
+            send_ctx
+                .runtime_stats
+                .captured_queue_full_mouse_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Full(_)) => {
+            send_ctx
+                .runtime_stats
+                .captured_queue_full_non_mouse_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            force_local_on_capture_saturation(
+                &send_ctx.active_target,
+                &send_ctx.pointer_lock_active,
+                &send_ctx.pointer_hidden,
+                &send_ctx.pinned_pointer_pos,
+            );
+            warn!("captured input queue full; dropping non-mouse event");
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!("captured input queue closed; dropping event");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CaptureSendContext {
+    runtime_stats: Arc<RuntimeStats>,
+    active_target: Arc<AtomicU8>,
+    pointer_lock_active: Arc<AtomicBool>,
+    pointer_hidden: Arc<AtomicBool>,
+    pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+}
+
+fn force_local_on_capture_saturation(
+    active_target: &Arc<AtomicU8>,
+    pointer_lock_active: &Arc<AtomicBool>,
+    pointer_hidden: &Arc<AtomicBool>,
+    pinned_pointer_pos: &Arc<Mutex<Option<(f64, f64)>>>,
+) {
+    let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
+    if matches!(target, ActiveTarget::Local) {
+        return;
+    }
+
+    active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+    pointer_lock_active.store(false, Ordering::Relaxed);
+    if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+        warn!("failed to disable pointer dissociation after queue saturation: {err:#}");
+    }
+    let was_hidden = pointer_hidden.swap(false, Ordering::Relaxed);
+    if was_hidden && let Err(err) = host_mouse::set_pointer_visible(true) {
+        warn!("failed to show pointer after queue saturation: {err:#}");
+        pointer_hidden.store(true, Ordering::Relaxed);
+    }
+    let mut pinned = pinned_pointer_pos
+        .lock()
+        .expect("pinned pointer mutex poisoned");
+    *pinned = None;
 }
 
 pub(crate) fn parse_detach_chord(chord: &str) -> Result<DetachChord> {

@@ -37,6 +37,10 @@ pub(crate) struct StatusPayload {
     pub(crate) active: ActiveTarget,
     pub(crate) pointer_mode: RemotePointerMode,
     pub(crate) attached: Vec<Side>,
+    pub(crate) captured_queue_full_mouse_dropped: u64,
+    pub(crate) captured_queue_full_non_mouse_dropped: u64,
+    pub(crate) writer_queue_full_dropped: u64,
+    pub(crate) writer_queue_full_forced_local: u64,
 }
 
 pub(crate) async fn send_switch(target: ActiveTarget) -> Result<()> {
@@ -71,14 +75,25 @@ pub(crate) async fn run_control_socket(state: HostState) -> Result<()> {
     info!("control socket ready: {}", socket.display());
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_control_request(&mut stream, state).await {
-                error!("control request error: {err:#}");
+        let maybe_stream = tokio::select! {
+            _ = state.shutdown_notify.notified() => {
+                break;
             }
-        });
+            accepted = listener.accept() => Some(accepted?),
+        };
+
+        if let Some((mut stream, _)) = maybe_stream {
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(err) = handle_control_request(&mut stream, state).await {
+                    error!("control request error: {err:#}");
+                }
+            });
+        }
     }
+
+    let _ = std::fs::remove_file(socket);
+    Ok(())
 }
 
 async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Result<()> {
@@ -96,6 +111,9 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
         },
         IpcCommand::Stop => {
             apply_target_change(&state, ActiveTarget::Local, "daemon stop");
+            ensure_pointer_restored();
+            state.shutdown_requested.store(true, Ordering::Relaxed);
+            state.shutdown_notify.notify_waiters();
             let response = IpcResponse {
                 ok: true,
                 message: "stopping host daemon".to_string(),
@@ -103,8 +121,7 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
             };
             let payload = serde_json::to_vec(&response)?;
             stream.write_all(&payload).await?;
-            let _ = std::fs::remove_file(socket_path()?);
-            std::process::exit(0);
+            return Ok(());
         }
     };
 
@@ -112,6 +129,19 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
     stream.write_all(&payload).await?;
     Ok(())
 }
+
+#[cfg(not(test))]
+pub(crate) fn ensure_pointer_restored() {
+    if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+        warn!("failed to disable pointer dissociation during shutdown: {err:#}");
+    }
+    if let Err(err) = host_mouse::set_pointer_visible(true) {
+        warn!("failed to show pointer during shutdown: {err:#}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_pointer_restored() {}
 
 async fn switch_target(state: &HostState, target: ActiveTarget) -> IpcResponse {
     if let Some(side) = target.to_side() {
@@ -221,6 +251,22 @@ async fn status_payload(state: &HostState) -> StatusPayload {
         active: ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)),
         pointer_mode: RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed)),
         attached,
+        captured_queue_full_mouse_dropped: state
+            .runtime_stats
+            .captured_queue_full_mouse_dropped
+            .load(Ordering::Relaxed),
+        captured_queue_full_non_mouse_dropped: state
+            .runtime_stats
+            .captured_queue_full_non_mouse_dropped
+            .load(Ordering::Relaxed),
+        writer_queue_full_dropped: state
+            .runtime_stats
+            .writer_queue_full_dropped
+            .load(Ordering::Relaxed),
+        writer_queue_full_forced_local: state
+            .runtime_stats
+            .writer_queue_full_forced_local
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -237,4 +283,79 @@ pub(crate) async fn cleanup_stale_socket() -> Result<()> {
         std::fs::remove_file(path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+
+    use iroh::{EndpointId, SecretKey};
+    use tokio::net::UnixStream;
+    use tokio::sync::{Notify, RwLock};
+
+    use crate::model::{HostState, RuntimeStats};
+
+    fn test_host_state() -> HostState {
+        HostState {
+            endpoint_id: EndpointId::from(SecretKey::generate().public()),
+            active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
+            pointer_lock_active: Arc::new(AtomicBool::new(false)),
+            pointer_hidden: Arc::new(AtomicBool::new(false)),
+            pinned_pointer_pos: Arc::new(std::sync::Mutex::new(None)),
+            remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            runtime_stats: Arc::new(RuntimeStats::default()),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_command_sets_shutdown_flag_and_returns_ok() {
+        let state = test_host_state();
+        let (mut client, mut server) = UnixStream::pair().expect("pair");
+
+        let request = serde_json::to_vec(&IpcCommand::Stop).expect("serialize stop request");
+        client.write_all(&request).await.expect("write request");
+        client.shutdown().await.expect("shutdown client write");
+
+        handle_control_request(&mut server, state.clone())
+            .await
+            .expect("handle stop request");
+
+        let mut response_bytes = vec![0u8; 512];
+        let read_len = client
+            .read(&mut response_bytes)
+            .await
+            .expect("read response bytes");
+        let response: IpcResponse =
+            serde_json::from_slice(&response_bytes[..read_len]).expect("parse response");
+
+        assert!(response.ok);
+        assert!(state.shutdown_requested.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn status_payload_round_trip_includes_runtime_counters() {
+        let payload = StatusPayload {
+            endpoint_id: "endpoint".to_string(),
+            active: ActiveTarget::Right,
+            pointer_mode: RemotePointerMode::Confine,
+            attached: vec![Side::Right],
+            captured_queue_full_mouse_dropped: 11,
+            captured_queue_full_non_mouse_dropped: 7,
+            writer_queue_full_dropped: 5,
+            writer_queue_full_forced_local: 3,
+        };
+
+        let encoded = serde_json::to_vec(&payload).expect("serialize payload");
+        let decoded: StatusPayload = serde_json::from_slice(&encoded).expect("deserialize payload");
+
+        assert_eq!(decoded.captured_queue_full_mouse_dropped, 11);
+        assert_eq!(decoded.captured_queue_full_non_mouse_dropped, 7);
+        assert_eq!(decoded.writer_queue_full_dropped, 5);
+        assert_eq!(decoded.writer_queue_full_forced_local, 3);
+    }
 }

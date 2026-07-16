@@ -14,22 +14,26 @@ use iroh::{
 };
 use rdev::{EventType, Key};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::{
     input::{parse_detach_chord, run_input_grab},
-    ipc::{IpcCommand, apply_target_change, cleanup_stale_socket, run_control_socket, send_ipc},
+    ipc::{
+        IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
+        run_control_socket, send_ipc,
+    },
     macos_mouse_delta::run_macos_mouse_delta_capture,
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
         ActiveTarget, CapturedEvent, CapturedInput, HostState, RemotePeer, RemotePointerMode,
-        ScreenEdge, Side,
+        RuntimeStats, ScreenEdge, Side,
     },
     presentation::print_host_ready,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, read_framed,
-        write_framed,
+        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage,
+        MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, read_framed_with_limit, write_framed,
     },
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
 };
@@ -76,6 +80,9 @@ pub(crate) async fn run_host() -> Result<()> {
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let runtime_stats = Arc::new(RuntimeStats::default());
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
     print_host_ready(&endpoint_id.to_string(), &secret);
 
@@ -87,9 +94,12 @@ pub(crate) async fn run_host() -> Result<()> {
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
         remotes: remotes.clone(),
+        runtime_stats: runtime_stats.clone(),
+        shutdown_requested: shutdown_requested.clone(),
+        shutdown_notify: shutdown_notify.clone(),
     };
 
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<CapturedInput>();
+    let (input_tx, input_rx) = mpsc::channel::<CapturedInput>(captured_input_channel_capacity());
     if bench_flush_enabled() {
         tokio::spawn(run_bench_synthetic_input(input_tx.clone(), state.clone()));
     } else if dev_smoke_enabled() {
@@ -101,9 +111,11 @@ pub(crate) async fn run_host() -> Result<()> {
         let input_pointer_lock_active = pointer_lock_active.clone();
         let input_pinned_pointer_pos = pinned_pointer_pos.clone();
         let input_detach_chord = detach_chord.clone();
+        let input_runtime_stats = runtime_stats.clone();
         std::thread::spawn(move || {
             if let Err(err) = run_input_grab(
                 input_tx,
+                input_runtime_stats,
                 input_active_target,
                 input_pointer_lock_active,
                 pointer_hidden,
@@ -117,9 +129,11 @@ pub(crate) async fn run_host() -> Result<()> {
         let mouse_delta_active_target = active_target.clone();
         let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
         let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
+        let mouse_delta_runtime_stats = runtime_stats.clone();
         std::thread::spawn(move || {
             if let Err(err) = run_macos_mouse_delta_capture(
                 mouse_delta_tx,
+                mouse_delta_runtime_stats,
                 mouse_delta_active_target,
                 mouse_delta_pointer_lock_active,
                 mouse_delta_pinned_pointer_pos,
@@ -140,7 +154,17 @@ pub(crate) async fn run_host() -> Result<()> {
     });
 
     loop {
-        let Some(incoming) = endpoint.accept().await else {
+        if state.shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+        let incoming = tokio::select! {
+            _ = state.shutdown_notify.notified() => {
+                break;
+            }
+            incoming = endpoint.accept() => incoming,
+        };
+
+        let Some(incoming) = incoming else {
             bail!("endpoint closed")
         };
 
@@ -152,6 +176,11 @@ pub(crate) async fn run_host() -> Result<()> {
             }
         });
     }
+
+    apply_target_change(&state, ActiveTarget::Local, "daemon shutdown");
+    ensure_pointer_restored();
+    let _ = std::fs::remove_file(crate::state::socket_path()?);
+    Ok(())
 }
 
 async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> Result<()> {
@@ -159,7 +188,15 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     let remote_id = connection.remote_id();
     let (mut send, mut recv) = connection.accept_bi().await?;
 
-    let auth: AuthRequest = read_framed(&mut recv).await?;
+    let auth: AuthRequest = match time::timeout(
+        Duration::from_secs(5),
+        read_framed_with_limit(&mut recv, MAX_AUTH_MSG_SIZE),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("timed out waiting for auth request"),
+    };
     if auth.secret != secret {
         let res = AuthResponse {
             ok: false,
@@ -178,7 +215,8 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     )
     .await?;
 
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<HostToClientMessage>();
+    let (input_tx, mut input_rx) =
+        mpsc::channel::<HostToClientMessage>(peer_writer_channel_capacity());
     tokio::spawn(async move {
         while let Some(message) = input_rx.recv().await {
             if let Err(err) = write_framed(&mut send, &message).await {
@@ -203,7 +241,7 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
             let seq = previous.next_seq.fetch_add(1, Ordering::Relaxed);
             let _ = previous
                 .input_tx
-                .send(HostToClientMessage::ReleaseAll { seq });
+                .try_send(HostToClientMessage::ReleaseAll { seq });
             info!(
                 "replaced existing remote on {:?}: old={} new={}",
                 auth.side, previous.remote_id, remote_id
@@ -265,7 +303,7 @@ async fn run_client_feedback_loop(
 ) -> Result<()> {
     loop {
         let mut recv = connection.accept_uni().await?;
-        let bytes = recv.read_to_end(crate::protocol::MAX_MSG_SIZE).await?;
+        let bytes = recv.read_to_end(MAX_FEEDBACK_MSG_SIZE).await?;
         let message: ClientToHostMessage = bincode::deserialize(&bytes)?;
         match message {
             ClientToHostMessage::ClientEdgeReached { edge } => {
@@ -307,7 +345,7 @@ fn is_host_facing_edge(side: Side, edge: ScreenEdge) -> bool {
     )
 }
 
-async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state: HostState) {
+async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostState) {
     use tokio::time::{self, MissedTickBehavior};
 
     let mut pending_relative: HashMap<Side, (i32, i32)> = HashMap::new();
@@ -318,6 +356,10 @@ async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state:
 
     loop {
         tokio::select! {
+            _ = state.shutdown_notify.notified() => {
+                flush_pending_relative(&state, &mut pending_relative).await;
+                break;
+            }
             _ = flush_tick.tick() => {
                 flush_pending_relative(&state, &mut pending_relative).await;
             }
@@ -340,7 +382,7 @@ async fn run_forward_loop(mut rx: mpsc::UnboundedReceiver<CapturedInput>, state:
                             seq: 0,
                             event,
                         };
-                        if !send_to_side(&state, side, message).await {
+                        if !send_to_side(&state, side, message, false).await {
                             continue;
                         }
                     }
@@ -383,10 +425,15 @@ async fn flush_relative_for_side(
         return;
     }
     let message = HostToClientMessage::MouseMoveRelative { seq: 0, dx, dy };
-    let _ = send_to_side(state, side, message).await;
+    let _ = send_to_side(state, side, message, true).await;
 }
 
-async fn send_to_side(state: &HostState, side: Side, message: HostToClientMessage) -> bool {
+async fn send_to_side(
+    state: &HostState,
+    side: Side,
+    message: HostToClientMessage,
+    drop_if_full: bool,
+) -> bool {
     let peer = {
         let remotes = state.remotes.read().await;
         remotes.get(&side).cloned()
@@ -405,13 +452,39 @@ async fn send_to_side(state: &HostState, side: Side, message: HostToClientMessag
     let with_seq = assign_sequence(message, seq);
 
     debug!("forwarding input event to {:?} ({})", side, peer.name);
-    if peer.input_tx.send(with_seq).is_err() {
-        warn!(
-            "failed forwarding to {:?} ({}): writer channel closed",
-            side, peer.name
-        );
-        apply_target_change(state, ActiveTarget::Local, "forwarding failure");
-        return false;
+    match peer.input_tx.try_send(with_seq) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            if drop_if_full {
+                debug!(
+                    "dropping forwarded event for {:?} ({}) due to saturated writer queue",
+                    side, peer.name
+                );
+            } else {
+                warn!(
+                    "writer queue saturated for {:?} ({}); falling back to local control",
+                    side, peer.name
+                );
+                state
+                    .runtime_stats
+                    .writer_queue_full_forced_local
+                    .fetch_add(1, Ordering::Relaxed);
+                apply_target_change(state, ActiveTarget::Local, "writer queue saturated");
+            }
+            state
+                .runtime_stats
+                .writer_queue_full_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!(
+                "failed forwarding to {:?} ({}): writer channel closed",
+                side, peer.name
+            );
+            apply_target_change(state, ActiveTarget::Local, "forwarding failure");
+            return false;
+        }
     }
 
     true
@@ -430,7 +503,12 @@ fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessag
 async fn run_target_transition_guard(state: HostState) {
     let mut last_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     loop {
-        time::sleep(Duration::from_millis(5)).await;
+        tokio::select! {
+            _ = state.shutdown_notify.notified() => {
+                break;
+            }
+            _ = time::sleep(Duration::from_millis(5)) => {}
+        }
         let current = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
         if current == last_target {
             continue;
@@ -457,8 +535,17 @@ async fn send_release_all_to_side(state: &HostState, side: Side) {
 
     let seq = peer.next_seq.fetch_add(1, Ordering::Relaxed);
     let message = HostToClientMessage::ReleaseAll { seq };
-    if peer.input_tx.send(message).is_err() {
-        warn!("failed sending release-all to {:?} ({})", side, peer.name);
+    match time::timeout(Duration::from_millis(50), peer.input_tx.send(message)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            warn!("failed sending release-all to {:?} ({})", side, peer.name);
+        }
+        Err(_) => {
+            warn!(
+                "timed out sending release-all to {:?} ({}) due to saturated writer queue",
+                side, peer.name
+            );
+        }
     }
 }
 
@@ -532,6 +619,22 @@ fn configured_flush_tick_ms() -> u64 {
     }
 }
 
+fn captured_input_channel_capacity() -> usize {
+    std::env::var("MEOW_CAPTURED_INPUT_CHAN_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8192)
+}
+
+fn peer_writer_channel_capacity() -> usize {
+    std::env::var("MEOW_PEER_WRITER_CHAN_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2048)
+}
+
 fn dev_smoke_side() -> Side {
     match std::env::var("MEOW_DEV_SIDE") {
         Ok(v) if v.eq_ignore_ascii_case("left") => Side::Left,
@@ -541,7 +644,7 @@ fn dev_smoke_side() -> Side {
     }
 }
 
-async fn run_dev_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, state: HostState) {
+async fn run_dev_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostState) {
     use tokio::time::{Duration, sleep};
 
     let side = dev_smoke_side();
@@ -567,7 +670,7 @@ async fn run_dev_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, state
                 },
             };
 
-            if tx.send(CapturedInput { target, event }).is_err() {
+            if tx.send(CapturedInput { target, event }).await.is_err() {
                 break;
             }
             seq_idx = seq_idx.saturating_add(1);
@@ -602,7 +705,7 @@ fn bench_axis_delta(var_name: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
-async fn run_bench_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, state: HostState) {
+async fn run_bench_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostState) {
     use tokio::time::{Duration, sleep};
 
     let side = bench_side();
@@ -634,6 +737,7 @@ async fn run_bench_synthetic_input(tx: mpsc::UnboundedSender<CapturedInput>, sta
                     target: ActiveTarget::from(side),
                     event,
                 })
+                .await
                 .is_err()
             {
                 break;

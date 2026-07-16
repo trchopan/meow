@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::model::{ScreenEdge, Side};
 
 pub(crate) const ALPN: &[u8] = b"meow/remote-input/0";
-pub(crate) const MAX_MSG_SIZE: usize = 1024 * 1024;
+pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
+pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AuthRequest {
@@ -55,27 +57,35 @@ pub(crate) async fn write_framed<T: Serialize>(
     Ok(())
 }
 
-pub(crate) async fn read_framed<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn read_framed_with_size<T: for<'de> Deserialize<'de>>(
     stream: &mut iroh::endpoint::RecvStream,
+) -> Result<(T, usize)> {
+    read_framed_with_size_limit(stream, MAX_INPUT_MSG_SIZE).await
+}
+
+pub(crate) async fn read_framed_with_limit<T: for<'de> Deserialize<'de>>(
+    stream: &mut iroh::endpoint::RecvStream,
+    max_size: usize,
 ) -> Result<T> {
-    let (value, _) = read_framed_with_size(stream).await?;
+    let (value, _) = read_framed_with_size_limit(stream, max_size).await?;
     Ok(value)
 }
 
-pub(crate) async fn read_framed_with_size<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn read_framed_with_size_limit<T: for<'de> Deserialize<'de>>(
     stream: &mut iroh::endpoint::RecvStream,
+    max_size: usize,
 ) -> Result<(T, usize)> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
-    ensure_frame_len(len)?;
+    ensure_frame_len(len, max_size)?;
     let mut bytes = vec![0u8; len];
     stream.read_exact(&mut bytes).await?;
     Ok((bincode::deserialize(&bytes)?, len + 4))
 }
 
-fn ensure_frame_len(len: usize) -> Result<()> {
-    if len > MAX_MSG_SIZE {
+fn ensure_frame_len(len: usize, max_size: usize) -> Result<()> {
+    if len > max_size {
         bail!("framed message too large: {len}");
     }
     Ok(())
@@ -87,13 +97,14 @@ mod tests {
 
     #[test]
     fn ensure_frame_len_accepts_limits() {
-        assert!(ensure_frame_len(0).is_ok());
-        assert!(ensure_frame_len(MAX_MSG_SIZE).is_ok());
+        assert!(ensure_frame_len(0, MAX_INPUT_MSG_SIZE).is_ok());
+        assert!(ensure_frame_len(MAX_INPUT_MSG_SIZE, MAX_INPUT_MSG_SIZE).is_ok());
     }
 
     #[test]
     fn ensure_frame_len_rejects_oversize() {
-        let err = ensure_frame_len(MAX_MSG_SIZE + 1).expect_err("must reject oversize frame");
+        let err = ensure_frame_len(MAX_INPUT_MSG_SIZE + 1, MAX_INPUT_MSG_SIZE)
+            .expect_err("must reject oversize frame");
         assert!(err.to_string().contains("framed message too large"));
     }
 

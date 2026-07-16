@@ -113,26 +113,7 @@ pub(crate) fn load_or_create_host_secret_key() -> Result<SecretKey> {
 }
 
 fn write_secret_key_file(path: &Path, key: &[u8; 32]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        file.write_all(key)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(path, key).with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
-    }
+    write_file_atomic(path, key)
 }
 
 pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<PersistedHostState> {
@@ -169,26 +150,74 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
 
 pub(crate) fn write_host_state_file(path: &Path, state: &PersistedHostState) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(state)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+    write_file_atomic(path, &bytes)
+}
+
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("missing parent directory for {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let temp_path = unique_temp_path(path);
+
+    let write_result: Result<()> = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temp_path)
+                .with_context(|| format!("failed to create {}", temp_path.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("failed to write {}", temp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .with_context(|| format!("failed to create {}", temp_path.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("failed to write {}", temp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        }
+
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            let dir = fs::File::open(parent)
+                .with_context(|| format!("failed to open {}", parent.display()))?;
+            dir.sync_all()
+                .with_context(|| format!("failed to sync {}", parent.display()))?;
+        }
         Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
 
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
-    }
+    write_result
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "meow-state".to_string());
+    let random_id: u64 = thread_rng().r#gen();
+    let temp_name = format!(".{file_name}.tmp-{}-{random_id}", std::process::id());
+    path.with_file_name(temp_name)
 }
 
 pub(crate) fn random_secret() -> String {

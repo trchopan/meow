@@ -150,7 +150,7 @@ pub(crate) enum CapturedEvent {
 
 #[derive(Clone)]
 pub(crate) struct RemotePeer {
-    pub(crate) input_tx: mpsc::UnboundedSender<HostToClientMessage>,
+    pub(crate) input_tx: mpsc::Sender<HostToClientMessage>,
     pub(crate) next_seq: Arc<AtomicU64>,
     pub(crate) remote_id: EndpointId,
     pub(crate) name: String,
@@ -165,4 +165,15 @@ pub(crate) struct HostState {
     pub(crate) pointer_hidden: Arc<AtomicBool>,
     pub(crate) pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
+    pub(crate) runtime_stats: Arc<RuntimeStats>,
+    pub(crate) shutdown_requested: Arc<AtomicBool>,
+    pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+pub(crate) struct RuntimeStats {
+    pub(crate) captured_queue_full_mouse_dropped: AtomicU64,
+    pub(crate) captured_queue_full_non_mouse_dropped: AtomicU64,
+    pub(crate) writer_queue_full_dropped: AtomicU64,
+    pub(crate) writer_queue_full_forced_local: AtomicU64,
 }

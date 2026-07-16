@@ -5,16 +5,18 @@ use std::sync::{
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::{
     host_mouse,
     input::clamp_relative_delta,
-    model::{ActiveTarget, CapturedEvent, CapturedInput},
+    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats},
 };
 
 #[cfg(target_os = "macos")]
 pub(crate) fn run_macos_mouse_delta_capture(
-    tx: mpsc::UnboundedSender<CapturedInput>,
+    tx: mpsc::Sender<CapturedInput>,
+    runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
@@ -47,14 +49,22 @@ pub(crate) fn run_macos_mouse_delta_capture(
             }
 
             if let Some(button_event) = map_other_mouse_button_event(event_type, event) {
-                if tx
-                    .send(CapturedInput {
-                        target,
-                        event: CapturedEvent::Raw(button_event),
-                    })
-                    .is_err()
-                {
-                    warn!("failed to queue macOS middle mouse button event for forwarding");
+                match tx.try_send(CapturedInput {
+                    target,
+                    event: CapturedEvent::Raw(button_event),
+                }) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        runtime_stats
+                            .captured_queue_full_non_mouse_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "captured input queue full; dropping macOS middle mouse button event"
+                        );
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        warn!("failed to queue macOS middle mouse button event for forwarding");
+                    }
                 }
                 return None;
             }
@@ -66,15 +76,21 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64,
             );
 
-            if (dx != 0 || dy != 0)
-                && tx
-                    .send(CapturedInput {
-                        target,
-                        event: CapturedEvent::MouseMoveRelative { dx, dy },
-                    })
-                    .is_err()
-            {
-                warn!("failed to queue macOS relative mouse delta for forwarding");
+            if dx != 0 || dy != 0 {
+                match tx.try_send(CapturedInput {
+                    target,
+                    event: CapturedEvent::MouseMoveRelative { dx, dy },
+                }) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        runtime_stats
+                            .captured_queue_full_mouse_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        warn!("failed to queue macOS relative mouse delta for forwarding");
+                    }
+                }
             }
 
             let pinned = {
@@ -129,7 +145,8 @@ fn map_other_mouse_button_event(
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_macos_mouse_delta_capture(
-    _tx: mpsc::UnboundedSender<CapturedInput>,
+    _tx: mpsc::Sender<CapturedInput>,
+    _runtime_stats: Arc<RuntimeStats>,
     _active_target: Arc<AtomicU8>,
     _pointer_lock_active: Arc<AtomicBool>,
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,

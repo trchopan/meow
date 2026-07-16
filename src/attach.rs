@@ -13,8 +13,9 @@ use crate::{
     cli::AttachArgs,
     model::ScreenEdge,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, read_framed,
-        read_framed_with_size, send_client_feedback, write_framed,
+        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage,
+        MAX_AUTH_MSG_SIZE, read_framed_with_limit, read_framed_with_size, send_client_feedback,
+        write_framed,
     },
 };
 
@@ -44,7 +45,12 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     };
     write_framed(&mut send, &auth).await?;
 
-    let response: AuthResponse = read_framed(&mut recv).await?;
+    let response: AuthResponse = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_framed_with_limit(&mut recv, MAX_AUTH_MSG_SIZE),
+    )
+    .await
+    .context("timed out waiting for auth response")??;
     if !response.ok {
         bail!("host denied attach: {}", response.message);
     }

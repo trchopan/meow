@@ -28,6 +28,13 @@ pub(crate) fn print_status_response(message: &str, status: Option<&StatusPayload
         println!("active: {}", status.active);
         println!("pointer_mode: {}", status.pointer_mode);
         println!("attached: {}", format_attached_sides(&status.attached));
+        println!(
+            "drops: captured_mouse={} captured_non_mouse={} writer_dropped={} writer_forced_local={}",
+            status.captured_queue_full_mouse_dropped,
+            status.captured_queue_full_non_mouse_dropped,
+            status.writer_queue_full_dropped,
+            status.writer_queue_full_forced_local,
+        );
     }
 }
 
