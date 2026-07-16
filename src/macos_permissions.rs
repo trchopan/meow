@@ -61,7 +61,9 @@ mod imp {
         eprintln!(
             "grant access for the app launching meow (Ghostty/Terminal/iTerm/Warp) or the meow binary, then re-run `meow host`."
         );
-        eprintln!("if Input Monitoring is empty, add and enable Ghostty first.");
+        eprintln!(
+            "if Input Monitoring is empty, add and enable the app launching meow (or the meow binary) first."
+        );
         bail!("missing macOS permissions: {}", missing.join(", "))
     }
 
