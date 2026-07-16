@@ -2,6 +2,42 @@
 
 macOS-first keyboard and mouse sharing over iroh.
 
+## Install
+
+### Homebrew
+
+```sh
+brew tap trchopan/tap
+brew install meow
+```
+
+### GitHub Releases
+
+Download the matching archive from the latest release:
+
+- Apple Silicon: `meow-vX.Y.Z-aarch64-apple-darwin.tar.gz`
+- Intel Mac: `meow-vX.Y.Z-x86_64-apple-darwin.tar.gz`
+
+Then install:
+
+```sh
+tar -xzf meow-vX.Y.Z-<target>.tar.gz
+chmod +x meow-vX.Y.Z-<target>/meow
+mv meow-vX.Y.Z-<target>/meow ~/.local/bin/
+```
+
+Verify:
+
+```sh
+meow --version
+```
+
+Unsigned binaries may be quarantined by macOS. If needed:
+
+```sh
+xattr -dr com.apple.quarantine ~/.local/bin/meow
+```
+
 ## Development Status
 
 `meow` is currently in the **development** stage.
