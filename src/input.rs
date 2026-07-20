@@ -33,6 +33,7 @@ pub(crate) struct DetachChord {
     pub(crate) config_value: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_input_grab(
     tx: mpsc::Sender<CapturedInput>,
     runtime_stats: Arc<RuntimeStats>,
@@ -40,6 +41,7 @@ pub(crate) fn run_input_grab(
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pending_release_sides: Arc<AtomicU8>,
     detach_chord: DetachChord,
 ) -> Result<()> {
     let send_ctx = CaptureSendContext {
@@ -48,6 +50,7 @@ pub(crate) fn run_input_grab(
         pointer_lock_active: pointer_lock_active.clone(),
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
+        pending_release_sides: pending_release_sides.clone(),
     };
 
     let pressed_keys: Arc<Mutex<HashSet<Key>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -90,6 +93,9 @@ pub(crate) fn run_input_grab(
         {
             let previous_target = target;
             active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+            if let Some(side) = previous_target.to_side() {
+                pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
+            }
             pointer_lock_active.store(false, Ordering::Relaxed);
             if let Err(err) = host_mouse::set_pointer_dissociation(false) {
                 warn!("failed to disable pointer dissociation after detach chord: {err:#}");
@@ -265,6 +271,7 @@ fn try_send_captured_input_with_policy(
                 &send_ctx.pointer_lock_active,
                 &send_ctx.pointer_hidden,
                 &send_ctx.pinned_pointer_pos,
+                &send_ctx.pending_release_sides,
             );
             send_ctx
                 .runtime_stats
@@ -285,6 +292,7 @@ struct CaptureSendContext {
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pending_release_sides: Arc<AtomicU8>,
 }
 
 fn force_local_on_capture_saturation(
@@ -292,6 +300,7 @@ fn force_local_on_capture_saturation(
     pointer_lock_active: &Arc<AtomicBool>,
     pointer_hidden: &Arc<AtomicBool>,
     pinned_pointer_pos: &Arc<Mutex<Option<(f64, f64)>>>,
+    pending_release_sides: &Arc<AtomicU8>,
 ) {
     let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
     if matches!(target, ActiveTarget::Local) {
@@ -299,6 +308,9 @@ fn force_local_on_capture_saturation(
     }
 
     active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+    if let Some(side) = target.to_side() {
+        pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
+    }
     pointer_lock_active.store(false, Ordering::Relaxed);
     if let Err(err) = host_mouse::set_pointer_dissociation(false) {
         warn!("failed to disable pointer dissociation after queue saturation: {err:#}");
