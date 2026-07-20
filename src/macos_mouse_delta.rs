@@ -25,6 +25,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pending_release_sides: Arc<AtomicU8>,
 ) -> Result<()> {
     use anyhow::anyhow;
     use core_foundation::base::TCFType;
@@ -73,7 +74,11 @@ pub(crate) fn run_macos_mouse_delta_capture(
                         .capture_tap_user_disabled
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                let previous_target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
                 active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+                if let Some(side) = previous_target.to_side() {
+                    pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
+                }
                 pointer_lock_active.store(false, Ordering::Relaxed);
                 runtime_stats
                     .recovery_events
@@ -163,6 +168,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _pointer_lock_active: Arc<AtomicBool>,
     _pointer_hidden: Arc<AtomicBool>,
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    _pending_release_sides: Arc<AtomicU8>,
 ) -> Result<()> {
     Ok(())
 }

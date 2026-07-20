@@ -198,6 +198,14 @@ fn persist_pointer_mode(endpoint_id: iroh::EndpointId, mode: RemotePointerMode) 
 }
 
 pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, context: &str) {
+    let previous_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+    if let Some(previous_side) = previous_target.to_side()
+        && target.to_side() != Some(previous_side)
+    {
+        state
+            .pending_release_sides
+            .fetch_or(previous_side.release_bit(), Ordering::AcqRel);
+    }
     state.active_target.store(target.to_u8(), Ordering::Relaxed);
 
     let should_lock = target.to_side().is_some();
@@ -322,6 +330,7 @@ mod tests {
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(std::sync::Mutex::new(None)),
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending_release_sides: Arc::new(AtomicU8::new(0)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -351,6 +360,28 @@ mod tests {
 
         assert!(response.ok);
         assert!(state.shutdown_requested.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn target_change_records_release_for_previous_remote_side() {
+        let state = test_host_state();
+        apply_target_change(&state, ActiveTarget::Right, "test attach");
+        assert_eq!(state.pending_release_sides.load(Ordering::Acquire), 0);
+
+        apply_target_change(&state, ActiveTarget::Local, "test detach");
+        assert_eq!(
+            state.pending_release_sides.load(Ordering::Acquire),
+            Side::Right.release_bit()
+        );
+
+        let state = test_host_state();
+        apply_target_change(&state, ActiveTarget::Right, "test first side");
+        apply_target_change(&state, ActiveTarget::Left, "test second side");
+        apply_target_change(&state, ActiveTarget::Right, "test return side");
+        assert_eq!(
+            state.pending_release_sides.load(Ordering::Acquire),
+            Side::Right.release_bit() | Side::Left.release_bit()
+        );
     }
 
     #[test]

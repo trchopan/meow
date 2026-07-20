@@ -84,6 +84,7 @@ pub(crate) async fn run_host() -> Result<()> {
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let pending_release_sides = Arc::new(AtomicU8::new(0));
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -98,6 +99,7 @@ pub(crate) async fn run_host() -> Result<()> {
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
         remotes: remotes.clone(),
+        pending_release_sides: pending_release_sides.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -115,6 +117,7 @@ pub(crate) async fn run_host() -> Result<()> {
         let input_pointer_lock_active = pointer_lock_active.clone();
         let input_pointer_hidden = pointer_hidden.clone();
         let input_pinned_pointer_pos = pinned_pointer_pos.clone();
+        let input_pending_release_sides = pending_release_sides.clone();
         let input_detach_chord = detach_chord.clone();
         let input_runtime_stats = runtime_stats.clone();
         std::thread::spawn(move || {
@@ -125,6 +128,7 @@ pub(crate) async fn run_host() -> Result<()> {
                 input_pointer_lock_active,
                 input_pointer_hidden,
                 input_pinned_pointer_pos,
+                input_pending_release_sides,
                 input_detach_chord,
             ) {
                 error!("input grab stopped: {err:#}");
@@ -135,6 +139,7 @@ pub(crate) async fn run_host() -> Result<()> {
         let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
         let mouse_delta_pointer_hidden = pointer_hidden.clone();
         let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
+        let mouse_delta_pending_release_sides = pending_release_sides.clone();
         let mouse_delta_runtime_stats = runtime_stats.clone();
         std::thread::spawn(move || {
             if let Err(err) = run_macos_mouse_delta_capture(
@@ -144,6 +149,7 @@ pub(crate) async fn run_host() -> Result<()> {
                 mouse_delta_pointer_lock_active,
                 mouse_delta_pointer_hidden,
                 mouse_delta_pinned_pointer_pos,
+                mouse_delta_pending_release_sides,
             ) {
                 error!("macOS mouse delta capture stopped: {err:#}");
             }
@@ -369,23 +375,13 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
     let mut modifier_flags = ModifierFlags::default();
     let mut pressed_keys = HashSet::new();
     let mut layout = LayoutTranslator::new();
-    let mut last_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     let flush_tick_ms = configured_flush_tick_ms();
     let mut flush_tick = time::interval(Duration::from_millis(flush_tick_ms));
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     debug!("relative flush tick configured to {}ms", flush_tick_ms);
 
     loop {
-        let current_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
-        if current_target != last_target {
-            if let Some(previous_side) = last_target.to_side()
-                && current_target.to_side() != Some(previous_side)
-            {
-                flush_relative_for_side(&state, &mut pending_relative, previous_side).await;
-                send_release_all_to_side(&state, previous_side).await;
-            }
-            last_target = current_target;
-        }
+        reconcile_target_transition(&state, &mut pending_relative).await;
 
         tokio::select! {
             _ = state.shutdown_notify.notified() => {
@@ -395,11 +391,24 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
             _ = flush_tick.tick() => {
                 flush_pending_relative(&state, &mut pending_relative).await;
             }
-                maybe_captured = rx.recv() => {
-                    let Some(captured) = maybe_captured else {
-                        flush_pending_relative(&state, &mut pending_relative).await;
-                        break;
-                    };
+                    maybe_captured = rx.recv() => {
+                        let Some(captured) = maybe_captured else {
+                            flush_pending_relative(&state, &mut pending_relative).await;
+                            break;
+                        };
+
+                    let current_target = reconcile_target_transition(
+                        &state,
+                        &mut pending_relative,
+                    )
+                    .await;
+                    if is_stale_captured_target(captured.target, current_target) {
+                        debug!(
+                            "discarding input captured for stale target {} (current target {})",
+                            captured.target, current_target
+                        );
+                        continue;
+                    }
 
                     if let Some(side) = side_requiring_ordered_flush(&captured) {
                         flush_relative_for_side(&state, &mut pending_relative, side).await;
@@ -464,6 +473,25 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
             }
         }
     }
+}
+
+fn is_stale_captured_target(captured_target: ActiveTarget, current_target: ActiveTarget) -> bool {
+    captured_target != current_target
+}
+
+async fn reconcile_target_transition(
+    state: &HostState,
+    pending_relative: &mut HashMap<Side, (i32, i32)>,
+) -> ActiveTarget {
+    let current_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+    let pending = state.pending_release_sides.swap(0, Ordering::AcqRel);
+    for side in [Side::Left, Side::Right, Side::Up, Side::Down] {
+        if pending & side.release_bit() != 0 {
+            flush_relative_for_side(state, pending_relative, side).await;
+            send_release_all_to_side(state, side).await;
+        }
+    }
+    current_target
 }
 
 fn side_requiring_ordered_flush(captured: &CapturedInput) -> Option<Side> {
@@ -684,16 +712,24 @@ async fn send_release_all_to_side(state: &HostState, side: Side) {
 
     let seq = peer.next_seq.fetch_add(1, Ordering::Relaxed);
     let message = HostToClientMessage::ReleaseAll { seq };
-    match time::timeout(Duration::from_millis(50), peer.input_tx.send(message)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            warn!("failed sending release-all to {:?} ({})", side, peer.name);
-        }
-        Err(_) => {
-            warn!(
-                "timed out sending release-all to {:?} ({}) due to saturated writer queue",
-                side, peer.name
-            );
+    let result = tokio::select! {
+        result = peer.input_tx.send(message) => result.map_err(|_| "writer channel closed"),
+        _ = state.shutdown_notify.notified() => Err("daemon shutting down"),
+        _ = time::sleep(Duration::from_millis(500)) => Err("writer queue timeout"),
+    };
+    if let Err(reason) = result {
+        warn!(
+            "failed sending release-all to {:?} ({}): {reason}",
+            side, peer.name
+        );
+        state
+            .runtime_stats
+            .recovery_events
+            .fetch_add(1, Ordering::Relaxed);
+        if ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)).to_side()
+            == Some(side)
+        {
+            apply_target_change(state, ActiveTarget::Local, "release-all delivery failure");
         }
     }
 }
@@ -800,6 +836,7 @@ async fn run_dev_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostSta
     info!("dev smoke synthetic input active for side {:?}", side);
 
     let mut seq_idx: u64 = 0;
+    let mut target_initialized = false;
     loop {
         let attached = {
             let remotes = state.remotes.read().await;
@@ -808,6 +845,10 @@ async fn run_dev_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostSta
 
         if attached {
             let target = ActiveTarget::from(side);
+            if should_initialize_synthetic_target(attached, target_initialized) {
+                apply_target_change(&state, target, "dev smoke synthetic input");
+                target_initialized = true;
+            }
             let event = match seq_idx % 16 {
                 0 => normalize_non_motion_event(EventType::KeyPress(Key::KeyM)),
                 1 => normalize_non_motion_event(EventType::KeyRelease(Key::KeyM)),
@@ -825,6 +866,7 @@ async fn run_dev_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostSta
             seq_idx = seq_idx.saturating_add(1);
             sleep(Duration::from_millis(12)).await;
         } else {
+            target_initialized = false;
             sleep(Duration::from_millis(20)).await;
         }
     }
@@ -868,6 +910,7 @@ async fn run_bench_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostS
     );
 
     let mut seq_idx: u64 = 0;
+    let mut target_initialized = false;
     loop {
         let attached = {
             let remotes = state.remotes.read().await;
@@ -875,33 +918,61 @@ async fn run_bench_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostS
         };
 
         if attached {
+            let target = ActiveTarget::from(side);
+            if should_initialize_synthetic_target(attached, target_initialized) {
+                apply_target_change(&state, target, "flush benchmark synthetic input");
+                target_initialized = true;
+            }
             let signed_dx = if seq_idx.is_multiple_of(2) { dx } else { -dx };
             let signed_dy = if seq_idx.is_multiple_of(3) { dy } else { -dy };
             let event = CapturedEvent::MouseMoveRelative {
                 dx: signed_dx,
                 dy: signed_dy,
             };
-            if tx
-                .send(CapturedInput {
-                    target: ActiveTarget::from(side),
-                    event,
-                })
-                .await
-                .is_err()
-            {
+            if tx.send(CapturedInput { target, event }).await.is_err() {
                 break;
             }
             seq_idx = seq_idx.saturating_add(1);
             sleep(interval).await;
         } else {
+            target_initialized = false;
             sleep(Duration::from_millis(10)).await;
         }
     }
 }
 
+fn should_initialize_synthetic_target(attached: bool, initialized: bool) -> bool {
+    attached && !initialized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Notify;
+
+    fn test_forward_state(side: Side, input_tx: mpsc::Sender<HostToClientMessage>) -> HostState {
+        HostState {
+            endpoint_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
+            active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
+            pointer_lock_active: Arc::new(AtomicBool::new(false)),
+            pointer_hidden: Arc::new(AtomicBool::new(false)),
+            pinned_pointer_pos: Arc::new(Mutex::new(None)),
+            remotes: Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+                side,
+                RemotePeer {
+                    input_tx,
+                    next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    remote_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
+                    name: "test-peer".to_string(),
+                },
+            )]))),
+            pending_release_sides: Arc::new(AtomicU8::new(0)),
+            runtime_stats: Arc::new(RuntimeStats::default()),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+        }
+    }
 
     #[test]
     fn host_facing_edge_matches_layout() {
@@ -963,5 +1034,66 @@ mod tests {
         assert_eq!(side_requiring_ordered_flush(&remote), Some(Side::Right));
         assert_eq!(side_requiring_ordered_flush(&local_motion), None);
         assert_eq!(side_requiring_ordered_flush(&edge), None);
+    }
+
+    #[test]
+    fn captured_events_from_previous_target_are_discarded() {
+        assert!(is_stale_captured_target(
+            ActiveTarget::Right,
+            ActiveTarget::Local
+        ));
+        assert!(!is_stale_captured_target(
+            ActiveTarget::Right,
+            ActiveTarget::Right
+        ));
+    }
+
+    #[test]
+    fn synthetic_target_is_initialized_once_per_attachment() {
+        assert!(should_initialize_synthetic_target(true, false));
+        assert!(!should_initialize_synthetic_target(true, true));
+        assert!(!should_initialize_synthetic_target(false, false));
+    }
+
+    #[tokio::test]
+    async fn transition_flushes_motion_before_release_all() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let state = test_forward_state(Side::Right, input_tx);
+        state
+            .pending_release_sides
+            .store(Side::Right.release_bit(), Ordering::Release);
+        let mut pending_relative = HashMap::from([(Side::Right, (3, 4))]);
+
+        reconcile_target_transition(&state, &mut pending_relative).await;
+
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HostToClientMessage::RelativeMotion { dx: 3, dy: 4, .. })
+        ));
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HostToClientMessage::ReleaseAll { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_writer_records_release_recovery_and_returns_local() {
+        let (input_tx, input_rx) = mpsc::channel(1);
+        drop(input_rx);
+        let state = test_forward_state(Side::Right, input_tx);
+        state
+            .active_target
+            .store(ActiveTarget::Right.to_u8(), Ordering::Release);
+
+        send_release_all_to_side(&state, Side::Right).await;
+
+        assert_eq!(
+            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+            ActiveTarget::Local
+        );
+        assert_eq!(
+            state.runtime_stats.recovery_events.load(Ordering::Acquire),
+            1
+        );
     }
 }

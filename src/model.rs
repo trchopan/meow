@@ -25,6 +25,17 @@ pub(crate) enum Side {
     Down,
 }
 
+impl Side {
+    pub(crate) fn release_bit(self) -> u8 {
+        match self {
+            Self::Left => 1 << 0,
+            Self::Right => 1 << 1,
+            Self::Up => 1 << 2,
+            Self::Down => 1 << 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemotePointerMode {
@@ -167,6 +178,7 @@ pub(crate) struct HostState {
     pub(crate) pointer_hidden: Arc<AtomicBool>,
     pub(crate) pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
+    pub(crate) pending_release_sides: Arc<AtomicU8>,
     pub(crate) runtime_stats: Arc<RuntimeStats>,
     pub(crate) shutdown_requested: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
