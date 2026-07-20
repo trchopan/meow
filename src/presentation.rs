@@ -35,6 +35,13 @@ pub(crate) fn print_status_response(message: &str, status: Option<&StatusPayload
             status.writer_queue_full_dropped,
             status.writer_queue_full_forced_local,
         );
+        println!(
+            "events: captured={} normalized={} replay_failures={} recoveries={}",
+            status.captured_events,
+            status.normalized_events,
+            status.replay_failures,
+            status.recovery_events,
+        );
     }
 }
 

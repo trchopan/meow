@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -7,7 +9,10 @@ mod dev;
 mod host;
 mod host_mouse;
 mod input;
+mod input_overlay;
 mod ipc;
+mod macos_inject;
+mod macos_keyboard;
 mod macos_mouse_delta;
 mod macos_permissions;
 mod model;
@@ -20,6 +25,7 @@ use attach::{run_attach, run_test_inject};
 use cli::{Cli, Command};
 use dev::{run_bench_flush, run_dev_smoke};
 use host::run_host;
+use input_overlay::run_overlay_ui;
 use ipc::{IpcCommand, send_ipc, send_switch};
 use model::ActiveTarget;
 use probe::run_probe_pointer_lock;
@@ -44,6 +50,7 @@ async fn main() -> Result<()> {
         Command::RotateSecret => rotate_secret().await,
         Command::TestInject => run_test_inject().await,
         Command::BenchFlush(args) => run_bench_flush(args).await,
+        Command::OverlayUi(args) => run_overlay_ui(args),
         Command::Local => send_switch(ActiveTarget::Local).await,
         Command::Right => send_switch(ActiveTarget::Right).await,
         Command::Left => send_switch(ActiveTarget::Left).await,

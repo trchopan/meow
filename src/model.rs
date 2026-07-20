@@ -144,6 +144,8 @@ pub(crate) struct CapturedInput {
 #[derive(Debug)]
 pub(crate) enum CapturedEvent {
     Raw(EventType),
+    MouseButton { button: rdev::Button, pressed: bool },
+    MouseWheel { delta_x: i64, delta_y: i64 },
     MouseMoveRelative { dx: i32, dy: i32 },
     HostEdgeReached { edge: ScreenEdge },
 }
@@ -172,6 +174,10 @@ pub(crate) struct HostState {
 
 #[derive(Default)]
 pub(crate) struct RuntimeStats {
+    pub(crate) captured_events: AtomicU64,
+    pub(crate) normalized_events: AtomicU64,
+    pub(crate) replay_failures: AtomicU64,
+    pub(crate) recovery_events: AtomicU64,
     pub(crate) captured_queue_full_mouse_dropped: AtomicU64,
     pub(crate) captured_queue_full_non_mouse_dropped: AtomicU64,
     pub(crate) writer_queue_full_dropped: AtomicU64,

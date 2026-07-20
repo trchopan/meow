@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 use crate::{
     cli::AttachArgs,
+    input_overlay::InputOverlay,
+    macos_inject,
     model::ScreenEdge,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage,
-        MAX_AUTH_MSG_SIZE, read_framed_with_limit, read_framed_with_size, send_client_feedback,
-        write_framed,
+        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
+        MAX_AUTH_MSG_SIZE, WireEvent, read_framed_with_limit, read_framed_with_size,
+        send_client_feedback, write_framed,
     },
 };
 
@@ -71,6 +73,12 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let mut edge_push = EdgePushTracker::new();
     let mut input_state = ClientInputState::default();
     let mut sequence_tracker = SequenceTracker::default();
+    let mut test_drop_sequence = args.test_drop_sequence;
+    let mut input_overlay = InputOverlay::start(
+        args.input_overlay,
+        args.input_overlay_position,
+        args.input_overlay_idle_ms,
+    );
 
     let mut probe_completed = false;
     let run_result: Result<()> = loop {
@@ -89,8 +97,32 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         debug!("client received {} byte(s) on forwarded stream", frame_size);
         let elapsed = probe_start.elapsed();
         match message {
-            HostToClientMessage::Input { seq, event } => {
+            HostToClientMessage::Event {
+                seq,
+                event: wire_event,
+            } => {
+                let Some(event) = wire_event_to_rdev(&wire_event) else {
+                    debug!(
+                        "client ignored modifier-only protocol event: {:?}",
+                        wire_event
+                    );
+                    continue;
+                };
+                if test_drop_sequence == Some(seq) {
+                    test_drop_sequence = None;
+                    warn!("test mode dropped input sequence {seq}");
+                    continue;
+                }
                 let seq_status = sequence_tracker.observe(seq);
+                if should_recover_from_sequence_status(seq_status) && !args.no_inject {
+                    let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+                    if failures > 0 {
+                        warn!("sequence anomaly recovery had {failures} injection failure(s)");
+                    }
+                    edge_push.reset();
+                    last_signaled_edge = None;
+                    input_overlay.clear();
+                }
                 let meta = ProbeMessageMeta {
                     seq,
                     bytes_len: frame_size,
@@ -99,6 +131,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 if let Some(probe) = probe.as_mut() {
                     probe.note_sequence(seq_status);
                     probe.on_input_event(
+                        &wire_event,
                         &event,
                         meta,
                         &mut enigo,
@@ -108,16 +141,33 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     probe.note_held_counts(&input_state);
                 }
                 debug!("client received input event: {:?}", event);
+                input_overlay.on_wire_event(&wire_event);
                 if probe.is_none() && !args.no_inject {
-                    if let Err(err) = inject_input_event(&event, &mut enigo, &mut input_state) {
+                    if let Err(err) =
+                        inject_wire_input_event(&wire_event, &event, &mut enigo, &mut input_state)
+                    {
                         warn!("failed injecting input event: {err}");
                     } else {
                         debug!("client injection ok for event: {:?}", event);
                     }
                 }
             }
-            HostToClientMessage::MouseMoveRelative { seq, dx, dy } => {
+            HostToClientMessage::RelativeMotion { seq, dx, dy } => {
+                if test_drop_sequence == Some(seq) {
+                    test_drop_sequence = None;
+                    warn!("test mode dropped relative-move sequence {seq}");
+                    continue;
+                }
                 let seq_status = sequence_tracker.observe(seq);
+                if should_recover_from_sequence_status(seq_status) && !args.no_inject {
+                    let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+                    if failures > 0 {
+                        warn!("sequence anomaly recovery had {failures} injection failure(s)");
+                    }
+                    edge_push.reset();
+                    last_signaled_edge = None;
+                    input_overlay.clear();
+                }
                 let meta = ProbeMessageMeta {
                     seq,
                     bytes_len: frame_size,
@@ -125,13 +175,14 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 };
                 if let Some(probe) = probe.as_mut() {
                     probe.note_sequence(seq_status);
-                    probe.on_relative_mouse(dx, dy, meta, &mut enigo, args.no_inject);
+                    probe.on_relative_mouse(dx, dy, meta, &mut enigo, &input_state, args.no_inject);
                     probe.note_held_counts(&input_state);
                 }
                 debug!("client received relative mouse move: dx={dx}, dy={dy}");
                 if probe.is_none() && !args.no_inject {
                     let before = enigo.mouse_location();
-                    enigo.mouse_move_relative(dx, dy);
+                    let drag_button = active_drag_button(&input_state);
+                    move_mouse_relative(&mut enigo, dx, dy, drag_button);
                     let after = enigo.mouse_location();
                     let display = enigo.main_display_size();
                     edge_push.reset_if_stale(Instant::now());
@@ -173,6 +224,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     if failures > 0 {
                         warn!("release-all had {failures} injection failure(s)");
                     }
+                    input_overlay.clear();
                 }
             }
         }
@@ -183,6 +235,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         if failures > 0 {
             warn!("attach cleanup had {failures} injection failure(s)");
         }
+        input_overlay.clear();
     }
 
     if let Some(probe) = probe.as_mut() {
@@ -195,6 +248,122 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     }
 
     run_result
+}
+
+fn wire_event_to_rdev(event: &WireEvent) -> Option<EventType> {
+    match event {
+        WireEvent::Key { action, key, .. } => {
+            let key = key
+                .physical_code
+                .map(|code| Key::Unknown(code as u32))
+                .or_else(|| parse_logical_key(&key.logical))?;
+            Some(match action {
+                KeyAction::Down | KeyAction::Repeat => EventType::KeyPress(key),
+                KeyAction::Up => EventType::KeyRelease(key),
+            })
+        }
+        WireEvent::MouseButton { button, pressed } => {
+            let button = match *button {
+                1 => Button::Left,
+                2 => Button::Middle,
+                3 => Button::Right,
+                value => Button::Unknown(value),
+            };
+            Some(if *pressed {
+                EventType::ButtonPress(button)
+            } else {
+                EventType::ButtonRelease(button)
+            })
+        }
+        WireEvent::Wheel { delta_x, delta_y } => Some(EventType::Wheel {
+            delta_x: *delta_x,
+            delta_y: *delta_y,
+        }),
+        WireEvent::RelativeMotion { .. } | WireEvent::ModifierChanged { .. } => None,
+    }
+}
+
+fn inject_wire_input_event(
+    wire_event: &WireEvent,
+    event: &EventType,
+    enigo: &mut Enigo,
+    state: &mut ClientInputState,
+) -> Result<()> {
+    if let WireEvent::Key {
+        action,
+        key,
+        modifiers,
+    } = wire_event
+        && let Some(physical_code) = key.physical_code
+        && !should_skip_client_key_event(event)
+    {
+        let down = !matches!(action, KeyAction::Up);
+        if macos_inject::inject_key_with_modifiers(
+            physical_code,
+            down,
+            matches!(action, KeyAction::Repeat),
+            modifiers,
+        )
+        .is_ok()
+        {
+            if down {
+                state.pressed_keys.insert(match event {
+                    EventType::KeyPress(key) | EventType::KeyRelease(key) => *key,
+                    _ => return Ok(()),
+                });
+                if let EventType::KeyPress(key) = event
+                    && is_modifier_key(*key)
+                {
+                    state.pressed_modifiers.insert(*key);
+                }
+            } else if let EventType::KeyRelease(key) = event {
+                state.pressed_keys.remove(key);
+                state.pressed_modifiers.remove(key);
+            }
+            return Ok(());
+        }
+    }
+
+    inject_input_event(event, enigo, state)
+}
+
+fn parse_logical_key(value: &str) -> Option<Key> {
+    let value = value.strip_prefix("Key::").unwrap_or(value);
+    Some(match value {
+        "KeyA" => Key::KeyA,
+        "KeyB" => Key::KeyB,
+        "KeyC" => Key::KeyC,
+        "KeyD" => Key::KeyD,
+        "KeyE" => Key::KeyE,
+        "KeyF" => Key::KeyF,
+        "KeyG" => Key::KeyG,
+        "KeyH" => Key::KeyH,
+        "KeyI" => Key::KeyI,
+        "KeyJ" => Key::KeyJ,
+        "KeyK" => Key::KeyK,
+        "KeyL" => Key::KeyL,
+        "KeyM" => Key::KeyM,
+        "KeyN" => Key::KeyN,
+        "KeyO" => Key::KeyO,
+        "KeyP" => Key::KeyP,
+        "KeyQ" => Key::KeyQ,
+        "KeyR" => Key::KeyR,
+        "KeyS" => Key::KeyS,
+        "KeyT" => Key::KeyT,
+        "KeyU" => Key::KeyU,
+        "KeyV" => Key::KeyV,
+        "KeyW" => Key::KeyW,
+        "KeyX" => Key::KeyX,
+        "KeyY" => Key::KeyY,
+        "KeyZ" => Key::KeyZ,
+        "Space" => Key::Space,
+        "Return" => Key::Return,
+        "Tab" => Key::Tab,
+        "Escape" => Key::Escape,
+        "Backspace" => Key::Backspace,
+        "Delete" => Key::Delete,
+        _ => return None,
+    })
 }
 
 fn detect_client_edge_push(
@@ -268,17 +437,39 @@ fn inject_input_event(
         return Ok(());
     }
 
-    simulate(event).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    if macos_inject::inject_event(event).is_err() {
+        simulate(event).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    }
     match event {
         EventType::KeyPress(key) => {
             state.pressed_keys.insert(*key);
+            if is_modifier_key(*key) {
+                state.pressed_modifiers.insert(*key);
+            }
         }
         EventType::KeyRelease(key) => {
             state.pressed_keys.remove(key);
+            state.pressed_modifiers.remove(key);
         }
         _ => {}
     }
     Ok(())
+}
+
+fn move_mouse_relative(enigo: &mut Enigo, dx: i32, dy: i32, drag_button: Option<Button>) {
+    #[cfg(target_os = "macos")]
+    {
+        if macos_inject::inject_relative_move_with_button(dx, dy, drag_button).is_ok() {
+            return;
+        }
+    }
+    enigo.mouse_move_relative(dx, dy);
+}
+
+fn active_drag_button(state: &ClientInputState) -> Option<Button> {
+    [Button::Left, Button::Right, Button::Middle]
+        .into_iter()
+        .find(|button| state.pressed_buttons.contains(button))
 }
 
 fn map_mouse_button_event(event: &EventType) -> Option<(MouseButton, bool)> {
@@ -345,6 +536,13 @@ enum SequenceStatus {
     DuplicateOrOutOfOrder,
 }
 
+fn should_recover_from_sequence_status(status: SequenceStatus) -> bool {
+    matches!(
+        status,
+        SequenceStatus::Gap { .. } | SequenceStatus::DuplicateOrOutOfOrder
+    )
+}
+
 #[derive(Default)]
 struct SequenceTracker {
     last_seq: Option<u64>,
@@ -370,6 +568,7 @@ impl SequenceTracker {
 #[derive(Default)]
 struct ClientInputState {
     pressed_keys: HashSet<Key>,
+    pressed_modifiers: HashSet<Key>,
     pressed_buttons: HashSet<Button>,
 }
 
@@ -393,15 +592,23 @@ fn release_all_pressed_inputs(enigo: &mut Enigo, state: &mut ClientInputState) -
             state.pressed_keys.remove(&key);
             continue;
         }
-        if let Err(err) = simulate(&event) {
-            warn!("failed releasing stuck key {:?}: {err:?}", key);
+        if let Err(err) = inject_event_with_fallback(&event) {
+            warn!("failed releasing stuck key {:?}: {err}", key);
             failures = failures.saturating_add(1);
             continue;
         }
         state.pressed_keys.remove(&key);
+        state.pressed_modifiers.remove(&key);
     }
 
     failures
+}
+
+fn inject_event_with_fallback(event: &EventType) -> Result<()> {
+    if macos_inject::inject_event(event).is_ok() {
+        return Ok(());
+    }
+    simulate(event).map_err(|err| anyhow::anyhow!("{err:?}"))
 }
 
 fn button_release_order(button: &Button) -> u8 {
@@ -576,6 +783,7 @@ impl ClientReceiveProbe {
 
     fn on_input_event(
         &mut self,
+        wire_event: &WireEvent,
         event: &EventType,
         meta: ProbeMessageMeta,
         enigo: &mut Enigo,
@@ -601,7 +809,7 @@ impl ClientReceiveProbe {
 
         let injection_status = if no_inject {
             "skip"
-        } else if let Err(err) = inject_input_event(event, enigo, input_state) {
+        } else if let Err(err) = inject_wire_input_event(wire_event, event, enigo, input_state) {
             self.input_injection_failures += 1;
             warn!("probe failed injecting input event {:?}: {err}", event);
             "fail"
@@ -628,6 +836,7 @@ impl ClientReceiveProbe {
         dy: i32,
         meta: ProbeMessageMeta,
         enigo: &mut Enigo,
+        input_state: &ClientInputState,
         no_inject: bool,
     ) {
         self.note_message(meta.bytes_len, meta.elapsed);
@@ -649,7 +858,8 @@ impl ClientReceiveProbe {
         let expected_y = (before.1 + dy).clamp(0, height.saturating_sub(1));
 
         if !no_inject {
-            enigo.mouse_move_relative(dx, dy);
+            let drag_button = active_drag_button(input_state);
+            move_mouse_relative(enigo, dx, dy, drag_button);
         }
 
         let after = enigo.mouse_location();
@@ -902,7 +1112,7 @@ pub(crate) async fn run_test_inject() -> Result<()> {
 
     for event in sequence {
         debug!("test-inject event: {:?}", event);
-        match simulate(&event) {
+        match inject_event_with_fallback(&event) {
             Ok(()) => debug!("test-inject simulate ok: {:?}", event),
             Err(err) => {
                 warn!("test-inject simulate failed for {:?}: {err:?}", event);
@@ -1001,9 +1211,45 @@ mod tests {
     }
 
     #[test]
+    fn should_recover_from_sequence_status_in_order_is_false() {
+        assert!(!should_recover_from_sequence_status(
+            SequenceStatus::InOrder
+        ));
+    }
+
+    #[test]
+    fn should_recover_from_sequence_status_gap_is_true() {
+        assert!(should_recover_from_sequence_status(SequenceStatus::Gap {
+            missing: 1
+        }));
+    }
+
+    #[test]
+    fn should_recover_from_sequence_status_out_of_order_is_true() {
+        assert!(should_recover_from_sequence_status(
+            SequenceStatus::DuplicateOrOutOfOrder
+        ));
+    }
+
+    #[test]
     fn key_release_order_puts_modifiers_last() {
         assert!(key_release_order(&Key::KeyA) < key_release_order(&Key::MetaLeft));
         assert!(key_release_order(&Key::KeyA) < key_release_order(&Key::ControlLeft));
+    }
+
+    #[test]
+    fn active_drag_button_prefers_left_then_right_then_middle() {
+        let mut state = ClientInputState::default();
+        assert_eq!(active_drag_button(&state), None);
+
+        state.pressed_buttons.insert(Button::Middle);
+        assert_eq!(active_drag_button(&state), Some(Button::Middle));
+
+        state.pressed_buttons.insert(Button::Right);
+        assert_eq!(active_drag_button(&state), Some(Button::Right));
+
+        state.pressed_buttons.insert(Button::Left);
+        assert_eq!(active_drag_button(&state), Some(Button::Left));
     }
 
     #[test]
@@ -1039,6 +1285,24 @@ mod tests {
         {
             assert!(should_skip_client_key_event(&press));
             assert!(should_skip_client_key_event(&release));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!should_skip_client_key_event(&press));
+            assert!(!should_skip_client_key_event(&release));
+        }
+    }
+
+    #[test]
+    fn should_skip_client_key_event_for_other_unknown_keycodes_on_macos() {
+        let press = EventType::KeyPress(Key::Unknown(179));
+        let release = EventType::KeyRelease(Key::Unknown(179));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!should_skip_client_key_event(&press));
+            assert!(!should_skip_client_key_event(&release));
         }
 
         #[cfg(not(target_os = "macos"))]

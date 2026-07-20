@@ -37,6 +37,10 @@ pub(crate) struct StatusPayload {
     pub(crate) active: ActiveTarget,
     pub(crate) pointer_mode: RemotePointerMode,
     pub(crate) attached: Vec<Side>,
+    pub(crate) captured_events: u64,
+    pub(crate) normalized_events: u64,
+    pub(crate) replay_failures: u64,
+    pub(crate) recovery_events: u64,
     pub(crate) captured_queue_full_mouse_dropped: u64,
     pub(crate) captured_queue_full_non_mouse_dropped: u64,
     pub(crate) writer_queue_full_dropped: u64,
@@ -251,6 +255,13 @@ async fn status_payload(state: &HostState) -> StatusPayload {
         active: ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)),
         pointer_mode: RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed)),
         attached,
+        captured_events: state.runtime_stats.captured_events.load(Ordering::Relaxed),
+        normalized_events: state
+            .runtime_stats
+            .normalized_events
+            .load(Ordering::Relaxed),
+        replay_failures: state.runtime_stats.replay_failures.load(Ordering::Relaxed),
+        recovery_events: state.runtime_stats.recovery_events.load(Ordering::Relaxed),
         captured_queue_full_mouse_dropped: state
             .runtime_stats
             .captured_queue_full_mouse_dropped
@@ -344,6 +355,10 @@ mod tests {
             active: ActiveTarget::Right,
             pointer_mode: RemotePointerMode::Confine,
             attached: vec![Side::Right],
+            captured_events: 1,
+            normalized_events: 2,
+            replay_failures: 3,
+            recovery_events: 4,
             captured_queue_full_mouse_dropped: 11,
             captured_queue_full_non_mouse_dropped: 7,
             writer_queue_full_dropped: 5,

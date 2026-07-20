@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -19,11 +19,12 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    input::{parse_detach_chord, run_input_grab},
+    input::{normalize_non_motion_event, parse_detach_chord, run_input_grab},
     ipc::{
         IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
         run_control_socket, send_ipc,
     },
+    macos_keyboard::LayoutTranslator,
     macos_mouse_delta::run_macos_mouse_delta_capture,
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
@@ -32,8 +33,9 @@ use crate::{
     },
     presentation::print_host_ready,
     protocol::{
-        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage,
-        MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, read_framed_with_limit, write_framed,
+        ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
+        MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, ModifierFlags, WireEvent, WireKey,
+        read_framed_with_limit, write_framed,
     },
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
 };
@@ -109,6 +111,7 @@ pub(crate) async fn run_host() -> Result<()> {
 
         let input_active_target = active_target.clone();
         let input_pointer_lock_active = pointer_lock_active.clone();
+        let input_pointer_hidden = pointer_hidden.clone();
         let input_pinned_pointer_pos = pinned_pointer_pos.clone();
         let input_detach_chord = detach_chord.clone();
         let input_runtime_stats = runtime_stats.clone();
@@ -118,7 +121,7 @@ pub(crate) async fn run_host() -> Result<()> {
                 input_runtime_stats,
                 input_active_target,
                 input_pointer_lock_active,
-                pointer_hidden,
+                input_pointer_hidden,
                 input_pinned_pointer_pos,
                 input_detach_chord,
             ) {
@@ -128,6 +131,7 @@ pub(crate) async fn run_host() -> Result<()> {
 
         let mouse_delta_active_target = active_target.clone();
         let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
+        let mouse_delta_pointer_hidden = pointer_hidden.clone();
         let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
         let mouse_delta_runtime_stats = runtime_stats.clone();
         std::thread::spawn(move || {
@@ -136,6 +140,7 @@ pub(crate) async fn run_host() -> Result<()> {
                 mouse_delta_runtime_stats,
                 mouse_delta_active_target,
                 mouse_delta_pointer_lock_active,
+                mouse_delta_pointer_hidden,
                 mouse_delta_pinned_pointer_pos,
             ) {
                 error!("macOS mouse delta capture stopped: {err:#}");
@@ -349,6 +354,9 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
     use tokio::time::{self, MissedTickBehavior};
 
     let mut pending_relative: HashMap<Side, (i32, i32)> = HashMap::new();
+    let mut modifier_flags = ModifierFlags::default();
+    let mut pressed_keys = HashSet::new();
+    let mut layout = LayoutTranslator::new();
     let flush_tick_ms = configured_flush_tick_ms();
     let mut flush_tick = time::interval(Duration::from_millis(flush_tick_ms));
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -378,13 +386,43 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                             continue;
                         };
                         flush_relative_for_side(&state, &mut pending_relative, side).await;
-                        let message = HostToClientMessage::Input {
+                        let message = HostToClientMessage::Event {
                             seq: 0,
-                            event,
+                            event: wire_event_from_rdev(
+                                event,
+                                &mut modifier_flags,
+                                &mut pressed_keys,
+                                &mut layout,
+                            ),
                         };
                         if !send_to_side(&state, side, message, false).await {
                             continue;
                         }
+                    }
+                    CapturedEvent::MouseButton { button, pressed } => {
+                        let Some(side) = captured.target.to_side() else {
+                            continue;
+                        };
+                        flush_relative_for_side(&state, &mut pending_relative, side).await;
+                        let message = HostToClientMessage::Event {
+                            seq: 0,
+                            event: WireEvent::MouseButton {
+                                button: button_to_wire(button),
+                                pressed,
+                            },
+                        };
+                        let _ = send_to_side(&state, side, message, false).await;
+                    }
+                    CapturedEvent::MouseWheel { delta_x, delta_y } => {
+                        let Some(side) = captured.target.to_side() else {
+                            continue;
+                        };
+                        flush_relative_for_side(&state, &mut pending_relative, side).await;
+                        let message = HostToClientMessage::Event {
+                            seq: 0,
+                            event: WireEvent::Wheel { delta_x, delta_y },
+                        };
+                        let _ = send_to_side(&state, side, message, false).await;
                     }
                     CapturedEvent::MouseMoveRelative { dx, dy } => {
                         let Some(side) = captured.target.to_side() else {
@@ -424,7 +462,7 @@ async fn flush_relative_for_side(
     if dx == 0 && dy == 0 {
         return;
     }
-    let message = HostToClientMessage::MouseMoveRelative { seq: 0, dx, dy };
+    let message = HostToClientMessage::RelativeMotion { seq: 0, dx, dy };
     let _ = send_to_side(state, side, message, true).await;
 }
 
@@ -469,6 +507,10 @@ async fn send_to_side(
                     .runtime_stats
                     .writer_queue_full_forced_local
                     .fetch_add(1, Ordering::Relaxed);
+                state
+                    .runtime_stats
+                    .recovery_events
+                    .fetch_add(1, Ordering::Relaxed);
                 apply_target_change(state, ActiveTarget::Local, "writer queue saturated");
             }
             state
@@ -483,6 +525,10 @@ async fn send_to_side(
                 side, peer.name
             );
             apply_target_change(state, ActiveTarget::Local, "forwarding failure");
+            state
+                .runtime_stats
+                .recovery_events
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
     }
@@ -492,11 +538,96 @@ async fn send_to_side(
 
 fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessage {
     match message {
-        HostToClientMessage::Input { event, .. } => HostToClientMessage::Input { seq, event },
-        HostToClientMessage::MouseMoveRelative { dx, dy, .. } => {
-            HostToClientMessage::MouseMoveRelative { seq, dx, dy }
+        HostToClientMessage::Event { event, .. } => HostToClientMessage::Event { seq, event },
+        HostToClientMessage::RelativeMotion { dx, dy, .. } => {
+            HostToClientMessage::RelativeMotion { seq, dx, dy }
         }
         HostToClientMessage::ReleaseAll { .. } => HostToClientMessage::ReleaseAll { seq },
+    }
+}
+
+fn wire_event_from_rdev(
+    event: EventType,
+    modifiers: &mut ModifierFlags,
+    pressed_keys: &mut HashSet<Key>,
+    layout: &mut LayoutTranslator,
+) -> WireEvent {
+    match event {
+        EventType::KeyPress(key) => {
+            let action = if pressed_keys.insert(key) {
+                KeyAction::Down
+            } else {
+                KeyAction::Repeat
+            };
+            update_modifier_flags(modifiers, key, true);
+            WireEvent::Key {
+                action,
+                key: wire_key(key, layout, modifiers, true),
+                modifiers: modifiers.clone(),
+            }
+        }
+        EventType::KeyRelease(key) => {
+            pressed_keys.remove(&key);
+            update_modifier_flags(modifiers, key, false);
+            WireEvent::Key {
+                action: KeyAction::Up,
+                key: wire_key(key, layout, modifiers, false),
+                modifiers: modifiers.clone(),
+            }
+        }
+        EventType::Wheel { delta_x, delta_y } => WireEvent::Wheel { delta_x, delta_y },
+        EventType::ButtonPress(button) => WireEvent::MouseButton {
+            button: button_to_wire(button),
+            pressed: true,
+        },
+        EventType::ButtonRelease(button) => WireEvent::MouseButton {
+            button: button_to_wire(button),
+            pressed: false,
+        },
+        EventType::MouseMove { x, y } => WireEvent::RelativeMotion {
+            dx: x.round() as i32,
+            dy: y.round() as i32,
+        },
+    }
+}
+
+fn update_modifier_flags(flags: &mut ModifierFlags, key: Key, down: bool) {
+    let slot = match key {
+        Key::ShiftLeft => &mut flags.left_shift,
+        Key::ShiftRight => &mut flags.right_shift,
+        Key::ControlLeft => &mut flags.left_control,
+        Key::ControlRight => &mut flags.right_control,
+        Key::Alt => &mut flags.left_alt,
+        Key::AltGr => &mut flags.right_alt,
+        Key::MetaLeft => &mut flags.left_meta,
+        Key::MetaRight => &mut flags.right_meta,
+        _ => return,
+    };
+    *slot = down;
+}
+
+fn wire_key(
+    key: Key,
+    layout: &mut LayoutTranslator,
+    modifiers: &ModifierFlags,
+    translate: bool,
+) -> WireKey {
+    let physical_code = crate::macos_inject::keycode_for_key(key);
+    WireKey {
+        logical: physical_code
+            .filter(|_| translate)
+            .and_then(|code| layout.translate(code, modifiers))
+            .unwrap_or_else(|| format!("{key:?}")),
+        physical_code,
+    }
+}
+
+fn button_to_wire(button: rdev::Button) -> u8 {
+    match button {
+        rdev::Button::Left => 1,
+        rdev::Button::Middle => 2,
+        rdev::Button::Right => 3,
+        rdev::Button::Unknown(value) => value,
     }
 }
 
@@ -660,10 +791,10 @@ async fn run_dev_synthetic_input(tx: mpsc::Sender<CapturedInput>, state: HostSta
         if attached {
             let target = ActiveTarget::from(side);
             let event = match seq_idx % 16 {
-                0 => CapturedEvent::Raw(EventType::KeyPress(Key::KeyM)),
-                1 => CapturedEvent::Raw(EventType::KeyRelease(Key::KeyM)),
-                2 => CapturedEvent::Raw(EventType::KeyPress(Key::KeyE)),
-                3 => CapturedEvent::Raw(EventType::KeyRelease(Key::KeyE)),
+                0 => normalize_non_motion_event(EventType::KeyPress(Key::KeyM)),
+                1 => normalize_non_motion_event(EventType::KeyRelease(Key::KeyM)),
+                2 => normalize_non_motion_event(EventType::KeyPress(Key::KeyE)),
+                3 => normalize_non_motion_event(EventType::KeyRelease(Key::KeyE)),
                 _ => CapturedEvent::MouseMoveRelative {
                     dx: if seq_idx.is_multiple_of(2) { 4 } else { -3 },
                     dy: if seq_idx.is_multiple_of(3) { 2 } else { -2 },

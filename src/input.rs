@@ -55,6 +55,9 @@ pub(crate) fn run_input_grab(
     let local_edge_push: Arc<Mutex<EdgePushTracker>> = Arc::new(Mutex::new(EdgePushTracker::new()));
 
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
+        runtime_stats
+            .captured_events
+            .fetch_add(1, Ordering::Relaxed);
         {
             let mut keys = pressed_keys.lock().expect("pressed key mutex poisoned");
             match event.event_type {
@@ -190,8 +193,11 @@ pub(crate) fn run_input_grab(
                             dy: clamp_relative_delta(dy),
                         }
                     }
-                    other => CapturedEvent::Raw(other),
+                    other => normalize_non_motion_event(other),
                 };
+                runtime_stats
+                    .normalized_events
+                    .fetch_add(1, Ordering::Relaxed);
 
                 let drop_if_full =
                     matches!(&captured_event, CapturedEvent::MouseMoveRelative { .. });
@@ -210,6 +216,21 @@ pub(crate) fn run_input_grab(
     };
 
     grab(callback).map_err(|e| anyhow!("input grab failed: {e:?}"))
+}
+
+pub(crate) fn normalize_non_motion_event(event: EventType) -> CapturedEvent {
+    match event {
+        EventType::ButtonPress(button) => CapturedEvent::MouseButton {
+            button,
+            pressed: true,
+        },
+        EventType::ButtonRelease(button) => CapturedEvent::MouseButton {
+            button,
+            pressed: false,
+        },
+        EventType::Wheel { delta_x, delta_y } => CapturedEvent::MouseWheel { delta_x, delta_y },
+        other => CapturedEvent::Raw(other),
+    }
 }
 
 fn try_send_captured_input(
@@ -245,6 +266,10 @@ fn try_send_captured_input_with_policy(
                 &send_ctx.pointer_hidden,
                 &send_ctx.pinned_pointer_pos,
             );
+            send_ctx
+                .runtime_stats
+                .recovery_events
+                .fetch_add(1, Ordering::Relaxed);
             warn!("captured input queue full; dropping non-mouse event");
         }
         Err(TrySendError::Closed(_)) => {
@@ -509,5 +534,51 @@ mod tests {
             err.to_string()
                 .contains("detach_key must include a key, for example")
         );
+    }
+
+    #[test]
+    fn normalize_non_motion_event_maps_all_standard_mouse_buttons() {
+        for button in [
+            rdev::Button::Left,
+            rdev::Button::Middle,
+            rdev::Button::Right,
+        ] {
+            assert!(matches!(
+                normalize_non_motion_event(EventType::ButtonPress(button)),
+                CapturedEvent::MouseButton {
+                    button: mapped,
+                    pressed: true
+                } if mapped == button
+            ));
+            assert!(matches!(
+                normalize_non_motion_event(EventType::ButtonRelease(button)),
+                CapturedEvent::MouseButton {
+                    button: mapped,
+                    pressed: false
+                } if mapped == button
+            ));
+        }
+    }
+
+    #[test]
+    fn normalize_non_motion_event_preserves_wheel_axes() {
+        assert!(matches!(
+            normalize_non_motion_event(EventType::Wheel {
+                delta_x: -3,
+                delta_y: 7,
+            }),
+            CapturedEvent::MouseWheel {
+                delta_x: -3,
+                delta_y: 7,
+            }
+        ));
+    }
+
+    #[test]
+    fn normalize_non_motion_event_keeps_keyboard_events_raw() {
+        assert!(matches!(
+            normalize_non_motion_event(EventType::KeyPress(Key::KeyA)),
+            CapturedEvent::Raw(EventType::KeyPress(Key::KeyA))
+        ));
     }
 }

@@ -19,15 +19,26 @@ pub(crate) fn run_macos_mouse_delta_capture(
     runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
+    pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
 ) -> Result<()> {
     use anyhow::anyhow;
+    use core_foundation::base::TCFType;
     use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
     use core_graphics::event::{
         CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
         CGEventType, EventField,
     };
-    use tracing::warn;
+    use std::sync::atomic::AtomicPtr;
+    use tracing::{info, warn};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    }
+
+    let tap_port = Arc::new(AtomicPtr::<std::ffi::c_void>::new(std::ptr::null_mut()));
+    let callback_tap_port = tap_port.clone();
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -38,35 +49,41 @@ pub(crate) fn run_macos_mouse_delta_capture(
             CGEventType::LeftMouseDragged,
             CGEventType::RightMouseDragged,
             CGEventType::OtherMouseDragged,
-            CGEventType::OtherMouseDown,
-            CGEventType::OtherMouseUp,
         ],
         move |_proxy, event_type, event: &CGEvent| {
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                let port = callback_tap_port.load(Ordering::Relaxed);
+                if !port.is_null() {
+                    unsafe { CGEventTapEnable(port, true) };
+                    info!("re-enabled macOS mouse CGEventTap after {event_type:?}");
+                } else {
+                    warn!("macOS mouse CGEventTap was disabled before its port was ready");
+                }
+                active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+                pointer_lock_active.store(false, Ordering::Relaxed);
+                runtime_stats
+                    .recovery_events
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+                    warn!("failed to restore pointer association after tap disable: {err:#}");
+                }
+                if pointer_hidden.swap(false, Ordering::Relaxed)
+                    && let Err(err) = host_mouse::set_pointer_visible(true)
+                {
+                    warn!("failed to show pointer after tap disable: {err:#}");
+                }
+                *pinned_pointer_pos
+                    .lock()
+                    .expect("pinned pointer mutex poisoned") = None;
+                return Some(event.clone());
+            }
             let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
             let is_remote = target.to_side().is_some();
             if !is_remote || !pointer_lock_active.load(Ordering::Relaxed) {
                 return Some(event.clone());
-            }
-
-            if let Some(button_event) = map_other_mouse_button_event(event_type, event) {
-                match tx.try_send(CapturedInput {
-                    target,
-                    event: CapturedEvent::Raw(button_event),
-                }) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        runtime_stats
-                            .captured_queue_full_non_mouse_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "captured input queue full; dropping macOS middle mouse button event"
-                        );
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        warn!("failed to queue macOS middle mouse button event for forwarding");
-                    }
-                }
-                return None;
             }
 
             let dx = clamp_relative_delta(
@@ -110,6 +127,11 @@ pub(crate) fn run_macos_mouse_delta_capture(
     )
     .map_err(|_| anyhow!("failed to create macOS mouse CGEventTap"))?;
 
+    tap_port.store(
+        tap.mach_port.as_concrete_TypeRef() as *mut std::ffi::c_void,
+        Ordering::Relaxed,
+    );
+
     let run_loop = CFRunLoop::get_current();
     let loop_source = tap
         .mach_port
@@ -123,61 +145,14 @@ pub(crate) fn run_macos_mouse_delta_capture(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn map_other_mouse_button_event(
-    event_type: core_graphics::event::CGEventType,
-    event: &core_graphics::event::CGEvent,
-) -> Option<rdev::EventType> {
-    use core_graphics::event::{CGEventType, EventField};
-    use rdev::{Button, EventType};
-
-    let button_number = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-    if button_number != 2 {
-        return None;
-    }
-
-    match event_type {
-        CGEventType::OtherMouseDown => Some(EventType::ButtonPress(Button::Middle)),
-        CGEventType::OtherMouseUp => Some(EventType::ButtonRelease(Button::Middle)),
-        _ => None,
-    }
-}
-
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_macos_mouse_delta_capture(
     _tx: mpsc::Sender<CapturedInput>,
     _runtime_stats: Arc<RuntimeStats>,
     _active_target: Arc<AtomicU8>,
     _pointer_lock_active: Arc<AtomicBool>,
+    _pointer_hidden: Arc<AtomicBool>,
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
 ) -> Result<()> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn map_other_mouse_button_event_maps_middle_press() {
-        use core_graphics::event::{CGEvent, CGEventType, CGMouseButton, EventField};
-        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-        use core_graphics::geometry::CGPoint;
-        use rdev::{Button, EventType};
-
-        let source =
-            CGEventSource::new(CGEventSourceStateID::CombinedSessionState).expect("event source");
-        let event = CGEvent::new_mouse_event(
-            source,
-            CGEventType::OtherMouseDown,
-            CGPoint::new(100.0, 200.0),
-            CGMouseButton::Center,
-        )
-        .expect("mouse event");
-        event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, 2);
-
-        let mapped = map_other_mouse_button_event(CGEventType::OtherMouseDown, &event);
-        assert_eq!(mapped, Some(EventType::ButtonPress(Button::Middle)));
-    }
 }

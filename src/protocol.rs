@@ -1,11 +1,10 @@
 use anyhow::{Result, bail};
 use iroh::endpoint::Connection;
-use rdev::EventType;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ScreenEdge, Side};
 
-pub(crate) const ALPN: &[u8] = b"meow/remote-input/0";
+pub(crate) const ALPN: &[u8] = b"meow/remote-input/1";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
@@ -25,9 +24,58 @@ pub(crate) struct AuthResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum HostToClientMessage {
-    Input { seq: u64, event: EventType },
-    MouseMoveRelative { seq: u64, dx: i32, dy: i32 },
+    Event { seq: u64, event: WireEvent },
+    RelativeMotion { seq: u64, dx: i32, dy: i32 },
     ReleaseAll { seq: u64 },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ModifierFlags {
+    pub(crate) left_shift: bool,
+    pub(crate) right_shift: bool,
+    pub(crate) left_control: bool,
+    pub(crate) right_control: bool,
+    pub(crate) left_alt: bool,
+    pub(crate) right_alt: bool,
+    pub(crate) left_meta: bool,
+    pub(crate) right_meta: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WireKey {
+    pub(crate) physical_code: Option<u16>,
+    pub(crate) logical: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum KeyAction {
+    Down,
+    Repeat,
+    Up,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum WireEvent {
+    Key {
+        action: KeyAction,
+        key: WireKey,
+        modifiers: ModifierFlags,
+    },
+    ModifierChanged {
+        modifiers: ModifierFlags,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    RelativeMotion {
+        dx: i32,
+        dy: i32,
+    },
+    Wheel {
+        delta_x: i64,
+        delta_y: i64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,15 +158,17 @@ mod tests {
 
     #[test]
     fn wire_message_round_trip_serde() {
-        let msg = HostToClientMessage::MouseMoveRelative {
+        let msg = HostToClientMessage::Event {
             seq: 7,
-            dx: -42,
-            dy: 17,
+            event: WireEvent::RelativeMotion { dx: -42, dy: 17 },
         };
         let bytes = bincode::serialize(&msg).expect("serialize");
         let round_trip: HostToClientMessage = bincode::deserialize(&bytes).expect("deserialize");
         match round_trip {
-            HostToClientMessage::MouseMoveRelative { seq, dx, dy } => {
+            HostToClientMessage::Event {
+                seq,
+                event: WireEvent::RelativeMotion { dx, dy },
+            } => {
                 assert_eq!(seq, 7);
                 assert_eq!(dx, -42);
                 assert_eq!(dy, 17);
@@ -149,6 +199,57 @@ mod tests {
             ClientToHostMessage::ClientEdgeReached { edge } => {
                 assert_eq!(edge, ScreenEdge::Left);
             }
+        }
+    }
+
+    #[test]
+    fn semantic_events_round_trip_serde() {
+        let events = [
+            WireEvent::Key {
+                action: KeyAction::Down,
+                key: WireKey {
+                    physical_code: Some(0),
+                    logical: "KeyA".to_string(),
+                },
+                modifiers: ModifierFlags::default(),
+            },
+            WireEvent::Key {
+                action: KeyAction::Repeat,
+                key: WireKey {
+                    physical_code: Some(0),
+                    logical: "KeyA".to_string(),
+                },
+                modifiers: ModifierFlags::default(),
+            },
+            WireEvent::Key {
+                action: KeyAction::Up,
+                key: WireKey {
+                    physical_code: Some(0),
+                    logical: "KeyA".to_string(),
+                },
+                modifiers: ModifierFlags::default(),
+            },
+            WireEvent::ModifierChanged {
+                modifiers: ModifierFlags {
+                    left_shift: true,
+                    ..ModifierFlags::default()
+                },
+            },
+            WireEvent::MouseButton {
+                button: 2,
+                pressed: true,
+            },
+            WireEvent::RelativeMotion { dx: -4, dy: 8 },
+            WireEvent::Wheel {
+                delta_x: 1,
+                delta_y: -2,
+            },
+        ];
+
+        for event in events {
+            let bytes = bincode::serialize(&event).expect("serialize semantic event");
+            let decoded: WireEvent = bincode::deserialize(&bytes).expect("deserialize event");
+            assert_eq!(decoded, event);
         }
     }
 }
