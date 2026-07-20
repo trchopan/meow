@@ -40,6 +40,7 @@ pub(crate) struct StatusPayload {
     pub(crate) captured_events: u64,
     pub(crate) normalized_events: u64,
     pub(crate) replay_failures: u64,
+    pub(crate) capture_tap_user_disabled: u64,
     pub(crate) recovery_events: u64,
     pub(crate) captured_queue_full_mouse_dropped: u64,
     pub(crate) captured_queue_full_non_mouse_dropped: u64,
@@ -261,6 +262,10 @@ async fn status_payload(state: &HostState) -> StatusPayload {
             .normalized_events
             .load(Ordering::Relaxed),
         replay_failures: state.runtime_stats.replay_failures.load(Ordering::Relaxed),
+        capture_tap_user_disabled: state
+            .runtime_stats
+            .capture_tap_user_disabled
+            .load(Ordering::Relaxed),
         recovery_events: state.runtime_stats.recovery_events.load(Ordering::Relaxed),
         captured_queue_full_mouse_dropped: state
             .runtime_stats
@@ -358,6 +363,7 @@ mod tests {
             captured_events: 1,
             normalized_events: 2,
             replay_failures: 3,
+            capture_tap_user_disabled: 4,
             recovery_events: 4,
             captured_queue_full_mouse_dropped: 11,
             captured_queue_full_non_mouse_dropped: 7,
@@ -372,5 +378,6 @@ mod tests {
         assert_eq!(decoded.captured_queue_full_non_mouse_dropped, 7);
         assert_eq!(decoded.writer_queue_full_dropped, 5);
         assert_eq!(decoded.writer_queue_full_forced_local, 3);
+        assert_eq!(decoded.capture_tap_user_disabled, 4);
     }
 }

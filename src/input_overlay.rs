@@ -119,6 +119,7 @@ impl Drop for InputOverlay {
     fn drop(&mut self) {
         self.stdin.take();
         if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
             let _ = child.wait();
         }
     }

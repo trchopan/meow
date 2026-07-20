@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ScreenEdge, Side};
 
-pub(crate) const ALPN: &[u8] = b"meow/remote-input/1";
+pub(crate) const ALPN: &[u8] = b"meow/remote-input/2";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
@@ -78,9 +78,17 @@ pub(crate) enum WireEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ReplayFailureKind {
+    Input,
+    SequenceRecovery,
+    ReleaseAll,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ClientToHostMessage {
     ClientEdgeReached { edge: ScreenEdge },
+    ReplayFailure { kind: ReplayFailureKind, count: u64 },
 }
 
 pub(crate) async fn send_client_feedback(
@@ -157,6 +165,12 @@ mod tests {
     }
 
     #[test]
+    fn ensure_frame_len_enforces_feedback_limit() {
+        assert!(ensure_frame_len(MAX_FEEDBACK_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE).is_ok());
+        assert!(ensure_frame_len(MAX_FEEDBACK_MSG_SIZE + 1, MAX_FEEDBACK_MSG_SIZE).is_err());
+    }
+
+    #[test]
     fn wire_message_round_trip_serde() {
         let msg = HostToClientMessage::Event {
             seq: 7,
@@ -198,6 +212,9 @@ mod tests {
         match round_trip {
             ClientToHostMessage::ClientEdgeReached { edge } => {
                 assert_eq!(edge, ScreenEdge::Left);
+            }
+            ClientToHostMessage::ReplayFailure { .. } => {
+                panic!("unexpected replay failure feedback")
             }
         }
     }
@@ -251,5 +268,29 @@ mod tests {
             let decoded: WireEvent = bincode::deserialize(&bytes).expect("deserialize event");
             assert_eq!(decoded, event);
         }
+    }
+
+    #[test]
+    fn replay_failure_feedback_round_trip_serde() {
+        let msg = ClientToHostMessage::ReplayFailure {
+            kind: ReplayFailureKind::Input,
+            count: 3,
+        };
+        let bytes = bincode::serialize(&msg).expect("serialize replay failure");
+        let round_trip: ClientToHostMessage =
+            bincode::deserialize(&bytes).expect("deserialize replay failure");
+        assert!(matches!(
+            round_trip,
+            ClientToHostMessage::ReplayFailure {
+                kind: ReplayFailureKind::Input,
+                count: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_wire_payload_is_rejected() {
+        assert!(bincode::deserialize::<WireEvent>(&[]).is_err());
+        assert!(bincode::deserialize::<HostToClientMessage>(&[0xff]).is_err());
     }
 }

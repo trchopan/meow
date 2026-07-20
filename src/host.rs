@@ -40,6 +40,8 @@ use crate::{
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
 };
 
+const MAX_REPLAY_FAILURE_REPORT_COUNT: u64 = 1_000_000;
+
 pub(crate) async fn run_host() -> Result<()> {
     if !skip_permissions_for_synthetic_mode() {
         ensure_host_permissions_on_startup()?;
@@ -149,7 +151,6 @@ pub(crate) async fn run_host() -> Result<()> {
     }
 
     tokio::spawn(run_forward_loop(input_rx, state.clone()));
-    tokio::spawn(run_target_transition_guard(state.clone()));
 
     let control_state = state.clone();
     tokio::spawn(async move {
@@ -314,6 +315,17 @@ async fn run_client_feedback_loop(
             ClientToHostMessage::ClientEdgeReached { edge } => {
                 maybe_switch_to_local_on_edge(&state, side, edge, peer_name);
             }
+            ClientToHostMessage::ReplayFailure { kind, count } => {
+                let count = count.min(MAX_REPLAY_FAILURE_REPORT_COUNT);
+                state
+                    .runtime_stats
+                    .replay_failures
+                    .fetch_add(count, Ordering::Relaxed);
+                warn!(
+                    "remote replay failure on {:?} ({}): kind={kind:?} count={count}",
+                    side, peer_name
+                );
+            }
         }
     }
 }
@@ -357,12 +369,24 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
     let mut modifier_flags = ModifierFlags::default();
     let mut pressed_keys = HashSet::new();
     let mut layout = LayoutTranslator::new();
+    let mut last_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     let flush_tick_ms = configured_flush_tick_ms();
     let mut flush_tick = time::interval(Duration::from_millis(flush_tick_ms));
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     debug!("relative flush tick configured to {}ms", flush_tick_ms);
 
     loop {
+        let current_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+        if current_target != last_target {
+            if let Some(previous_side) = last_target.to_side()
+                && current_target.to_side() != Some(previous_side)
+            {
+                flush_relative_for_side(&state, &mut pending_relative, previous_side).await;
+                send_release_all_to_side(&state, previous_side).await;
+            }
+            last_target = current_target;
+        }
+
         tokio::select! {
             _ = state.shutdown_notify.notified() => {
                 flush_pending_relative(&state, &mut pending_relative).await;
@@ -371,13 +395,17 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
             _ = flush_tick.tick() => {
                 flush_pending_relative(&state, &mut pending_relative).await;
             }
-            maybe_captured = rx.recv() => {
-                let Some(captured) = maybe_captured else {
-                    flush_pending_relative(&state, &mut pending_relative).await;
-                    break;
-                };
+                maybe_captured = rx.recv() => {
+                    let Some(captured) = maybe_captured else {
+                        flush_pending_relative(&state, &mut pending_relative).await;
+                        break;
+                    };
 
-                match captured.event {
+                    if let Some(side) = side_requiring_ordered_flush(&captured) {
+                        flush_relative_for_side(&state, &mut pending_relative, side).await;
+                    }
+
+                    match captured.event {
                     CapturedEvent::HostEdgeReached { edge } => {
                         maybe_switch_to_remote_on_host_edge(&state, edge).await;
                     }
@@ -385,7 +413,6 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                         let Some(side) = captured.target.to_side() else {
                             continue;
                         };
-                        flush_relative_for_side(&state, &mut pending_relative, side).await;
                         let message = HostToClientMessage::Event {
                             seq: 0,
                             event: wire_event_from_rdev(
@@ -403,7 +430,6 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                         let Some(side) = captured.target.to_side() else {
                             continue;
                         };
-                        flush_relative_for_side(&state, &mut pending_relative, side).await;
                         let message = HostToClientMessage::Event {
                             seq: 0,
                             event: WireEvent::MouseButton {
@@ -417,7 +443,6 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                         let Some(side) = captured.target.to_side() else {
                             continue;
                         };
-                        flush_relative_for_side(&state, &mut pending_relative, side).await;
                         let message = HostToClientMessage::Event {
                             seq: 0,
                             event: WireEvent::Wheel { delta_x, delta_y },
@@ -438,6 +463,15 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                 }
             }
         }
+    }
+}
+
+fn side_requiring_ordered_flush(captured: &CapturedInput) -> Option<Side> {
+    match &captured.event {
+        CapturedEvent::Raw(_)
+        | CapturedEvent::MouseButton { .. }
+        | CapturedEvent::MouseWheel { .. } => captured.target.to_side(),
+        CapturedEvent::MouseMoveRelative { .. } | CapturedEvent::HostEdgeReached { .. } => None,
     }
 }
 
@@ -622,35 +656,19 @@ fn wire_key(
     }
 }
 
+#[cfg(test)]
+fn wire_key_identity(key: &WireKey) -> String {
+    key.physical_code
+        .map(|code| format!("physical:{code}"))
+        .unwrap_or_else(|| format!("logical:{}", key.logical))
+}
+
 fn button_to_wire(button: rdev::Button) -> u8 {
     match button {
         rdev::Button::Left => 1,
         rdev::Button::Middle => 2,
         rdev::Button::Right => 3,
         rdev::Button::Unknown(value) => value,
-    }
-}
-
-async fn run_target_transition_guard(state: HostState) {
-    let mut last_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
-    loop {
-        tokio::select! {
-            _ = state.shutdown_notify.notified() => {
-                break;
-            }
-            _ = time::sleep(Duration::from_millis(5)) => {}
-        }
-        let current = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
-        if current == last_target {
-            continue;
-        }
-
-        if let Some(previous_side) = last_target.to_side()
-            && current.to_side() != Some(previous_side)
-        {
-            send_release_all_to_side(&state, previous_side).await;
-        }
-        last_target = current;
     }
 }
 
@@ -907,5 +925,43 @@ mod tests {
         assert_eq!(side_from_edge(ScreenEdge::Right), Side::Right);
         assert_eq!(side_from_edge(ScreenEdge::Up), Side::Up);
         assert_eq!(side_from_edge(ScreenEdge::Down), Side::Down);
+    }
+
+    #[test]
+    fn physical_key_identity_is_stable_across_logical_release_changes() {
+        let press = WireKey {
+            physical_code: Some(37),
+            logical: "A".to_string(),
+        };
+        let release = WireKey {
+            physical_code: Some(37),
+            logical: "KeyL".to_string(),
+        };
+        assert_eq!(wire_key_identity(&press), wire_key_identity(&release));
+    }
+
+    #[test]
+    fn ordered_discrete_events_flush_only_for_remote_targets() {
+        let remote = CapturedInput {
+            target: ActiveTarget::Right,
+            event: CapturedEvent::MouseWheel {
+                delta_x: 1,
+                delta_y: -1,
+            },
+        };
+        let local_motion = CapturedInput {
+            target: ActiveTarget::Local,
+            event: CapturedEvent::MouseMoveRelative { dx: 1, dy: 1 },
+        };
+        let edge = CapturedInput {
+            target: ActiveTarget::Local,
+            event: CapturedEvent::HostEdgeReached {
+                edge: ScreenEdge::Right,
+            },
+        };
+
+        assert_eq!(side_requiring_ordered_flush(&remote), Some(Side::Right));
+        assert_eq!(side_requiring_ordered_flush(&local_motion), None);
+        assert_eq!(side_requiring_ordered_flush(&edge), None);
     }
 }

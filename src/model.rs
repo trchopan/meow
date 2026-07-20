@@ -177,6 +177,7 @@ pub(crate) struct RuntimeStats {
     pub(crate) captured_events: AtomicU64,
     pub(crate) normalized_events: AtomicU64,
     pub(crate) replay_failures: AtomicU64,
+    pub(crate) capture_tap_user_disabled: AtomicU64,
     pub(crate) recovery_events: AtomicU64,
     pub(crate) captured_queue_full_mouse_dropped: AtomicU64,
     pub(crate) captured_queue_full_non_mouse_dropped: AtomicU64,

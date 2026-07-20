@@ -16,8 +16,8 @@ use crate::{
     model::ScreenEdge,
     protocol::{
         ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
-        MAX_AUTH_MSG_SIZE, WireEvent, read_framed_with_limit, read_framed_with_size,
-        send_client_feedback, write_framed,
+        MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, read_framed_with_limit,
+        read_framed_with_size, send_client_feedback, write_framed,
     },
 };
 
@@ -74,6 +74,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let mut input_state = ClientInputState::default();
     let mut sequence_tracker = SequenceTracker::default();
     let mut test_drop_sequence = args.test_drop_sequence;
+    let mut replay_failures = ReplayFailureReporter::default();
     let mut input_overlay = InputOverlay::start(
         args.input_overlay,
         args.input_overlay_position,
@@ -118,6 +119,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
                     if failures > 0 {
                         warn!("sequence anomaly recovery had {failures} injection failure(s)");
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
+                            .await;
                     }
                     edge_push.reset();
                     last_signaled_edge = None;
@@ -130,7 +134,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 };
                 if let Some(probe) = probe.as_mut() {
                     probe.note_sequence(seq_status);
-                    probe.on_input_event(
+                    let failed = probe.on_input_event(
                         &wire_event,
                         &event,
                         meta,
@@ -138,6 +142,11 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                         &mut input_state,
                         args.no_inject,
                     );
+                    if failed {
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::Input, 1)
+                            .await;
+                    }
                     probe.note_held_counts(&input_state);
                 }
                 debug!("client received input event: {:?}", event);
@@ -147,6 +156,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                         inject_wire_input_event(&wire_event, &event, &mut enigo, &mut input_state)
                     {
                         warn!("failed injecting input event: {err}");
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::Input, 1)
+                            .await;
                     } else {
                         debug!("client injection ok for event: {:?}", event);
                     }
@@ -163,6 +175,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
                     if failures > 0 {
                         warn!("sequence anomaly recovery had {failures} injection failure(s)");
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
+                            .await;
                     }
                     edge_push.reset();
                     last_signaled_edge = None;
@@ -210,7 +225,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 let seq_status = sequence_tracker.observe(seq);
                 if let Some(probe) = probe.as_mut() {
                     probe.note_sequence(seq_status);
-                    probe.on_release_all(
+                    let failures = probe.on_release_all(
                         seq,
                         frame_size,
                         &mut enigo,
@@ -218,11 +233,19 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                         elapsed,
                         args.no_inject,
                     );
+                    if failures > 0 {
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::ReleaseAll, failures)
+                            .await;
+                    }
                     probe.note_held_counts(&input_state);
                 } else if !args.no_inject {
                     let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
                     if failures > 0 {
                         warn!("release-all had {failures} injection failure(s)");
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::ReleaseAll, failures)
+                            .await;
                     }
                     input_overlay.clear();
                 }
@@ -234,9 +257,14 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
         if failures > 0 {
             warn!("attach cleanup had {failures} injection failure(s)");
+            replay_failures
+                .report(&connection, ReplayFailureKind::ReleaseAll, failures)
+                .await;
         }
         input_overlay.clear();
     }
+
+    replay_failures.flush(&connection).await;
 
     if let Some(probe) = probe.as_mut() {
         probe.note_held_counts(&input_state);
@@ -248,6 +276,68 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     }
 
     run_result
+}
+
+#[derive(Default)]
+struct ReplayFailureReporter {
+    last_sent: Option<Instant>,
+    pending: Option<(ReplayFailureKind, u64)>,
+}
+
+impl ReplayFailureReporter {
+    async fn report(
+        &mut self,
+        connection: &iroh::endpoint::Connection,
+        kind: ReplayFailureKind,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_sent
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+        {
+            match &mut self.pending {
+                Some((pending_kind, pending_count)) if *pending_kind == kind => {
+                    *pending_count = pending_count.saturating_add(count);
+                    return;
+                }
+                None => {
+                    self.pending = Some((kind, count));
+                    return;
+                }
+                Some(_) => {
+                    self.flush(connection).await;
+                }
+            }
+        }
+
+        self.flush(connection).await;
+        self.send(connection, kind, count).await;
+        self.last_sent = Some(now);
+    }
+
+    async fn flush(&mut self, connection: &iroh::endpoint::Connection) {
+        let Some((kind, count)) = self.pending.take() else {
+            return;
+        };
+        self.send(connection, kind, count).await;
+        self.last_sent = Some(Instant::now());
+    }
+
+    async fn send(
+        &self,
+        connection: &iroh::endpoint::Connection,
+        kind: ReplayFailureKind,
+        count: u64,
+    ) {
+        let message = ClientToHostMessage::ReplayFailure { kind, count };
+        if let Err(err) = send_client_feedback(connection, &message).await {
+            debug!("failed reporting replay failure to host: {err:#}");
+        }
+    }
 }
 
 fn wire_event_to_rdev(event: &WireEvent) -> Option<EventType> {
@@ -789,7 +879,7 @@ impl ClientReceiveProbe {
         enigo: &mut Enigo,
         input_state: &mut ClientInputState,
         no_inject: bool,
-    ) {
+    ) -> bool {
         self.note_message(meta.bytes_len, meta.elapsed);
         self.total_messages += 1;
         self.input_messages += 1;
@@ -828,6 +918,7 @@ impl ClientReceiveProbe {
                 injection_status
             );
         }
+        injection_status == "fail"
     }
 
     fn on_relative_mouse(
@@ -908,15 +999,16 @@ impl ClientReceiveProbe {
         input_state: &mut ClientInputState,
         elapsed: std::time::Duration,
         no_inject: bool,
-    ) {
+    ) -> u64 {
         self.note_message(bytes_len, elapsed);
         self.total_messages += 1;
         self.release_all_messages += 1;
 
+        let mut failures = 0;
         let status = if no_inject {
             "skip"
         } else {
-            let failures = release_all_pressed_inputs(enigo, input_state);
+            failures = release_all_pressed_inputs(enigo, input_state);
             self.input_injection_failures = self.input_injection_failures.saturating_add(failures);
             if failures == 0 { "ok" } else { "fail" }
         };
@@ -931,6 +1023,7 @@ impl ClientReceiveProbe {
                 status
             );
         }
+        failures
     }
 
     fn note_sequence(&mut self, status: SequenceStatus) {
@@ -1310,5 +1403,28 @@ mod tests {
             assert!(!should_skip_client_key_event(&press));
             assert!(!should_skip_client_key_event(&release));
         }
+    }
+
+    #[test]
+    fn physical_keycode_pairs_press_and_release_despite_logical_labels() {
+        let press = wire_event_to_rdev(&WireEvent::Key {
+            action: KeyAction::Down,
+            key: crate::protocol::WireKey {
+                physical_code: Some(37),
+                logical: "A".to_string(),
+            },
+            modifiers: Default::default(),
+        });
+        let release = wire_event_to_rdev(&WireEvent::Key {
+            action: KeyAction::Up,
+            key: crate::protocol::WireKey {
+                physical_code: Some(37),
+                logical: "KeyL".to_string(),
+            },
+            modifiers: Default::default(),
+        });
+
+        assert_eq!(press, Some(EventType::KeyPress(Key::Unknown(37))));
+        assert_eq!(release, Some(EventType::KeyRelease(Key::Unknown(37))));
     }
 }
