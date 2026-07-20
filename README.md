@@ -60,6 +60,7 @@ You can switch active targets from the host with directional commands (`meow rig
 - Local detach chord for fast return to host input.
 - Persistent host identity and attach secret.
 - Local control socket for status and runtime control commands.
+- Optional remote input overlay for displaying pressed keys and buttons.
 
 ## Requirements
 
@@ -146,6 +147,15 @@ Attach command:
 ```sh
 meow attach <host-id> <secret> --side <left|right|up|down>
 ```
+
+The optional input overlay can be enabled on the attached machine:
+
+```sh
+meow attach <host-id> <secret> --side right --input-overlay
+```
+
+Use `--input-overlay-position top-left|top-right|bottom-left|bottom-right` and
+`--input-overlay-idle-ms <milliseconds>` to configure its position and idle timeout.
 
 ## Pointer Modes
 

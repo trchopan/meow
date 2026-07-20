@@ -2,6 +2,14 @@ use clap::{Parser, Subcommand};
 
 use crate::model::{RemotePointerMode, Side};
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum OverlayPosition {
+    TopRight,
+    TopLeft,
+    BottomRight,
+    BottomLeft,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "meow", version, about = "Control nearby machines with iroh")]
 pub(crate) struct Cli {
@@ -23,6 +31,8 @@ pub(crate) enum Command {
     TestInject,
     #[command(hide = true)]
     BenchFlush(BenchFlushArgs),
+    #[command(hide = true)]
+    OverlayUi(OverlayUiArgs),
     Local,
     Right,
     Left,
@@ -81,6 +91,22 @@ pub(crate) struct AttachArgs {
     pub(crate) no_inject: bool,
     #[arg(long, default_value_t = false, hide = true)]
     pub(crate) probe_summary_only: bool,
+    #[arg(long, hide = true)]
+    pub(crate) test_drop_sequence: Option<u64>,
+    #[arg(long, default_value_t = false)]
+    pub(crate) input_overlay: bool,
+    #[arg(long, value_enum, default_value_t = OverlayPosition::TopRight)]
+    pub(crate) input_overlay_position: OverlayPosition,
+    #[arg(long, default_value_t = 1500)]
+    pub(crate) input_overlay_idle_ms: u64,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct OverlayUiArgs {
+    #[arg(long, value_enum, default_value_t = OverlayPosition::TopRight)]
+    pub(crate) position: OverlayPosition,
+    #[arg(long, default_value_t = 1500)]
+    pub(crate) idle_ms: u64,
 }
 
 #[derive(Debug, clap::Args)]
