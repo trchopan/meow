@@ -36,10 +36,11 @@ pub(crate) fn print_status_response(message: &str, status: Option<&StatusPayload
             status.writer_queue_full_forced_local,
         );
         println!(
-            "events: captured={} normalized={} replay_failures={} recoveries={}",
+            "events: captured={} normalized={} replay_failures={} tap_user_disabled={} recoveries={}",
             status.captured_events,
             status.normalized_events,
             status.replay_failures,
+            status.capture_tap_user_disabled,
             status.recovery_events,
         );
     }

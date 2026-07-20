@@ -13,6 +13,10 @@ use crate::{
     model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats},
 };
 
+fn should_capture_motion(target: ActiveTarget, pointer_lock_active: bool) -> bool {
+    target.to_side().is_some() && pointer_lock_active
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn run_macos_mouse_delta_capture(
     tx: mpsc::Sender<CapturedInput>,
@@ -56,11 +60,18 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
                 let port = callback_tap_port.load(Ordering::Relaxed);
-                if !port.is_null() {
-                    unsafe { CGEventTapEnable(port, true) };
-                    info!("re-enabled macOS mouse CGEventTap after {event_type:?}");
+                if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+                    if !port.is_null() {
+                        unsafe { CGEventTapEnable(port, true) };
+                        info!("re-enabled macOS mouse CGEventTap after timeout");
+                    } else {
+                        warn!("macOS mouse CGEventTap timed out before its port was ready");
+                    }
                 } else {
-                    warn!("macOS mouse CGEventTap was disabled before its port was ready");
+                    warn!("macOS mouse CGEventTap was disabled by user input; leaving it disabled");
+                    runtime_stats
+                        .capture_tap_user_disabled
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
                 pointer_lock_active.store(false, Ordering::Relaxed);
@@ -81,8 +92,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 return Some(event.clone());
             }
             let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
-            let is_remote = target.to_side().is_some();
-            if !is_remote || !pointer_lock_active.load(Ordering::Relaxed) {
+            if !should_capture_motion(target, pointer_lock_active.load(Ordering::Relaxed)) {
                 return Some(event.clone());
             }
 
@@ -155,4 +165,16 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
 ) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn motion_capture_requires_remote_target_and_pointer_lock() {
+        assert!(!should_capture_motion(ActiveTarget::Local, true));
+        assert!(!should_capture_motion(ActiveTarget::Right, false));
+        assert!(should_capture_motion(ActiveTarget::Right, true));
+    }
 }
