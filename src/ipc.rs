@@ -313,7 +313,7 @@ pub(crate) async fn cleanup_stale_socket() -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU8};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
     use iroh::{EndpointId, SecretKey};
     use tokio::net::UnixStream;
@@ -330,6 +330,7 @@ mod tests {
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(std::sync::Mutex::new(None)),
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            next_remote_generation: Arc::new(AtomicU64::new(1)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),

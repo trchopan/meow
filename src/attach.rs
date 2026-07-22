@@ -26,33 +26,63 @@ const EDGE_PUSH_THRESHOLD_PX: i32 = 16;
 const EDGE_PUSH_RESET_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     let host_id = EndpointId::from_str(&args.host_id).context("invalid host endpoint id")?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::generate())
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
+    let endpoint = tokio::select! {
+        signal = &mut ctrl_c => {
+            signal.context("failed waiting for Ctrl+C")?;
+            info!("Ctrl+C received before client attach started");
+            return Ok(());
+        }
+        result = Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()])
+            .bind() => result.context("failed to create iroh endpoint"),
+    }?;
 
-    let connection = endpoint
-        .connect(host_id, ALPN)
-        .await
-        .context("failed to connect to host")?;
+    let connection = tokio::select! {
+        signal = &mut ctrl_c => {
+            signal.context("failed waiting for Ctrl+C")?;
+            info!("Ctrl+C received while connecting to host");
+            return Ok(());
+        }
+        result = endpoint.connect(host_id, ALPN) => result.context("failed to connect to host"),
+    }?;
 
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (mut send, mut recv) = tokio::select! {
+        signal = &mut ctrl_c => {
+            signal.context("failed waiting for Ctrl+C")?;
+            info!("Ctrl+C received while opening host stream");
+            return Ok(());
+        }
+        result = connection.open_bi() => result,
+    }?;
     let auth = AuthRequest {
         secret: args.secret,
         side: args.side,
         name: format!("remote-{}", Uuid::new_v4().simple()),
     };
-    write_framed(&mut send, &auth).await?;
+    tokio::select! {
+        signal = &mut ctrl_c => {
+            signal.context("failed waiting for Ctrl+C")?;
+            info!("Ctrl+C received while authenticating with host");
+            return Ok(());
+        }
+        result = write_framed(&mut send, &auth) => result,
+    }?;
 
-    let response: AuthResponse = tokio::time::timeout(
-        Duration::from_secs(5),
-        read_framed_with_limit(&mut recv, MAX_AUTH_MSG_SIZE),
-    )
-    .await
-    .context("timed out waiting for auth response")??;
+    let response: AuthResponse = tokio::select! {
+        signal = &mut ctrl_c => {
+            signal.context("failed waiting for Ctrl+C")?;
+            info!("Ctrl+C received while waiting for host authentication");
+            return Ok(());
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_framed_with_limit(&mut recv, MAX_AUTH_MSG_SIZE),
+        ) => result.context("timed out waiting for auth response")??,
+    };
     if !response.ok {
         bail!("host denied attach: {}", response.message);
     }
@@ -82,6 +112,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     );
 
     let mut probe_completed = false;
+    let mut interrupted = false;
     let run_result: Result<()> = loop {
         if let Some(probe) = probe.as_ref()
             && probe.is_finished(probe_start)
@@ -90,11 +121,22 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             break Ok(());
         }
 
-        let (message, frame_size): (HostToClientMessage, usize) =
-            match read_framed_with_size(&mut recv).await {
-                Ok(frame) => frame,
-                Err(err) => break Err(err),
-            };
+        let (message, frame_size): (HostToClientMessage, usize) = match tokio::select! {
+            signal = &mut ctrl_c => {
+                match signal {
+                    Ok(()) => {
+                        info!("Ctrl+C received, shutting down client attach");
+                        interrupted = true;
+                        break Ok(());
+                    }
+                    Err(err) => break Err(err.into()),
+                }
+            }
+            frame = read_framed_with_size(&mut recv) => frame,
+        } {
+            Ok(frame) => frame,
+            Err(err) => break Err(err),
+        };
         debug!("client received {} byte(s) on forwarded stream", frame_size);
         let elapsed = probe_start.elapsed();
         match message {
@@ -272,6 +314,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             probe.print_summary();
             println!("probe complete");
             return Ok(());
+        }
+        if interrupted {
+            bail!("probe interrupted");
         }
     }
 
