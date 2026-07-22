@@ -87,6 +87,12 @@ pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
     imp::current_pointer_position()
 }
 
+pub(crate) fn center_pointer() -> Result<(f64, f64)> {
+    let position = crate::display::main_display_geometry()?.center();
+    warp_pointer(position.0, position.1)?;
+    Ok(position)
+}
+
 pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {
     imp::set_pointer_visible(visible)
 }
