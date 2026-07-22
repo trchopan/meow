@@ -168,7 +168,10 @@ Use `--input-overlay-position top-left|top-right|bottom-left|bottom-right` and
 
 Host edge switching uses a configurable activation zone and dwell time. The defaults
 are a 12-pixel zone and 150 milliseconds. The pointer must enter and remain in the
-zone; it switches once per edge entry and re-arms after leaving the zone.
+zone; it switches once per edge entry and re-arms after leaving the zone. After
+returning from a remote edge, the pointer must move at least twice the zone width
+inward before that same host edge can activate again, capped by the available
+display distance for unusually large zones.
 
 Set mode while the host daemon is running:
 
