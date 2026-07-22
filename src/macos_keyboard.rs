@@ -3,7 +3,7 @@ use crate::protocol::ModifierFlags;
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
-    use std::ffi::c_void;
+    use std::ffi::{CStr, c_void};
 
     type InputSourceRef = *mut c_void;
     type OptionBits = u32;
@@ -20,6 +20,7 @@ mod imp {
             source: InputSourceRef,
             property: *mut c_void,
         ) -> *const c_void;
+        static kTISPropertyInputSourceLanguages: *mut c_void;
         static kTISPropertyUnicodeKeyLayoutData: *mut c_void;
         fn UCKeyTranslate(
             layout: *const u8,
@@ -38,8 +39,24 @@ mod imp {
 
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
         fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+        fn CFStringGetCString(
+            string: *const c_void,
+            buffer: *mut i8,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> bool;
         fn CFRelease(value: *const c_void);
+    }
+
+    const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    fn is_english_language(language: &str) -> bool {
+        language
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("en"))
     }
 
     pub(crate) struct LayoutTranslator {
@@ -134,6 +151,60 @@ mod imp {
         }
         state
     }
+
+    pub(crate) fn current_input_source_is_non_english() -> bool {
+        let current = unsafe { TISCopyCurrentKeyboardInputSource() };
+        if current.is_null() {
+            return false;
+        }
+
+        let languages =
+            unsafe { TISGetInputSourceProperty(current, kTISPropertyInputSourceLanguages) };
+        let mut non_english = false;
+        if !languages.is_null() {
+            let count = unsafe { CFArrayGetCount(languages) };
+            for index in 0..count {
+                let language = unsafe { CFArrayGetValueAtIndex(languages, index) };
+                if language.is_null() {
+                    continue;
+                }
+                let mut buffer = [0i8; 16];
+                let is_utf8 = unsafe {
+                    CFStringGetCString(
+                        language,
+                        buffer.as_mut_ptr(),
+                        buffer.len() as isize,
+                        K_CFSTRING_ENCODING_UTF8,
+                    )
+                };
+                if is_utf8
+                    && let Ok(language) = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str()
+                    && !is_english_language(language)
+                {
+                    non_english = true;
+                    break;
+                }
+            }
+        }
+        unsafe {
+            CFRelease(current as *const c_void);
+        }
+        non_english
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_english_language;
+
+        #[test]
+        fn english_language_tags_are_detected() {
+            assert!(is_english_language("en"));
+            assert!(is_english_language("en-US"));
+            assert!(is_english_language("EN_gb"));
+            assert!(!is_english_language("vi"));
+            assert!(!is_english_language("zh-Hans"));
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -155,6 +226,10 @@ mod imp {
             None
         }
     }
+
+    pub(crate) fn current_input_source_is_non_english() -> bool {
+        false
+    }
 }
 
-pub(crate) use imp::LayoutTranslator;
+pub(crate) use imp::{LayoutTranslator, current_input_source_is_non_english};

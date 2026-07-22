@@ -16,7 +16,7 @@ use crate::{
     model::ScreenEdge,
     protocol::{
         ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
-        MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, read_framed_with_limit,
+        MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, WireKey, read_framed_with_limit,
         read_framed_with_size, send_client_feedback, write_framed,
     },
 };
@@ -188,6 +188,8 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                         replay_failures
                             .report(&connection, ReplayFailureKind::Input, 1)
                             .await;
+                    } else if is_injected_text_event(&wire_event, &event, args.no_inject) {
+                        input_state.text_input_injected = true;
                     }
                     probe.note_held_counts(&input_state);
                 }
@@ -202,6 +204,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::Input, 1)
                             .await;
                     } else {
+                        if is_injected_text_event(&wire_event, &event, args.no_inject) {
+                            input_state.text_input_injected = true;
+                        }
                         debug!("client injection ok for event: {:?}", event);
                     }
                 }
@@ -282,7 +287,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     }
                     probe.note_held_counts(&input_state);
                 } else if !args.no_inject {
-                    let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+                    let failures = cleanup_client_input(&mut enigo, &mut input_state);
                     if failures > 0 {
                         warn!("release-all had {failures} injection failure(s)");
                         replay_failures
@@ -296,7 +301,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     };
 
     if !args.no_inject {
-        let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+        let failures = cleanup_client_input(&mut enigo, &mut input_state);
         if failures > 0 {
             warn!("attach cleanup had {failures} injection failure(s)");
             replay_failures
@@ -460,6 +465,71 @@ fn inject_wire_input_event(
     }
 
     inject_input_event(event, enigo, state)
+}
+
+fn is_injected_text_event(wire_event: &WireEvent, event: &EventType, no_inject: bool) -> bool {
+    if no_inject || should_skip_client_key_event(event) {
+        return false;
+    }
+    let WireEvent::Key { key, .. } = wire_event else {
+        return false;
+    };
+    is_text_wire_key(key)
+}
+
+fn is_text_wire_key(key: &WireKey) -> bool {
+    let logical = key.logical.strip_prefix("Key::").unwrap_or(&key.logical);
+    matches!(
+        logical,
+        "KeyA"
+            | "KeyB"
+            | "KeyC"
+            | "KeyD"
+            | "KeyE"
+            | "KeyF"
+            | "KeyG"
+            | "KeyH"
+            | "KeyI"
+            | "KeyJ"
+            | "KeyK"
+            | "KeyL"
+            | "KeyM"
+            | "KeyN"
+            | "KeyO"
+            | "KeyP"
+            | "KeyQ"
+            | "KeyR"
+            | "KeyS"
+            | "KeyT"
+            | "KeyU"
+            | "KeyV"
+            | "KeyW"
+            | "KeyX"
+            | "KeyY"
+            | "KeyZ"
+            | "Num0"
+            | "Num1"
+            | "Num2"
+            | "Num3"
+            | "Num4"
+            | "Num5"
+            | "Num6"
+            | "Num7"
+            | "Num8"
+            | "Num9"
+            | "Space"
+            | "Equal"
+            | "Minus"
+            | "LeftBracket"
+            | "RightBracket"
+            | "BackSlash"
+            | "SemiColon"
+            | "Quote"
+            | "Comma"
+            | "Dot"
+            | "Slash"
+            | "BackQuote"
+    ) || (logical.chars().count() == 1 && !logical.chars().next().unwrap().is_control())
 }
 
 fn parse_logical_key(value: &str) -> Option<Key> {
@@ -705,6 +775,7 @@ struct ClientInputState {
     pressed_keys: HashSet<Key>,
     pressed_modifiers: HashSet<Key>,
     pressed_buttons: HashSet<Button>,
+    text_input_injected: bool,
 }
 
 fn release_all_pressed_inputs(enigo: &mut Enigo, state: &mut ClientInputState) -> u64 {
@@ -736,6 +807,17 @@ fn release_all_pressed_inputs(enigo: &mut Enigo, state: &mut ClientInputState) -
         state.pressed_modifiers.remove(&key);
     }
 
+    failures
+}
+
+fn cleanup_client_input(enigo: &mut Enigo, state: &mut ClientInputState) -> u64 {
+    let failures = release_all_pressed_inputs(enigo, state);
+    if state.text_input_injected {
+        match macos_inject::cancel_input_composition() {
+            Ok(()) => state.text_input_injected = false,
+            Err(err) => warn!("failed cancelling input composition: {err:#}"),
+        }
+    }
     failures
 }
 
@@ -1053,7 +1135,7 @@ impl ClientReceiveProbe {
         let status = if no_inject {
             "skip"
         } else {
-            failures = release_all_pressed_inputs(enigo, input_state);
+            failures = cleanup_client_input(enigo, input_state);
             self.input_injection_failures = self.input_injection_failures.saturating_add(failures);
             if failures == 0 { "ok" } else { "fail" }
         };
@@ -1412,6 +1494,40 @@ mod tests {
     fn should_skip_client_key_event_keeps_non_function_keys() {
         let event = EventType::KeyPress(Key::KeyA);
         assert!(!should_skip_client_key_event(&event));
+    }
+
+    #[test]
+    fn injected_text_event_requires_injection_and_text_key() {
+        let key = EventType::KeyPress(Key::Unknown(0));
+        let wire_key = WireEvent::Key {
+            action: KeyAction::Down,
+            key: WireKey {
+                physical_code: Some(0),
+                logical: "KeyA".to_string(),
+            },
+            modifiers: Default::default(),
+        };
+        assert!(is_injected_text_event(&wire_key, &key, false));
+        assert!(!is_injected_text_event(&wire_key, &key, true));
+        let motion = WireEvent::RelativeMotion { dx: 1, dy: 1 };
+        assert!(!is_injected_text_event(
+            &motion,
+            &EventType::MouseMove { x: 1.0, y: 1.0 },
+            false
+        ));
+        let modifier = WireEvent::Key {
+            action: KeyAction::Down,
+            key: WireKey {
+                physical_code: Some(59),
+                logical: "ControlLeft".to_string(),
+            },
+            modifiers: Default::default(),
+        };
+        assert!(!is_injected_text_event(
+            &modifier,
+            &EventType::KeyPress(Key::Unknown(59)),
+            false
+        ));
     }
 
     #[test]
