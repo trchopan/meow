@@ -6,6 +6,7 @@ use crate::protocol::ModifierFlags;
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
+    use crate::display::main_display_geometry;
     use core_graphics::{
         event::{
             CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
@@ -35,10 +36,16 @@ mod imp {
                 event.post(CGEventTapLocation::HID);
             }
             EventType::MouseMove { x, y } => {
+                let display = main_display_geometry()?;
+                if display.width <= 0.0 || display.height <= 0.0 {
+                    return Err(anyhow!("macOS display geometry is empty"));
+                }
+                let x = (*x).clamp(display.origin_x, display.right() - 1.0);
+                let y = (*y).clamp(display.origin_y, display.bottom() - 1.0);
                 let event = CGEvent::new_mouse_event(
                     source,
                     CGEventType::MouseMoved,
-                    CGPoint::new(*x, *y),
+                    CGPoint::new(x, y),
                     CGMouseButton::Left,
                 )
                 .map_err(|_| anyhow!("failed to create macOS motion event"))?;
@@ -113,6 +120,10 @@ mod imp {
         button: Option<Button>,
     ) -> Result<()> {
         let location = current_location()?;
+        let display = main_display_geometry()?;
+        let (target_x, target_y, actual_dx, actual_dy) = display
+            .clamp_pointer_move(location.x, location.y, dx, dy)
+            .ok_or_else(|| anyhow!("macOS display geometry is empty"))?;
         let event_type = match button {
             Some(Button::Left) => CGEventType::LeftMouseDragged,
             Some(Button::Right) => CGEventType::RightMouseDragged,
@@ -129,12 +140,12 @@ mod imp {
         let event = CGEvent::new_mouse_event(
             source,
             event_type,
-            CGPoint::new(location.x + f64::from(dx), location.y + f64::from(dy)),
+            CGPoint::new(target_x, target_y),
             mouse_button,
         )
         .map_err(|_| anyhow!("failed to create macOS drag event"))?;
-        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
-        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(actual_dx));
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(actual_dy));
         event.post(CGEventTapLocation::HID);
         Ok(())
     }

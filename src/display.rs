@@ -23,6 +23,28 @@ impl DisplayGeometry {
             self.origin_y + self.height / 2.0,
         )
     }
+
+    pub(crate) fn clamp_pointer_move(
+        &self,
+        x: f64,
+        y: f64,
+        dx: i32,
+        dy: i32,
+    ) -> Option<(f64, f64, i32, i32)> {
+        if self.width <= 0.0 || self.height <= 0.0 {
+            return None;
+        }
+
+        let min_x = self.origin_x;
+        let min_y = self.origin_y;
+        let max_x = self.right() - 1.0;
+        let max_y = self.bottom() - 1.0;
+        let target_x = (x + f64::from(dx)).clamp(min_x, max_x);
+        let target_y = (y + f64::from(dy)).clamp(min_y, max_y);
+        let actual_dx = (target_x - x).round() as i32;
+        let actual_dy = (target_y - y).round() as i32;
+        Some((target_x, target_y, actual_dx, actual_dy))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -88,5 +110,32 @@ mod tests {
         assert_eq!(display.right(), 1612.0);
         assert_eq!(display.bottom(), 1022.0);
         assert_eq!(display.center(), (856.0, 531.0));
+    }
+
+    #[test]
+    fn clamp_pointer_move_keeps_target_inside_logical_bounds() {
+        let display = DisplayGeometry {
+            origin_x: 100.0,
+            origin_y: 40.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        assert_eq!(
+            display.clamp_pointer_move(1611.0, 1021.0, 12, 12),
+            Some((1611.0, 1021.0, 0, 0))
+        );
+        assert_eq!(
+            display.clamp_pointer_move(1608.0, 500.0, 12, 0),
+            Some((1611.0, 500.0, 3, 0))
+        );
+        assert_eq!(
+            display.clamp_pointer_move(100.0, 40.0, -12, -12),
+            Some((100.0, 40.0, 0, 0))
+        );
+        assert_eq!(
+            display.clamp_pointer_move(856.0, 531.0, 12, -8),
+            Some((868.0, 523.0, 12, -8))
+        );
     }
 }
