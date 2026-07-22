@@ -277,6 +277,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     let (x, y) = display.center();
                     enigo.mouse_move_to(x.round() as i32, y.round() as i32);
                 }
+                last_signaled_edge = None;
                 debug!("centered pointer for remote activation");
             }
             HostToClientMessage::ReleaseAll { seq } => {
@@ -598,7 +599,7 @@ fn detect_client_edge_push(
         let requested = -dx;
         let actual_outward = (-actual_dx).max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 {
+        if blocked > 0 || after.0 < display.origin_x {
             return Some((ScreenEdge::Left, blocked));
         }
     }
@@ -606,7 +607,7 @@ fn detect_client_edge_push(
         let requested = dx;
         let actual_outward = actual_dx.max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 {
+        if blocked > 0 || after.0 > max_x {
             return Some((ScreenEdge::Right, blocked));
         }
     }
@@ -614,7 +615,7 @@ fn detect_client_edge_push(
         let requested = -dy;
         let actual_outward = (-actual_dy).max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 {
+        if blocked > 0 || after.1 < display.origin_y {
             return Some((ScreenEdge::Up, blocked));
         }
     }
@@ -622,7 +623,7 @@ fn detect_client_edge_push(
         let requested = dy;
         let actual_outward = actual_dy.max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 {
+        if blocked > 0 || after.1 > max_y {
             return Some((ScreenEdge::Down, blocked));
         }
     }
@@ -676,6 +677,12 @@ fn move_mouse_relative(enigo: &mut Enigo, dx: i32, dy: i32, drag_button: Option<
     #[cfg(target_os = "macos")]
     {
         if macos_inject::inject_relative_move_with_button(dx, dy, drag_button).is_ok() {
+            return;
+        }
+        if let (Ok(display), Ok((x, y))) = (main_display_geometry(), pointer_location())
+            && let Some((target_x, target_y, _, _)) = display.clamp_pointer_move(x, y, dx, dy)
+        {
+            enigo.mouse_move_to(target_x.round() as i32, target_y.round() as i32);
             return;
         }
     }
@@ -1395,6 +1402,23 @@ mod tests {
         };
         let edge = detect_client_edge_push((1608.0, 500.0), (1611.0, 500.0), display, 12, 0);
         assert_eq!(edge, Some((ScreenEdge::Right, 9)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_reports_overshoot() {
+        let edge = detect_client_edge_push(
+            (1500.0, 500.0),
+            (1520.0, 500.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1512.0,
+                height: 982.0,
+            },
+            20,
+            0,
+        );
+        assert_eq!(edge, Some((ScreenEdge::Right, 0)));
     }
 
     #[test]
