@@ -17,6 +17,15 @@ fn should_capture_motion(target: ActiveTarget, pointer_lock_active: bool) -> boo
     target.to_side().is_some() && pointer_lock_active
 }
 
+const MAX_USER_DISABLE_RETRIES: u8 = 3;
+
+fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
+    port_ready
+        .then_some(attempt)
+        .filter(|attempt| *attempt < MAX_USER_DISABLE_RETRIES)
+        .map(|attempt| attempt.saturating_add(1))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn run_macos_mouse_delta_capture(
     tx: mpsc::Sender<CapturedInput>,
@@ -44,6 +53,8 @@ pub(crate) fn run_macos_mouse_delta_capture(
 
     let tap_port = Arc::new(AtomicPtr::<std::ffi::c_void>::new(std::ptr::null_mut()));
     let callback_tap_port = tap_port.clone();
+    let user_disable_retries = Arc::new(AtomicU8::new(0));
+    let callback_user_disable_retries = user_disable_retries.clone();
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -69,7 +80,20 @@ pub(crate) fn run_macos_mouse_delta_capture(
                         warn!("macOS mouse CGEventTap timed out before its port was ready");
                     }
                 } else {
-                    warn!("macOS mouse CGEventTap was disabled by user input; leaving it disabled");
+                    let attempt = callback_user_disable_retries.load(Ordering::Relaxed);
+                    if let Some(attempt) = next_user_disable_attempt(attempt, !port.is_null()) {
+                        callback_user_disable_retries.store(attempt, Ordering::Relaxed);
+                        unsafe { CGEventTapEnable(port, true) };
+                        info!(
+                            "re-enabled macOS mouse CGEventTap after user-input disable (attempt {attempt}/{MAX_USER_DISABLE_RETRIES})"
+                        );
+                    } else if attempt >= MAX_USER_DISABLE_RETRIES {
+                        warn!(
+                            "macOS mouse CGEventTap remained disabled after {MAX_USER_DISABLE_RETRIES} user-input recovery attempts"
+                        );
+                    } else {
+                        warn!("macOS mouse CGEventTap was disabled by user input before its port was ready");
+                    }
                     runtime_stats
                         .capture_tap_user_disabled
                         .fetch_add(1, Ordering::Relaxed);
@@ -182,5 +206,15 @@ mod tests {
         assert!(!should_capture_motion(ActiveTarget::Local, true));
         assert!(!should_capture_motion(ActiveTarget::Right, false));
         assert!(should_capture_motion(ActiveTarget::Right, true));
+    }
+
+    #[test]
+    fn user_disable_recovery_is_bounded_and_requires_port() {
+        assert_eq!(next_user_disable_attempt(0, true), Some(1));
+        assert_eq!(
+            next_user_disable_attempt(MAX_USER_DISABLE_RETRIES, true),
+            None
+        );
+        assert_eq!(next_user_disable_attempt(0, false), None);
     }
 }

@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -85,6 +85,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let next_remote_generation = Arc::new(AtomicU64::new(1));
     let pending_release_sides = Arc::new(AtomicU8::new(0));
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -100,6 +101,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
         remotes: remotes.clone(),
+        next_remote_generation: next_remote_generation.clone(),
         pending_release_sides: pending_release_sides.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
@@ -242,6 +244,7 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
         }
     });
 
+    let generation = state.next_remote_generation.fetch_add(1, Ordering::Relaxed);
     {
         let mut remotes = state.remotes.write().await;
         let previous = remotes.insert(
@@ -250,6 +253,7 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
                 input_tx,
                 next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 remote_id,
+                generation,
                 name: auth.name.clone(),
             },
         );
@@ -273,12 +277,14 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     let feedback_state = state.clone();
     let feedback_connection = connection.clone();
     let feedback_side = auth.side;
+    let feedback_generation = generation;
     let feedback_name = auth.name.clone();
     tokio::spawn(async move {
         if let Err(err) = run_client_feedback_loop(
             feedback_state,
             feedback_connection,
             feedback_side,
+            feedback_generation,
             &feedback_name,
         )
         .await
@@ -294,14 +300,15 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     tokio::spawn(async move {
         connection.closed().await;
         let mut remotes = remotes.write().await;
-        if let Some(existing) = remotes.get(&auth.side)
-            && existing.remote_id == remote_id
-        {
+        let removed_current =
+            is_current_remote(remotes.get(&auth.side), remote_id, feedback_generation);
+        if removed_current {
             remotes.remove(&auth.side);
         }
 
-        if ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)).to_side()
-            == Some(auth.side)
+        if removed_current
+            && ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)).to_side()
+                == Some(auth.side)
         {
             apply_target_change(&state, ActiveTarget::Local, "remote disconnect");
         }
@@ -311,19 +318,39 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     Ok(())
 }
 
+fn is_current_remote(
+    existing: Option<&RemotePeer>,
+    remote_id: iroh::EndpointId,
+    generation: u64,
+) -> bool {
+    existing.is_some_and(|existing| {
+        existing.remote_id == remote_id && existing.generation == generation
+    })
+}
+
 async fn run_client_feedback_loop(
     state: HostState,
     connection: iroh::endpoint::Connection,
     side: Side,
+    generation: u64,
     peer_name: &str,
 ) -> Result<()> {
     loop {
         let mut recv = connection.accept_uni().await?;
         let bytes = recv.read_to_end(MAX_FEEDBACK_MSG_SIZE).await?;
         let message: ClientToHostMessage = bincode::deserialize(&bytes)?;
+        let is_current = {
+            let remotes = state.remotes.read().await;
+            remotes
+                .get(&side)
+                .is_some_and(|remote| remote.generation == generation)
+        };
+        if !is_current {
+            return Ok(());
+        }
         match message {
             ClientToHostMessage::ClientEdgeReached { edge } => {
-                maybe_switch_to_local_on_edge(&state, side, edge, peer_name);
+                maybe_switch_to_local_on_edge(&state, side, generation, edge, peer_name).await;
             }
             ClientToHostMessage::ReplayFailure { kind, count } => {
                 let count = count.min(MAX_REPLAY_FAILURE_REPORT_COUNT);
@@ -340,7 +367,20 @@ async fn run_client_feedback_loop(
     }
 }
 
-fn maybe_switch_to_local_on_edge(state: &HostState, side: Side, edge: ScreenEdge, peer_name: &str) {
+async fn maybe_switch_to_local_on_edge(
+    state: &HostState,
+    side: Side,
+    generation: u64,
+    edge: ScreenEdge,
+    peer_name: &str,
+) {
+    let remotes = state.remotes.read().await;
+    if remotes
+        .get(&side)
+        .is_none_or(|remote| remote.generation != generation)
+    {
+        return;
+    }
     let mode = RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed));
     if mode != RemotePointerMode::EdgeToEdge {
         return;
@@ -968,14 +1008,34 @@ mod tests {
                     input_tx,
                     next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     remote_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
+                    generation: 1,
                     name: "test-peer".to_string(),
                 },
             )]))),
+            next_remote_generation: Arc::new(AtomicU64::new(2)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
         }
+    }
+
+    #[test]
+    fn stale_remote_disconnect_does_not_match_replacement() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let current_id = iroh::SecretKey::generate().public();
+        let stale_id = iroh::SecretKey::generate().public();
+        let current = RemotePeer {
+            input_tx,
+            next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            remote_id: current_id,
+            generation: 2,
+            name: "current-peer".to_string(),
+        };
+
+        assert!(is_current_remote(Some(&current), current_id, 2));
+        assert!(!is_current_remote(Some(&current), current_id, 1));
+        assert!(!is_current_remote(Some(&current), stale_id, 2));
     }
 
     #[test]
