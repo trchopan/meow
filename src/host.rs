@@ -19,6 +19,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    cli::HostArgs,
     input::{normalize_non_motion_event, parse_detach_chord, run_input_grab},
     ipc::{
         IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
@@ -42,7 +43,7 @@ use crate::{
 
 const MAX_REPLAY_FAILURE_REPORT_COUNT: u64 = 1_000_000;
 
-pub(crate) async fn run_host() -> Result<()> {
+pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     if !skip_permissions_for_synthetic_mode() {
         ensure_host_permissions_on_startup()?;
     } else {
@@ -120,6 +121,8 @@ pub(crate) async fn run_host() -> Result<()> {
         let input_pending_release_sides = pending_release_sides.clone();
         let input_detach_chord = detach_chord.clone();
         let input_runtime_stats = runtime_stats.clone();
+        let input_edge_config =
+            crate::input::HostEdgeConfig::new(args.edge_zone_px, args.edge_dwell_ms);
         std::thread::spawn(move || {
             if let Err(err) = run_input_grab(
                 input_tx,
@@ -130,6 +133,7 @@ pub(crate) async fn run_host() -> Result<()> {
                 input_pinned_pointer_pos,
                 input_pending_release_sides,
                 input_detach_chord,
+                input_edge_config,
             ) {
                 error!("input grab stopped: {err:#}");
             }

@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 
-use crate::model::{RemotePointerMode, Side};
+use crate::{
+    input::{DEFAULT_EDGE_DWELL_MS, DEFAULT_EDGE_ZONE_PX},
+    model::{RemotePointerMode, Side},
+};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum OverlayPosition {
@@ -19,7 +22,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
-    Host,
+    Host(HostArgs),
     Attach(AttachArgs),
     #[command(hide = true)]
     DevSmoke(DevSmokeArgs),
@@ -41,6 +44,16 @@ pub(crate) enum Command {
     PointerMode(PointerModeArgs),
     Status,
     Stop,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct HostArgs {
+    /// Width of the screen edge activation zone in pixels.
+    #[arg(long, default_value_t = DEFAULT_EDGE_ZONE_PX, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pub(crate) edge_zone_px: u32,
+    /// Time the pointer must remain in the edge zone before switching.
+    #[arg(long, default_value_t = DEFAULT_EDGE_DWELL_MS, value_parser = clap::value_parser!(u64).range(0..=10_000))]
+    pub(crate) edge_dwell_ms: u64,
 }
 
 #[derive(Debug, clap::Args)]
