@@ -15,13 +15,12 @@ use tracing::{info, warn};
 
 use crate::{
     host_mouse,
-    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats, ScreenEdge, Side},
+    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats, ScreenEdge},
 };
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
 pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
 pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
-const EDGE_REARM_DISTANCE_MULTIPLIER: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DetachChord {
@@ -83,7 +82,6 @@ pub(crate) fn run_input_grab(
     let timer_send_ctx = send_ctx.clone();
     let timer_stop = stop_edge_timer.clone();
     let edge_timer = std::thread::spawn(move || {
-        let mut previous_target = ActiveTarget::Local;
         let mut last_generation = 0;
         while !timer_stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(10));
@@ -97,13 +95,6 @@ pub(crate) fn run_input_grab(
 
             if target != ActiveTarget::Local {
                 edge_zone.reset();
-                previous_target = target;
-                last_generation = generation;
-                continue;
-            }
-            if previous_target != ActiveTarget::Local {
-                edge_zone.disarm(previous_target.to_side().map(edge_for_side));
-                previous_target = ActiveTarget::Local;
                 last_generation = generation;
                 continue;
             }
@@ -119,7 +110,6 @@ pub(crate) fn run_input_grab(
                 continue;
             };
             let display = rdev::display_size().unwrap_or((0, 0));
-            edge_zone.rearm_if_far(x, y, display.0, display.1, edge_config.zone_px);
             let Some(edge) =
                 detect_host_edge_zone_in_display(x, y, display.0, display.1, edge_config.zone_px)
             else {
@@ -137,7 +127,6 @@ pub(crate) fn run_input_grab(
         }
     });
 
-    let callback_previous_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         runtime_stats
             .captured_events
@@ -156,13 +145,6 @@ pub(crate) fn run_input_grab(
         }
 
         let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
-        let previous_target =
-            ActiveTarget::from_u8(callback_previous_target.load(Ordering::Relaxed));
-        if target == ActiveTarget::Local && previous_target != ActiveTarget::Local {
-            let mut edge_zone = local_edge_zone.lock().expect("local edge mutex poisoned");
-            edge_zone.disarm(previous_target.to_side().map(edge_for_side));
-        }
-        callback_previous_target.store(target.to_u8(), Ordering::Relaxed);
 
         let (is_ctrl_down, is_alt_down, is_meta_down, is_shift_down) = {
             let keys = pressed_keys.lock().expect("pressed key mutex poisoned");
@@ -218,7 +200,6 @@ pub(crate) fn run_input_grab(
                     let now = Instant::now();
                     let mut edge_zone = local_edge_zone.lock().expect("local edge mutex poisoned");
                     let display = rdev::display_size().unwrap_or((0, 0));
-                    edge_zone.rearm_if_far(x, y, display.0, display.1, edge_config.zone_px);
                     if let Some(edge) = detect_host_edge_zone_in_display(
                         x,
                         y,
@@ -582,7 +563,6 @@ struct EdgeZoneTracker {
     edge: Option<ScreenEdge>,
     entered_at: Option<Instant>,
     triggered: bool,
-    disarmed_edge: Option<ScreenEdge>,
 }
 
 impl EdgeZoneTracker {
@@ -591,14 +571,10 @@ impl EdgeZoneTracker {
             edge: None,
             entered_at: None,
             triggered: false,
-            disarmed_edge: None,
         }
     }
 
     fn enter_or_stay(&mut self, edge: ScreenEdge, now: Instant, dwell: Duration) -> bool {
-        if self.disarmed_edge == Some(edge) {
-            return false;
-        }
         if self.edge != Some(edge) {
             self.edge = Some(edge);
             self.entered_at = Some(now);
@@ -611,22 +587,6 @@ impl EdgeZoneTracker {
                 .is_some_and(|entered_at| now.duration_since(entered_at) >= dwell)
     }
 
-    fn disarm(&mut self, edge: Option<ScreenEdge>) {
-        self.edge = None;
-        self.entered_at = None;
-        self.triggered = false;
-        self.disarmed_edge = edge;
-    }
-
-    fn rearm_if_far(&mut self, x: f64, y: f64, width: u64, height: u64, zone_px: u32) {
-        let Some(edge) = self.disarmed_edge else {
-            return;
-        };
-        if is_far_from_edge(x, y, width, height, edge, zone_px) {
-            self.disarmed_edge = None;
-        }
-    }
-
     fn mark_triggered(&mut self) {
         self.triggered = true;
     }
@@ -635,38 +595,6 @@ impl EdgeZoneTracker {
         self.edge = None;
         self.entered_at = None;
         self.triggered = false;
-        self.disarmed_edge = None;
-    }
-}
-
-fn edge_for_side(side: Side) -> ScreenEdge {
-    match side {
-        Side::Left => ScreenEdge::Left,
-        Side::Right => ScreenEdge::Right,
-        Side::Up => ScreenEdge::Up,
-        Side::Down => ScreenEdge::Down,
-    }
-}
-
-fn is_far_from_edge(
-    x: f64,
-    y: f64,
-    width: u64,
-    height: u64,
-    edge: ScreenEdge,
-    zone_px: u32,
-) -> bool {
-    let rearm_distance = zone_px.saturating_mul(EDGE_REARM_DISTANCE_MULTIPLIER) as f64;
-    let max_x = width.saturating_sub(1) as f64;
-    let max_y = height.saturating_sub(1) as f64;
-    let rearm_x = rearm_distance.min((max_x - 1.0).max(0.0));
-    let rearm_y = rearm_distance.min((max_y - 1.0).max(0.0));
-
-    match edge {
-        ScreenEdge::Left => x > rearm_x,
-        ScreenEdge::Right => x < (max_x - rearm_x).max(0.0),
-        ScreenEdge::Up => y > rearm_y,
-        ScreenEdge::Down => y < (max_y - rearm_y).max(0.0),
     }
 }
 
@@ -842,158 +770,6 @@ mod tests {
             ScreenEdge::Right,
             start + Duration::from_millis(150),
             dwell
-        ));
-    }
-
-    #[test]
-    fn host_edge_zone_requires_inward_rearm_after_remote_return() {
-        let mut tracker = EdgeZoneTracker::new();
-        let start = Instant::now();
-        let dwell = Duration::from_millis(150);
-
-        tracker.disarm(Some(ScreenEdge::Right));
-        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
-
-        tracker.rearm_if_far(1894.0, 500.0, 1920, 1080, 12);
-        assert!(!tracker.enter_or_stay(
-            ScreenEdge::Right,
-            start + dwell + Duration::from_millis(1),
-            dwell
-        ));
-
-        tracker.rearm_if_far(25.0, 500.0, 1920, 1080, 12);
-        assert!(!tracker.enter_or_stay(
-            ScreenEdge::Right,
-            start + dwell + Duration::from_millis(2),
-            dwell
-        ));
-        assert!(tracker.enter_or_stay(
-            ScreenEdge::Right,
-            start + dwell + Duration::from_millis(151),
-            dwell
-        ));
-    }
-
-    #[test]
-    fn host_edge_zone_rearms_when_pointer_is_far_from_return_edge() {
-        let mut tracker = EdgeZoneTracker::new();
-        let start = Instant::now();
-        let dwell = Duration::from_millis(150);
-
-        tracker.disarm(Some(ScreenEdge::Right));
-        tracker.rearm_if_far(25.0, 500.0, 1920, 1080, 12);
-
-        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
-        assert!(tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
-    }
-
-    #[test]
-    fn edge_rearm_distance_has_explicit_boundaries_for_each_edge() {
-        let display = (1920, 1080);
-        let zone = 12;
-
-        assert!(!is_far_from_edge(
-            24.0,
-            500.0,
-            display.0,
-            display.1,
-            ScreenEdge::Left,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            25.0,
-            500.0,
-            display.0,
-            display.1,
-            ScreenEdge::Left,
-            zone
-        ));
-        assert!(!is_far_from_edge(
-            1895.0,
-            500.0,
-            display.0,
-            display.1,
-            ScreenEdge::Right,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            1894.0,
-            500.0,
-            display.0,
-            display.1,
-            ScreenEdge::Right,
-            zone
-        ));
-        assert!(!is_far_from_edge(
-            500.0,
-            24.0,
-            display.0,
-            display.1,
-            ScreenEdge::Up,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            500.0,
-            25.0,
-            display.0,
-            display.1,
-            ScreenEdge::Up,
-            zone
-        ));
-        assert!(!is_far_from_edge(
-            500.0,
-            1055.0,
-            display.0,
-            display.1,
-            ScreenEdge::Down,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            500.0,
-            1054.0,
-            display.0,
-            display.1,
-            ScreenEdge::Down,
-            zone
-        ));
-    }
-
-    #[test]
-    fn edge_rearm_distance_remains_reachable_for_large_zones() {
-        let display = (1440, 900);
-        let zone = 1000;
-
-        assert!(is_far_from_edge(
-            1439.0,
-            450.0,
-            display.0,
-            display.1,
-            ScreenEdge::Left,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            0.0,
-            450.0,
-            display.0,
-            display.1,
-            ScreenEdge::Right,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            720.0,
-            899.0,
-            display.0,
-            display.1,
-            ScreenEdge::Up,
-            zone
-        ));
-        assert!(is_far_from_edge(
-            720.0,
-            0.0,
-            display.0,
-            display.1,
-            ScreenEdge::Down,
-            zone
         ));
     }
 

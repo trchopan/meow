@@ -87,6 +87,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let next_remote_generation = Arc::new(AtomicU64::new(1));
     let pending_release_sides = Arc::new(AtomicU8::new(0));
+    let pending_center_target = Arc::new(AtomicU8::new(0));
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -103,6 +104,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         remotes: remotes.clone(),
         next_remote_generation: next_remote_generation.clone(),
         pending_release_sides: pending_release_sides.clone(),
+        pending_center_target: pending_center_target.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -395,7 +397,15 @@ async fn maybe_switch_to_local_on_edge(
         return;
     }
 
+    drop(remotes);
     apply_target_change(state, ActiveTarget::Local, "client edge reached");
+    let _ = send_to_side(
+        state,
+        side,
+        HostToClientMessage::CenterPointer { seq: 0 },
+        false,
+    )
+    .await;
     info!(
         "switched to local after host-facing edge {:?} from {:?} ({})",
         edge, side, peer_name
@@ -535,6 +545,23 @@ async fn reconcile_target_transition(
             send_release_all_to_side(state, side).await;
         }
     }
+    let pending_center = ActiveTarget::from_u8(state.pending_center_target.load(Ordering::Acquire));
+    if pending_center == current_target
+        && pending_center.to_side().is_some()
+        && state
+            .pending_center_target
+            .compare_exchange(
+                pending_center.to_u8(),
+                ActiveTarget::Local.to_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        let side = pending_center.to_side().expect("remote target has a side");
+        let message = HostToClientMessage::CenterPointer { seq: 0 };
+        let _ = send_to_side(state, side, message, false).await;
+    }
     current_target
 }
 
@@ -649,6 +676,7 @@ fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessag
             HostToClientMessage::RelativeMotion { seq, dx, dy }
         }
         HostToClientMessage::ReleaseAll { .. } => HostToClientMessage::ReleaseAll { seq },
+        HostToClientMessage::CenterPointer { .. } => HostToClientMessage::CenterPointer { seq },
     }
 }
 
@@ -1014,6 +1042,7 @@ mod tests {
             )]))),
             next_remote_generation: Arc::new(AtomicU64::new(2)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            pending_center_target: Arc::new(AtomicU8::new(0)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -1137,6 +1166,50 @@ mod tests {
         assert!(matches!(
             input_rx.recv().await,
             Some(HostToClientMessage::ReleaseAll { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_activation_centers_before_forwarding_motion() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let state = test_forward_state(Side::Right, input_tx);
+        state
+            .active_target
+            .store(ActiveTarget::Right.to_u8(), Ordering::Release);
+        state
+            .pending_center_target
+            .store(ActiveTarget::Right.to_u8(), Ordering::Release);
+
+        reconcile_target_transition(&state, &mut HashMap::new()).await;
+
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HostToClientMessage::CenterPointer { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_center_waits_for_its_target_to_become_active() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let state = test_forward_state(Side::Right, input_tx);
+        state
+            .pending_center_target
+            .store(ActiveTarget::Right.to_u8(), Ordering::Release);
+
+        reconcile_target_transition(&state, &mut HashMap::new()).await;
+        assert!(input_rx.try_recv().is_err());
+        assert_eq!(
+            state.pending_center_target.load(Ordering::Acquire),
+            ActiveTarget::Right.to_u8()
+        );
+
+        state
+            .active_target
+            .store(ActiveTarget::Right.to_u8(), Ordering::Release);
+        reconcile_target_transition(&state, &mut HashMap::new()).await;
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HostToClientMessage::CenterPointer { .. })
         ));
     }
 

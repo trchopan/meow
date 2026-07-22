@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ScreenEdge, Side};
 
-pub(crate) const ALPN: &[u8] = b"meow/remote-input/2";
+pub(crate) const ALPN: &[u8] = b"meow/remote-input/3";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
@@ -27,6 +27,7 @@ pub(crate) enum HostToClientMessage {
     Event { seq: u64, event: WireEvent },
     RelativeMotion { seq: u64, dx: i32, dy: i32 },
     ReleaseAll { seq: u64 },
+    CenterPointer { seq: u64 },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +199,17 @@ mod tests {
         let round_trip: HostToClientMessage = bincode::deserialize(&bytes).expect("deserialize");
         match round_trip {
             HostToClientMessage::ReleaseAll { seq } => assert_eq!(seq, 99),
+            _ => panic!("unexpected wire message variant"),
+        }
+    }
+
+    #[test]
+    fn host_center_pointer_round_trip_serde() {
+        let msg = HostToClientMessage::CenterPointer { seq: 12 };
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let round_trip: HostToClientMessage = bincode::deserialize(&bytes).expect("deserialize");
+        match round_trip {
+            HostToClientMessage::CenterPointer { seq } => assert_eq!(seq, 12),
             _ => panic!("unexpected wire message variant"),
         }
     }

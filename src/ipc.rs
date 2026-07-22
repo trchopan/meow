@@ -206,27 +206,35 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
             .pending_release_sides
             .fetch_or(previous_side.release_bit(), Ordering::AcqRel);
     }
-    state.active_target.store(target.to_u8(), Ordering::Relaxed);
-
+    if let Some(target_side) = target.to_side()
+        && target != previous_target
+    {
+        state
+            .pending_center_target
+            .store(ActiveTarget::from(target_side).to_u8(), Ordering::Release);
+    }
     let should_lock = target.to_side().is_some();
-    let was_locked = state
-        .pointer_lock_active
-        .swap(should_lock, Ordering::Relaxed);
+    let was_locked = state.pointer_lock_active.load(Ordering::Relaxed);
 
     if should_lock && !was_locked {
-        match host_mouse::current_pointer_position() {
-            Ok((x, y)) => {
+        match host_mouse::center_pointer() {
+            Ok(position) => {
                 let mut pinned = state
                     .pinned_pointer_pos
                     .lock()
                     .expect("pinned pointer mutex poisoned");
-                *pinned = Some((x, y));
+                *pinned = Some(position);
             }
             Err(err) => {
-                warn!("failed reading current pointer position: {err:#}");
+                warn!("failed centering pointer before remote switch: {err:#}");
             }
         }
     }
+
+    state.active_target.store(target.to_u8(), Ordering::Relaxed);
+    state
+        .pointer_lock_active
+        .store(should_lock, Ordering::Relaxed);
 
     if was_locked != should_lock
         && let Err(err) = host_mouse::set_pointer_dissociation(should_lock)
@@ -332,6 +340,7 @@ mod tests {
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
             next_remote_generation: Arc::new(AtomicU64::new(1)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            pending_center_target: Arc::new(AtomicU8::new(0)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -368,6 +377,10 @@ mod tests {
         let state = test_host_state();
         apply_target_change(&state, ActiveTarget::Right, "test attach");
         assert_eq!(state.pending_release_sides.load(Ordering::Acquire), 0);
+        assert_eq!(
+            state.pending_center_target.load(Ordering::Acquire),
+            ActiveTarget::Right.to_u8()
+        );
 
         apply_target_change(&state, ActiveTarget::Local, "test detach");
         assert_eq!(
@@ -382,6 +395,10 @@ mod tests {
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit() | Side::Left.release_bit()
+        );
+        assert_eq!(
+            state.pending_center_target.load(Ordering::Acquire),
+            ActiveTarget::Right.to_u8()
         );
     }
 

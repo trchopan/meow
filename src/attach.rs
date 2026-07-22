@@ -22,8 +22,6 @@ use crate::{
 };
 
 const EDGE_TOLERANCE_PX: i32 = 2;
-const EDGE_PUSH_THRESHOLD_PX: i32 = 16;
-const EDGE_PUSH_RESET_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
@@ -100,7 +98,6 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     });
     let probe_start = Instant::now();
     let mut last_signaled_edge: Option<ScreenEdge> = None;
-    let mut edge_push = EdgePushTracker::new();
     let mut input_state = ClientInputState::default();
     let mut sequence_tracker = SequenceTracker::default();
     let mut test_drop_sequence = args.test_drop_sequence;
@@ -165,8 +162,6 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
                             .await;
                     }
-                    edge_push.reset();
-                    last_signaled_edge = None;
                     input_overlay.clear();
                 }
                 let meta = ProbeMessageMeta {
@@ -226,8 +221,6 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
                             .await;
                     }
-                    edge_push.reset();
-                    last_signaled_edge = None;
                     input_overlay.clear();
                 }
                 let meta = ProbeMessageMeta {
@@ -247,26 +240,34 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     move_mouse_relative(&mut enigo, dx, dy, drag_button);
                     let after = enigo.mouse_location();
                     let display = enigo.main_display_size();
-                    edge_push.reset_if_stale(Instant::now());
                     let push = detect_client_edge_push(before, after, display, dx, dy);
-                    let Some((edge, push_amount)) = push else {
-                        edge_push.reset();
+                    let Some((edge, _push_amount)) = push else {
                         last_signaled_edge = None;
                         continue;
                     };
 
-                    if edge_push.register_outward_push(edge, push_amount, Instant::now())
-                        && Some(edge) != last_signaled_edge
-                    {
-                        let message = ClientToHostMessage::ClientEdgeReached { edge };
-                        if let Err(err) = send_client_feedback(&connection, &message).await {
-                            warn!("failed sending edge feedback to host: {err:#}");
-                        } else {
-                            debug!("sent edge feedback to host: {:?}", edge);
-                            last_signaled_edge = Some(edge);
-                        }
+                    if Some(edge) == last_signaled_edge {
+                        continue;
+                    }
+                    let message = ClientToHostMessage::ClientEdgeReached { edge };
+                    if let Err(err) = send_client_feedback(&connection, &message).await {
+                        warn!("failed sending edge feedback to host: {err:#}");
+                    } else {
+                        debug!("sent edge feedback: {:?}", edge);
+                        last_signaled_edge = Some(edge);
                     }
                 }
+            }
+            HostToClientMessage::CenterPointer { seq } => {
+                let seq_status = sequence_tracker.observe(seq);
+                if let Some(probe) = probe.as_mut() {
+                    probe.note_sequence(seq_status);
+                }
+                if !args.no_inject {
+                    let display = enigo.main_display_size();
+                    enigo.mouse_move_to(display.0 / 2, display.1 / 2);
+                }
+                debug!("centered pointer for remote activation");
             }
             HostToClientMessage::ReleaseAll { seq } => {
                 let seq_status = sequence_tracker.observe(seq);
@@ -853,55 +854,6 @@ fn is_modifier_key(key: Key) -> bool {
             | Key::MetaLeft
             | Key::MetaRight
     )
-}
-
-struct EdgePushTracker {
-    edge: Option<ScreenEdge>,
-    accumulated_px: i32,
-    last_update: Option<Instant>,
-}
-
-impl EdgePushTracker {
-    fn new() -> Self {
-        Self {
-            edge: None,
-            accumulated_px: 0,
-            last_update: None,
-        }
-    }
-
-    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: i32, now: Instant) -> bool {
-        if push_px <= 0 {
-            return false;
-        }
-
-        if self.edge != Some(edge) {
-            self.edge = Some(edge);
-            self.accumulated_px = 0;
-        }
-
-        self.accumulated_px = self.accumulated_px.saturating_add(push_px);
-        self.last_update = Some(now);
-        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
-            self.accumulated_px = 0;
-            return true;
-        }
-        false
-    }
-
-    fn reset_if_stale(&mut self, now: Instant) {
-        if let Some(last_update) = self.last_update
-            && now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT
-        {
-            self.reset();
-        }
-    }
-
-    fn reset(&mut self) {
-        self.edge = None;
-        self.accumulated_px = 0;
-        self.last_update = None;
-    }
 }
 
 struct ClientReceiveProbe {
