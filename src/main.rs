@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Host => run_host().await,
+        Command::Host(args) => run_host(args).await,
         Command::Attach(args) => run_attach(args).await,
         Command::DevSmoke(args) => run_dev_smoke(args).await,
         Command::ProbePointerLock(args) => run_probe_pointer_lock(args).await,

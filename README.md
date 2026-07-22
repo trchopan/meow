@@ -130,6 +130,8 @@ Daemon and control commands:
 
 ```sh
 meow host
+# Optional: customize host edge activation.
+meow host --edge-zone-px 12 --edge-dwell-ms 150
 meow status
 meow stop
 meow local
@@ -163,6 +165,10 @@ Use `--input-overlay-position top-left|top-right|bottom-left|bottom-right` and
 
 - `edge-to-edge` (default): moving to a host edge switches control to the connected client on that side; reaching the client edge facing back toward the host returns control to local host input.
 - `confine`: keeps control on the remote even at client edges; use the host detach chord to return to local.
+
+Host edge switching uses a configurable activation zone and dwell time. The defaults
+are a 12-pixel zone and 150 milliseconds. The pointer must enter and remain in the
+zone; it switches once per edge entry and re-arms after leaving the zone.
 
 Set mode while the host daemon is running:
 

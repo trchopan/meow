@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -19,9 +19,8 @@ use crate::{
 };
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
-const EDGE_TOLERANCE_PX: f64 = 2.0;
-const EDGE_PUSH_THRESHOLD_PX: f64 = 16.0;
-const EDGE_PUSH_RESET_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
+pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DetachChord {
@@ -31,6 +30,21 @@ pub(crate) struct DetachChord {
     pub(crate) meta: bool,
     pub(crate) shift: bool,
     pub(crate) config_value: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostEdgeConfig {
+    pub(crate) zone_px: u32,
+    pub(crate) dwell: Duration,
+}
+
+impl HostEdgeConfig {
+    pub(crate) fn new(zone_px: u32, dwell_ms: u64) -> Self {
+        Self {
+            zone_px,
+            dwell: Duration::from_millis(dwell_ms),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -43,6 +57,7 @@ pub(crate) fn run_input_grab(
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pending_release_sides: Arc<AtomicU8>,
     detach_chord: DetachChord,
+    edge_config: HostEdgeConfig,
 ) -> Result<()> {
     let send_ctx = CaptureSendContext {
         runtime_stats: runtime_stats.clone(),
@@ -55,7 +70,67 @@ pub(crate) fn run_input_grab(
 
     let pressed_keys: Arc<Mutex<HashSet<Key>>> = Arc::new(Mutex::new(HashSet::new()));
     let last_mouse_pos: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
-    let local_edge_push: Arc<Mutex<EdgePushTracker>> = Arc::new(Mutex::new(EdgePushTracker::new()));
+    let mouse_position_generation = Arc::new(AtomicU64::new(0));
+    let local_edge_zone: Arc<Mutex<EdgeZoneTracker>> = Arc::new(Mutex::new(EdgeZoneTracker::new()));
+    let stop_edge_timer = Arc::new(AtomicBool::new(false));
+
+    let timer_last_mouse_pos = last_mouse_pos.clone();
+    let timer_position_generation = mouse_position_generation.clone();
+    let timer_edge_zone = local_edge_zone.clone();
+    let timer_active_target = active_target.clone();
+    let timer_tx = tx.clone();
+    let timer_send_ctx = send_ctx.clone();
+    let timer_stop = stop_edge_timer.clone();
+    let edge_timer = std::thread::spawn(move || {
+        let mut previous_target = ActiveTarget::Local;
+        let mut last_generation = 0;
+        while !timer_stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+
+            let target = ActiveTarget::from_u8(timer_active_target.load(Ordering::Relaxed));
+            let generation = timer_position_generation.load(Ordering::Relaxed);
+            let position = *timer_last_mouse_pos
+                .lock()
+                .expect("mouse position mutex poisoned");
+            let mut edge_zone = timer_edge_zone.lock().expect("local edge mutex poisoned");
+
+            if target != ActiveTarget::Local {
+                edge_zone.reset();
+                previous_target = target;
+                last_generation = generation;
+                continue;
+            }
+            if previous_target != ActiveTarget::Local {
+                edge_zone.reset();
+                previous_target = ActiveTarget::Local;
+                last_generation = generation;
+                continue;
+            }
+            if generation == 0 {
+                continue;
+            }
+            if generation == last_generation && edge_zone.edge.is_none() {
+                continue;
+            }
+            last_generation = generation;
+
+            let Some((x, y)) = position else {
+                continue;
+            };
+            let Some(edge) = detect_host_edge_zone(x, y, edge_config.zone_px) else {
+                edge_zone.reset();
+                continue;
+            };
+            try_send_host_edge(
+                &timer_tx,
+                &timer_send_ctx,
+                &mut edge_zone,
+                edge,
+                Instant::now(),
+                edge_config.dwell,
+            );
+        }
+    });
 
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         runtime_stats
@@ -121,34 +196,25 @@ pub(crate) fn run_input_grab(
         match target {
             ActiveTarget::Local => {
                 if let EventType::MouseMove { x, y } = event.event_type {
-                    let (dx, dy) = {
+                    {
                         let mut last_pos = last_mouse_pos.lock().expect("mouse pos mutex poisoned");
-                        let (dx, dy) = if let Some((last_x, last_y)) = *last_pos {
-                            (x - last_x, y - last_y)
-                        } else {
-                            (0.0, 0.0)
-                        };
                         *last_pos = Some((x, y));
-                        (dx, dy)
-                    };
+                    }
+                    mouse_position_generation.fetch_add(1, Ordering::Relaxed);
 
                     let now = Instant::now();
-                    let mut edge_push = local_edge_push.lock().expect("local edge mutex poisoned");
-                    edge_push.reset_if_stale(now);
-                    let push = detect_host_edge_push(x, y, dx, dy);
-                    if let Some((edge, push_amount)) = push {
-                        if edge_push.register_outward_push(edge, push_amount, now) {
-                            try_send_captured_input(
-                                &tx,
-                                &send_ctx,
-                                CapturedInput {
-                                    target: ActiveTarget::Local,
-                                    event: CapturedEvent::HostEdgeReached { edge },
-                                },
-                            );
-                        }
+                    let mut edge_zone = local_edge_zone.lock().expect("local edge mutex poisoned");
+                    if let Some(edge) = detect_host_edge_zone(x, y, edge_config.zone_px) {
+                        try_send_host_edge(
+                            &tx,
+                            &send_ctx,
+                            &mut edge_zone,
+                            edge,
+                            now,
+                            edge_config.dwell,
+                        );
                     } else {
-                        edge_push.reset();
+                        edge_zone.reset();
                     }
                 }
 
@@ -221,7 +287,10 @@ pub(crate) fn run_input_grab(
         }
     };
 
-    grab(callback).map_err(|e| anyhow!("input grab failed: {e:?}"))
+    let result = grab(callback).map_err(|e| anyhow!("input grab failed: {e:?}"));
+    stop_edge_timer.store(true, Ordering::Relaxed);
+    let _ = edge_timer.join();
+    result
 }
 
 pub(crate) fn normalize_non_motion_event(event: EventType) -> CapturedEvent {
@@ -243,8 +312,8 @@ fn try_send_captured_input(
     tx: &mpsc::Sender<CapturedInput>,
     send_ctx: &CaptureSendContext,
     captured: CapturedInput,
-) {
-    try_send_captured_input_with_policy(tx, send_ctx, captured, false);
+) -> bool {
+    try_send_captured_input_with_policy(tx, send_ctx, captured, false)
 }
 
 fn try_send_captured_input_with_policy(
@@ -252,14 +321,15 @@ fn try_send_captured_input_with_policy(
     send_ctx: &CaptureSendContext,
     captured: CapturedInput,
     drop_if_full: bool,
-) {
+) -> bool {
     match tx.try_send(captured) {
-        Ok(()) => {}
+        Ok(()) => true,
         Err(TrySendError::Full(_)) if drop_if_full => {
             send_ctx
                 .runtime_stats
                 .captured_queue_full_mouse_dropped
                 .fetch_add(1, Ordering::Relaxed);
+            false
         }
         Err(TrySendError::Full(_)) => {
             send_ctx
@@ -278,10 +348,37 @@ fn try_send_captured_input_with_policy(
                 .recovery_events
                 .fetch_add(1, Ordering::Relaxed);
             warn!("captured input queue full; dropping non-mouse event");
+            false
         }
         Err(TrySendError::Closed(_)) => {
             warn!("captured input queue closed; dropping event");
+            false
         }
+    }
+}
+
+fn try_send_host_edge(
+    tx: &mpsc::Sender<CapturedInput>,
+    send_ctx: &CaptureSendContext,
+    edge_zone: &mut EdgeZoneTracker,
+    edge: ScreenEdge,
+    now: Instant,
+    dwell: Duration,
+) {
+    if !edge_zone.enter_or_stay(edge, now, dwell) {
+        return;
+    }
+
+    let sent = try_send_captured_input(
+        tx,
+        send_ctx,
+        CapturedInput {
+            target: ActiveTarget::Local,
+            event: CapturedEvent::HostEdgeReached { edge },
+        },
+    );
+    if sent {
+        edge_zone.mark_triggered();
     }
 }
 
@@ -429,73 +526,78 @@ pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
     (delta.round() as i32).clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA)
 }
 
-fn detect_host_edge_push(x: f64, y: f64, dx: f64, dy: f64) -> Option<(ScreenEdge, f64)> {
+fn detect_host_edge_zone(x: f64, y: f64, zone_px: u32) -> Option<ScreenEdge> {
     let (width, height) = rdev::display_size().unwrap_or((0, 0));
+    detect_host_edge_zone_in_display(x, y, width, height, zone_px)
+}
+
+fn detect_host_edge_zone_in_display(
+    x: f64,
+    y: f64,
+    width: u64,
+    height: u64,
+    zone_px: u32,
+) -> Option<ScreenEdge> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let zone = zone_px as f64;
     let max_x = width.saturating_sub(1) as f64;
     let max_y = height.saturating_sub(1) as f64;
 
-    if dx < 0.0 && x <= EDGE_TOLERANCE_PX {
-        return Some((ScreenEdge::Left, -dx));
+    if x <= zone {
+        return Some(ScreenEdge::Left);
     }
-    if dx > 0.0 && x >= (max_x - EDGE_TOLERANCE_PX).max(0.0) {
-        return Some((ScreenEdge::Right, dx));
+    if x >= (max_x - zone).max(0.0) {
+        return Some(ScreenEdge::Right);
     }
-    if dy < 0.0 && y <= EDGE_TOLERANCE_PX {
-        return Some((ScreenEdge::Up, -dy));
+    if y <= zone {
+        return Some(ScreenEdge::Up);
     }
-    if dy > 0.0 && y >= (max_y - EDGE_TOLERANCE_PX).max(0.0) {
-        return Some((ScreenEdge::Down, dy));
+    if y >= (max_y - zone).max(0.0) {
+        return Some(ScreenEdge::Down);
     }
 
     None
 }
 
-struct EdgePushTracker {
+struct EdgeZoneTracker {
     edge: Option<ScreenEdge>,
-    accumulated_px: f64,
-    last_update: Option<Instant>,
+    entered_at: Option<Instant>,
+    triggered: bool,
 }
 
-impl EdgePushTracker {
+impl EdgeZoneTracker {
     fn new() -> Self {
         Self {
             edge: None,
-            accumulated_px: 0.0,
-            last_update: None,
+            entered_at: None,
+            triggered: false,
         }
     }
 
-    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: f64, now: Instant) -> bool {
-        if push_px <= 0.0 {
-            return false;
-        }
-
+    fn enter_or_stay(&mut self, edge: ScreenEdge, now: Instant, dwell: Duration) -> bool {
         if self.edge != Some(edge) {
             self.edge = Some(edge);
-            self.accumulated_px = 0.0;
+            self.entered_at = Some(now);
+            self.triggered = false;
         }
 
-        self.accumulated_px += push_px;
-        self.last_update = Some(now);
-        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
-            self.accumulated_px = 0.0;
-            return true;
-        }
-        false
+        !self.triggered
+            && self
+                .entered_at
+                .is_some_and(|entered_at| now.duration_since(entered_at) >= dwell)
     }
 
-    fn reset_if_stale(&mut self, now: Instant) {
-        if let Some(last_update) = self.last_update
-            && now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT
-        {
-            self.reset();
-        }
+    fn mark_triggered(&mut self) {
+        self.triggered = true;
     }
 
     fn reset(&mut self) {
         self.edge = None;
-        self.accumulated_px = 0.0;
-        self.last_update = None;
+        self.entered_at = None;
+        self.triggered = false;
     }
 }
 
@@ -584,6 +686,135 @@ mod tests {
                 delta_y: 7,
             }
         ));
+    }
+
+    #[test]
+    fn host_edge_zone_detects_each_display_edge() {
+        let display = (1920, 1080);
+        let zone = 12;
+
+        assert_eq!(
+            detect_host_edge_zone_in_display(12.0, 500.0, display.0, display.1, zone),
+            Some(ScreenEdge::Left)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(1907.0, 500.0, display.0, display.1, zone),
+            Some(ScreenEdge::Right)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(500.0, 12.0, display.0, display.1, zone),
+            Some(ScreenEdge::Up)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(500.0, 1067.0, display.0, display.1, zone),
+            Some(ScreenEdge::Down)
+        );
+        assert_eq!(detect_host_edge_zone_in_display(0.0, 0.0, 0, 0, zone), None);
+    }
+
+    #[test]
+    fn host_edge_zone_ignores_pointer_outside_zone() {
+        assert_eq!(
+            detect_host_edge_zone_in_display(100.0, 500.0, 1920, 1080, 12),
+            None
+        );
+    }
+
+    #[test]
+    fn host_edge_zone_switches_once_until_rearmed() {
+        let mut tracker = EdgeZoneTracker::new();
+        let start = Instant::now();
+        let dwell = Duration::from_millis(150);
+
+        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
+        assert!(tracker.enter_or_stay(
+            ScreenEdge::Right,
+            start + Duration::from_millis(150),
+            dwell
+        ));
+        tracker.mark_triggered();
+        assert!(!tracker.enter_or_stay(
+            ScreenEdge::Right,
+            start + Duration::from_millis(300),
+            dwell
+        ));
+
+        tracker.reset();
+        assert!(!tracker.enter_or_stay(
+            ScreenEdge::Right,
+            start + Duration::from_millis(301),
+            dwell
+        ));
+    }
+
+    #[test]
+    fn host_edge_zone_direction_change_starts_new_dwell() {
+        let mut tracker = EdgeZoneTracker::new();
+        let start = Instant::now();
+        let dwell = Duration::from_millis(150);
+
+        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
+        assert!(!tracker.enter_or_stay(
+            ScreenEdge::Left,
+            start + Duration::from_millis(149),
+            dwell
+        ));
+        assert!(tracker.enter_or_stay(ScreenEdge::Left, start + Duration::from_millis(299), dwell));
+    }
+
+    #[test]
+    fn host_edge_zone_can_complete_after_idle_dwell() {
+        let mut tracker = EdgeZoneTracker::new();
+        let start = Instant::now();
+        let dwell = Duration::from_millis(150);
+
+        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
+        assert!(tracker.enter_or_stay(
+            ScreenEdge::Right,
+            start + Duration::from_millis(150),
+            dwell
+        ));
+    }
+
+    #[test]
+    fn host_edge_zone_retries_when_capture_queue_is_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(CapturedInput {
+            target: ActiveTarget::Local,
+            event: CapturedEvent::Raw(EventType::MouseMove { x: 0.0, y: 0.0 }),
+        })
+        .expect("test queue should accept its first item");
+
+        let send_ctx = CaptureSendContext {
+            runtime_stats: Arc::new(RuntimeStats::default()),
+            active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            pointer_lock_active: Arc::new(AtomicBool::new(false)),
+            pointer_hidden: Arc::new(AtomicBool::new(false)),
+            pinned_pointer_pos: Arc::new(Mutex::new(None)),
+            pending_release_sides: Arc::new(AtomicU8::new(0)),
+        };
+        let mut tracker = EdgeZoneTracker::new();
+        let start = Instant::now();
+        let dwell = Duration::from_millis(150);
+
+        try_send_host_edge(
+            &tx,
+            &send_ctx,
+            &mut tracker,
+            ScreenEdge::Right,
+            start,
+            dwell,
+        );
+        try_send_host_edge(
+            &tx,
+            &send_ctx,
+            &mut tracker,
+            ScreenEdge::Right,
+            start + dwell,
+            dwell,
+        );
+
+        assert!(!tracker.triggered);
     }
 
     #[test]
