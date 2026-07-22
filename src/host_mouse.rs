@@ -67,14 +67,7 @@ pub(crate) fn warp_pointer(x: f64, y: f64) -> Result<()> {
 }
 
 pub(crate) fn center_pointer() -> Result<(f64, f64)> {
-    let (width, height) = rdev::display_size().map_err(|err| {
-        anyhow::anyhow!("failed to determine display size for pointer centering: {err:?}")
-    })?;
-    if width == 0 || height == 0 {
-        return Err(anyhow::anyhow!("display size is zero"));
-    }
-
-    let position = (width as f64 / 2.0, height as f64 / 2.0);
+    let position = crate::display::main_display_geometry()?.center();
     warp_pointer(position.0, position.1)?;
     Ok(position)
 }

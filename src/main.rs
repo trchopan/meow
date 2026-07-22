@@ -6,6 +6,7 @@ use clap::Parser;
 mod attach;
 mod cli;
 mod dev;
+mod display;
 mod host;
 mod host_mouse;
 mod input;

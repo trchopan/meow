@@ -14,6 +14,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{info, warn};
 
 use crate::{
+    display::{DisplayGeometry, main_display_geometry},
     host_mouse,
     model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats, ScreenEdge},
 };
@@ -109,9 +110,13 @@ pub(crate) fn run_input_grab(
             let Some((x, y)) = position else {
                 continue;
             };
-            let display = rdev::display_size().unwrap_or((0, 0));
-            let Some(edge) =
-                detect_host_edge_zone_in_display(x, y, display.0, display.1, edge_config.zone_px)
+            let display = main_display_geometry().unwrap_or(DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            });
+            let Some(edge) = detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
             else {
                 edge_zone.reset();
                 continue;
@@ -199,14 +204,15 @@ pub(crate) fn run_input_grab(
 
                     let now = Instant::now();
                     let mut edge_zone = local_edge_zone.lock().expect("local edge mutex poisoned");
-                    let display = rdev::display_size().unwrap_or((0, 0));
-                    if let Some(edge) = detect_host_edge_zone_in_display(
-                        x,
-                        y,
-                        display.0,
-                        display.1,
-                        edge_config.zone_px,
-                    ) {
+                    let display = main_display_geometry().unwrap_or(DisplayGeometry {
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        width: 0.0,
+                        height: 0.0,
+                    });
+                    if let Some(edge) =
+                        detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
+                    {
                         try_send_host_edge(
                             &tx,
                             &send_ctx,
@@ -531,28 +537,27 @@ pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
 fn detect_host_edge_zone_in_display(
     x: f64,
     y: f64,
-    width: u64,
-    height: u64,
+    display: DisplayGeometry,
     zone_px: u32,
 ) -> Option<ScreenEdge> {
-    if width == 0 || height == 0 {
+    if display.width <= 0.0 || display.height <= 0.0 {
         return None;
     }
 
     let zone = zone_px as f64;
-    let max_x = width.saturating_sub(1) as f64;
-    let max_y = height.saturating_sub(1) as f64;
+    let max_x = display.right() - 1.0;
+    let max_y = display.bottom() - 1.0;
 
-    if x <= zone {
+    if x <= display.origin_x + zone {
         return Some(ScreenEdge::Left);
     }
-    if x >= (max_x - zone).max(0.0) {
+    if x >= (max_x - zone).max(display.origin_x) {
         return Some(ScreenEdge::Right);
     }
-    if y <= zone {
+    if y <= display.origin_y + zone {
         return Some(ScreenEdge::Up);
     }
-    if y >= (max_y - zone).max(0.0) {
+    if y >= (max_y - zone).max(display.origin_y) {
         return Some(ScreenEdge::Down);
     }
 
@@ -687,33 +692,99 @@ mod tests {
 
     #[test]
     fn host_edge_zone_detects_each_display_edge() {
-        let display = (1920, 1080);
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
         let zone = 12;
 
         assert_eq!(
-            detect_host_edge_zone_in_display(12.0, 500.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(12.0, 500.0, display, zone),
             Some(ScreenEdge::Left)
         );
         assert_eq!(
-            detect_host_edge_zone_in_display(1907.0, 500.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(1907.0, 500.0, display, zone),
             Some(ScreenEdge::Right)
         );
         assert_eq!(
-            detect_host_edge_zone_in_display(500.0, 12.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(500.0, 12.0, display, zone),
             Some(ScreenEdge::Up)
         );
         assert_eq!(
-            detect_host_edge_zone_in_display(500.0, 1067.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(500.0, 1067.0, display, zone),
             Some(ScreenEdge::Down)
         );
-        assert_eq!(detect_host_edge_zone_in_display(0.0, 0.0, 0, 0, zone), None);
+        assert_eq!(
+            detect_host_edge_zone_in_display(
+                0.0,
+                0.0,
+                DisplayGeometry {
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                zone,
+            ),
+            None
+        );
     }
 
     #[test]
     fn host_edge_zone_ignores_pointer_outside_zone() {
         assert_eq!(
-            detect_host_edge_zone_in_display(100.0, 500.0, 1920, 1080, 12),
+            detect_host_edge_zone_in_display(
+                100.0,
+                500.0,
+                DisplayGeometry {
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                12,
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn host_edge_zone_uses_logical_retina_dimensions() {
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        assert_eq!(
+            detect_host_edge_zone_in_display(1511.0, 500.0, display, 12),
+            Some(ScreenEdge::Right)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(500.0, 981.0, display, 12),
+            Some(ScreenEdge::Down)
+        );
+    }
+
+    #[test]
+    fn host_edge_zone_respects_non_zero_display_origin() {
+        let display = DisplayGeometry {
+            origin_x: 100.0,
+            origin_y: 40.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        assert_eq!(
+            detect_host_edge_zone_in_display(1611.0, 500.0, display, 12),
+            Some(ScreenEdge::Right)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(500.0, 1021.0, display, 12),
+            Some(ScreenEdge::Down)
         );
     }
 
