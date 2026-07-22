@@ -60,6 +60,14 @@ mod imp {
         Ok(())
     }
 
+    pub(crate) fn cancel_input_composition() -> Result<()> {
+        if !crate::macos_keyboard::current_input_source_is_non_english() {
+            return Ok(());
+        }
+        inject_event(&EventType::KeyPress(Key::Escape))?;
+        inject_event(&EventType::KeyRelease(Key::Escape))
+    }
+
     pub(crate) fn keycode_for_key(key: Key) -> Option<u16> {
         keycode(key)
     }
@@ -297,6 +305,10 @@ mod imp {
         ))
     }
 
+    pub(crate) fn cancel_input_composition() -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn keycode_for_key(_key: Key) -> Option<u16> {
         None
     }
@@ -325,6 +337,10 @@ mod imp {
 
 pub(crate) fn inject_event(event: &EventType) -> Result<()> {
     imp::inject_event(event)
+}
+
+pub(crate) fn cancel_input_composition() -> Result<()> {
+    imp::cancel_input_composition()
 }
 
 pub(crate) fn keycode_for_key(key: Key) -> Option<u16> {
