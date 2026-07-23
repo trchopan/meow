@@ -6,7 +6,7 @@ use crate::protocol::ModifierFlags;
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
-    use crate::display::main_display_geometry;
+    use crate::display::{display_layout, pointer_location};
     use core_graphics::{
         event::{
             CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
@@ -15,11 +15,23 @@ mod imp {
         geometry::CGPoint,
     };
 
+    pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
+        let EventType::MouseMove { x, y } = event else {
+            return Ok(*event);
+        };
+        let (fallback_x, fallback_y) = pointer_location()?;
+        let (x, y) = display_layout()?
+            .clamp_absolute_point(*x, *y, fallback_x, fallback_y)
+            .ok_or_else(|| anyhow!("macOS display layout is empty"))?;
+        Ok(EventType::MouseMove { x, y })
+    }
+
     pub(crate) fn inject_event(event: &EventType) -> Result<()> {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow!("failed to create macOS HID event source"))?;
 
-        match event {
+        let event = prepare_event_for_injection(event)?;
+        match &event {
             EventType::KeyPress(key) | EventType::KeyRelease(key) => {
                 let keycode =
                     keycode(*key).ok_or_else(|| anyhow!("unsupported macOS key: {key:?}"))?;
@@ -29,23 +41,17 @@ mod imp {
                 event.post(CGEventTapLocation::HID);
             }
             EventType::ButtonPress(button) | EventType::ButtonRelease(button) => {
-                let (event_type, mouse_button) = mouse_button_event(*button, event)?;
+                let (event_type, mouse_button) = mouse_button_event(*button, &event)?;
                 let location = current_location()?;
                 let event = CGEvent::new_mouse_event(source, event_type, location, mouse_button)
                     .map_err(|_| anyhow!("failed to create macOS mouse event"))?;
                 event.post(CGEventTapLocation::HID);
             }
             EventType::MouseMove { x, y } => {
-                let display = main_display_geometry()?;
-                if display.width <= 0.0 || display.height <= 0.0 {
-                    return Err(anyhow!("macOS display geometry is empty"));
-                }
-                let x = (*x).clamp(display.origin_x, display.right() - 1.0);
-                let y = (*y).clamp(display.origin_y, display.bottom() - 1.0);
                 let event = CGEvent::new_mouse_event(
                     source,
                     CGEventType::MouseMoved,
-                    CGPoint::new(x, y),
+                    CGPoint::new(*x, *y),
                     CGMouseButton::Left,
                 )
                 .map_err(|_| anyhow!("failed to create macOS motion event"))?;
@@ -120,10 +126,10 @@ mod imp {
         button: Option<Button>,
     ) -> Result<()> {
         let location = current_location()?;
-        let display = main_display_geometry()?;
-        let (target_x, target_y, actual_dx, actual_dy) = display
+        let layout = display_layout()?;
+        let (target_x, target_y, actual_dx, actual_dy) = layout
             .clamp_pointer_move(location.x, location.y, dx, dy)
-            .ok_or_else(|| anyhow!("macOS display geometry is empty"))?;
+            .ok_or_else(|| anyhow!("macOS display layout is empty"))?;
         let event_type = match button {
             Some(Button::Left) => CGEventType::LeftMouseDragged,
             Some(Button::Right) => CGEventType::RightMouseDragged,
@@ -335,6 +341,10 @@ mod imp {
         ))
     }
 
+    pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
+        Ok(event.clone())
+    }
+
     pub(crate) fn cancel_input_composition() -> Result<()> {
         Ok(())
     }
@@ -371,6 +381,10 @@ mod imp {
 
 pub(crate) fn inject_event(event: &EventType) -> Result<()> {
     imp::inject_event(event)
+}
+
+pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
+    imp::prepare_event_for_injection(event)
 }
 
 pub(crate) fn cancel_input_composition() -> Result<()> {

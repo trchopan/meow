@@ -12,7 +12,9 @@ use uuid::Uuid;
 use crate::{
     cli::AttachArgs,
     clipboard,
-    display::{DisplayGeometry, main_display_geometry, pointer_location},
+    display::{
+        DisplayGeometry, DisplayLayout, display_layout, main_display_geometry, pointer_location,
+    },
     input_overlay::InputOverlay,
     macos_inject,
     model::ScreenEdge,
@@ -256,7 +258,11 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     let drag_button = active_drag_button(&input_state);
                     move_mouse_relative(&mut enigo, dx, dy, drag_button);
                     let after = pointer_location()?;
-                    let display = main_display_geometry()?;
+                    let layout = display_layout()?;
+                    let display = layout
+                        .display_at(after.0, after.1)
+                        .or_else(|| layout.display_at(before.0, before.1))
+                        .unwrap_or_else(|| layout.main());
                     edge_push.reset_if_stale(Instant::now());
                     let push = detect_client_edge_push(before, after, display, dx, dy);
                     let Some((edge, push_amount)) = push else {
@@ -706,8 +712,9 @@ fn inject_input_event(
         return Ok(());
     }
 
-    if macos_inject::inject_event(event).is_err() {
-        simulate(event).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    let prepared = macos_inject::prepare_event_for_injection(event)?;
+    if macos_inject::inject_event(&prepared).is_err() {
+        simulate(&prepared).map_err(|err| anyhow::anyhow!("{err:?}"))?;
     }
     match event {
         EventType::KeyPress(key) => {
@@ -731,8 +738,8 @@ fn move_mouse_relative(enigo: &mut Enigo, dx: i32, dy: i32, drag_button: Option<
         if macos_inject::inject_relative_move_with_button(dx, dy, drag_button).is_ok() {
             return;
         }
-        if let (Ok(display), Ok((x, y))) = (main_display_geometry(), pointer_location())
-            && let Some((target_x, target_y, _, _)) = display.clamp_pointer_move(x, y, dx, dy)
+        if let (Ok(layout), Ok((x, y))) = (display_layout(), pointer_location())
+            && let Some((target_x, target_y, _, _)) = layout.clamp_pointer_move(x, y, dx, dy)
         {
             enigo.mouse_move_to(target_x.round() as i32, target_y.round() as i32);
             return;
@@ -976,7 +983,7 @@ impl EdgePushTracker {
 
 struct ClientReceiveProbe {
     start_cursor: (i32, i32),
-    display: DisplayGeometry,
+    layout: DisplayLayout,
     duration_secs: u64,
     total_messages: u64,
     relative_messages: u64,
@@ -1020,7 +1027,8 @@ struct ProbeMessageMeta {
 
 impl ClientReceiveProbe {
     fn new(duration_secs: u64, verbose_events: bool) -> Result<Self> {
-        let display = main_display_geometry()?;
+        let layout = display_layout()?;
+        let display = layout.main();
         let start_cursor = pointer_location().map(|(x, y)| (x.round() as i32, y.round() as i32))?;
         println!(
             "client probe start: duration={}s display=({:.0},{:.0}) cursor_start=({},{})",
@@ -1028,7 +1036,7 @@ impl ClientReceiveProbe {
         );
         Ok(Self {
             start_cursor,
-            display,
+            layout,
             duration_secs,
             total_messages: 0,
             relative_messages: 0,
@@ -1141,12 +1149,18 @@ impl ClientReceiveProbe {
         }
 
         let before = pointer_location().map(|(x, y)| (x.round() as i32, y.round() as i32))?;
-        let min_x = self.display.origin_x.round() as i32;
-        let min_y = self.display.origin_y.round() as i32;
-        let max_x = self.display.right().round() as i32 - 1;
-        let max_y = self.display.bottom().round() as i32 - 1;
-        let expected_x = (before.0 + dx).clamp(min_x, max_x);
-        let expected_y = (before.1 + dy).clamp(min_y, max_y);
+        let layout = display_layout().unwrap_or_else(|_| self.layout.clone());
+        let display = layout
+            .display_at(f64::from(before.0), f64::from(before.1))
+            .unwrap_or_else(|| layout.main());
+        let min_x = display.origin_x.round() as i32;
+        let min_y = display.origin_y.round() as i32;
+        let max_x = display.right().round() as i32 - 1;
+        let max_y = display.bottom().round() as i32 - 1;
+        let (expected_x, expected_y) = layout
+            .clamp_pointer_move(f64::from(before.0), f64::from(before.1), dx, dy)
+            .map(|(x, y, _, _)| (x.round() as i32, y.round() as i32))
+            .unwrap_or((before.0, before.1));
 
         if !no_inject {
             let drag_button = active_drag_button(input_state);
@@ -1264,7 +1278,10 @@ impl ClientReceiveProbe {
         println!("client probe summary:");
         println!(
             "  display_origin=({:.0}, {:.0}) display_size=({:.0}, {:.0})",
-            self.display.origin_x, self.display.origin_y, self.display.width, self.display.height
+            self.layout.main().origin_x,
+            self.layout.main().origin_y,
+            self.layout.main().width,
+            self.layout.main().height
         );
         println!(
             "  start_cursor=({}, {})",

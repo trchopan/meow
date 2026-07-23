@@ -14,7 +14,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{info, warn};
 
 use crate::{
-    display::{DisplayGeometry, main_display_geometry},
+    display::{DisplayGeometry, display_layout},
     host_mouse,
     model::{
         ActiveTarget, CapturedEvent, CapturedInput, PendingClipboardRequest, RuntimeStats,
@@ -137,12 +137,13 @@ pub(crate) fn run_input_grab(
             let Some((x, y)) = position else {
                 continue;
             };
-            let display = main_display_geometry().unwrap_or(DisplayGeometry {
-                origin_x: 0.0,
-                origin_y: 0.0,
-                width: 0.0,
-                height: 0.0,
-            });
+            let display = display_layout()
+                .ok()
+                .and_then(|layout| layout.display_at(x, y));
+            let Some(display) = display else {
+                edge_zone.reset();
+                continue;
+            };
             edge_zone.rearm_if_far(x, y, display, edge_config.zone_px);
             let Some(edge) = detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
             else {
@@ -322,15 +323,11 @@ pub(crate) fn run_input_grab(
 
                     let now = Instant::now();
                     let mut edge_zone = local_edge_zone.lock().expect("local edge mutex poisoned");
-                    let display = main_display_geometry().unwrap_or(DisplayGeometry {
-                        origin_x: 0.0,
-                        origin_y: 0.0,
-                        width: 0.0,
-                        height: 0.0,
-                    });
-                    edge_zone.rearm_if_far(x, y, display, edge_config.zone_px);
-                    if let Some(edge) =
-                        detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
+                    if let Some(display) = display_layout()
+                        .ok()
+                        .and_then(|layout| layout.display_at(x, y))
+                        && let Some(edge) =
+                            detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
                     {
                         try_send_host_edge(
                             &tx,
