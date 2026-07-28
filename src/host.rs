@@ -425,11 +425,18 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
     debug!("relative flush tick configured to {}ms", flush_tick_ms);
 
     loop {
-        reconcile_target_transition(&state, &mut pending_relative).await;
+        reconcile_target_transition(
+            &state,
+            &mut pending_relative,
+            &mut modifier_flags,
+            &mut pressed_keys,
+        )
+        .await;
 
         tokio::select! {
             _ = state.shutdown_notify.notified() => {
                 flush_pending_relative(&state, &mut pending_relative).await;
+                release_all_remote_inputs(&state).await;
                 break;
             }
             _ = flush_tick.tick() => {
@@ -444,6 +451,8 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                     let current_target = reconcile_target_transition(
                         &state,
                         &mut pending_relative,
+                        &mut modifier_flags,
+                        &mut pressed_keys,
                     )
                     .await;
                     if is_stale_captured_target(captured.target, current_target) {
@@ -526,6 +535,8 @@ fn is_stale_captured_target(captured_target: ActiveTarget, current_target: Activ
 async fn reconcile_target_transition(
     state: &HostState,
     pending_relative: &mut HashMap<Side, (i32, i32)>,
+    modifier_flags: &mut ModifierFlags,
+    pressed_keys: &mut HashSet<Key>,
 ) -> ActiveTarget {
     let current_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     let pending = state.pending_release_sides.swap(0, Ordering::AcqRel);
@@ -534,6 +545,12 @@ async fn reconcile_target_transition(
             flush_relative_for_side(state, pending_relative, side).await;
             send_release_all_to_side(state, side).await;
         }
+    }
+    if pending != 0 {
+        // The remote no longer owns the host's previous key state. Do not carry
+        // stale modifiers into the next target after a lost release or detach.
+        *modifier_flags = ModifierFlags::default();
+        pressed_keys.clear();
     }
     current_target
 }
@@ -758,7 +775,6 @@ async fn send_release_all_to_side(state: &HostState, side: Side) {
     let message = HostToClientMessage::ReleaseAll { seq };
     let result = tokio::select! {
         result = peer.input_tx.send(message) => result.map_err(|_| "writer channel closed"),
-        _ = state.shutdown_notify.notified() => Err("daemon shutting down"),
         _ = time::sleep(Duration::from_millis(500)) => Err("writer queue timeout"),
     };
     if let Err(reason) = result {
@@ -775,6 +791,12 @@ async fn send_release_all_to_side(state: &HostState, side: Side) {
         {
             apply_target_change(state, ActiveTarget::Local, "release-all delivery failure");
         }
+    }
+}
+
+async fn release_all_remote_inputs(state: &HostState) {
+    for side in [Side::Left, Side::Right, Side::Up, Side::Down] {
+        send_release_all_to_side(state, side).await;
     }
 }
 
@@ -1076,6 +1098,58 @@ mod tests {
     }
 
     #[test]
+    fn control_press_and_release_update_forwarded_modifier_state() {
+        let mut modifiers = ModifierFlags::default();
+        let mut pressed_keys = HashSet::new();
+        let mut layout = LayoutTranslator::new();
+
+        let press = wire_event_from_rdev(
+            EventType::KeyPress(Key::ControlLeft),
+            &mut modifiers,
+            &mut pressed_keys,
+            &mut layout,
+        );
+        assert!(matches!(
+            press,
+            WireEvent::Key {
+                action: KeyAction::Down,
+                modifiers: ModifierFlags {
+                    left_control: true,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let release = wire_event_from_rdev(
+            EventType::KeyRelease(Key::ControlLeft),
+            &mut modifiers,
+            &mut pressed_keys,
+            &mut layout,
+        );
+        assert!(matches!(
+            release,
+            WireEvent::Key {
+                action: KeyAction::Up,
+                modifiers: ModifierFlags {
+                    left_control: false,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(pressed_keys.is_empty());
+        assert_eq!(modifiers, ModifierFlags::default());
+    }
+
+    #[test]
+    fn standard_mouse_buttons_have_stable_wire_values() {
+        assert_eq!(button_to_wire(rdev::Button::Left), 1);
+        assert_eq!(button_to_wire(rdev::Button::Middle), 2);
+        assert_eq!(button_to_wire(rdev::Button::Right), 3);
+    }
+
+    #[test]
     fn ordered_discrete_events_flush_only_for_remote_targets() {
         let remote = CapturedInput {
             target: ActiveTarget::Right,
@@ -1127,8 +1201,19 @@ mod tests {
             .pending_release_sides
             .store(Side::Right.release_bit(), Ordering::Release);
         let mut pending_relative = HashMap::from([(Side::Right, (3, 4))]);
+        let mut modifier_flags = ModifierFlags {
+            left_control: true,
+            ..ModifierFlags::default()
+        };
+        let mut pressed_keys = HashSet::from([Key::ControlLeft]);
 
-        reconcile_target_transition(&state, &mut pending_relative).await;
+        reconcile_target_transition(
+            &state,
+            &mut pending_relative,
+            &mut modifier_flags,
+            &mut pressed_keys,
+        )
+        .await;
 
         assert!(matches!(
             input_rx.recv().await,
@@ -1138,6 +1223,8 @@ mod tests {
             input_rx.recv().await,
             Some(HostToClientMessage::ReleaseAll { .. })
         ));
+        assert_eq!(modifier_flags, ModifierFlags::default());
+        assert!(pressed_keys.is_empty());
     }
 
     #[tokio::test]
