@@ -17,6 +17,10 @@ fn should_capture_motion(target: ActiveTarget, pointer_lock_active: bool) -> boo
     target.to_side().is_some() && pointer_lock_active
 }
 
+fn should_suppress_unlocked_remote_motion(target: ActiveTarget, pointer_lock_active: bool) -> bool {
+    target.to_side().is_some() && !pointer_lock_active
+}
+
 const MAX_USER_DISABLE_RETRIES: u8 = 3;
 
 fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
@@ -27,6 +31,7 @@ fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_macos_mouse_delta_capture(
     tx: mpsc::Sender<CapturedInput>,
     runtime_stats: Arc<RuntimeStats>,
@@ -34,6 +39,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pointer_transition_lock: Arc<Mutex<()>>,
     pending_release_sides: Arc<AtomicU8>,
 ) -> Result<()> {
     use anyhow::anyhow;
@@ -71,6 +77,9 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 event_type,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
+                let _transition_guard = pointer_transition_lock
+                    .lock()
+                    .expect("pointer transition mutex poisoned");
                 let port = callback_tap_port.load(Ordering::Relaxed);
                 if matches!(event_type, CGEventType::TapDisabledByTimeout) {
                     if !port.is_null() {
@@ -107,7 +116,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 runtime_stats
                     .recovery_events
                     .fetch_add(1, Ordering::Relaxed);
-                if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+                if let Err(err) = host_mouse::set_pointer_dissociation_once(false) {
                     warn!("failed to restore pointer association after tap disable: {err:#}");
                 }
                 if pointer_hidden.swap(false, Ordering::Relaxed)
@@ -121,7 +130,11 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 return Some(event.clone());
             }
             let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
-            if !should_capture_motion(target, pointer_lock_active.load(Ordering::Relaxed)) {
+            let pointer_lock_active = pointer_lock_active.load(Ordering::Relaxed);
+            if should_suppress_unlocked_remote_motion(target, pointer_lock_active) {
+                return None;
+            }
+            if !should_capture_motion(target, pointer_lock_active) {
                 return Some(event.clone());
             }
 
@@ -185,6 +198,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_macos_mouse_delta_capture(
     _tx: mpsc::Sender<CapturedInput>,
     _runtime_stats: Arc<RuntimeStats>,
@@ -192,6 +206,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _pointer_lock_active: Arc<AtomicBool>,
     _pointer_hidden: Arc<AtomicBool>,
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    _pointer_transition_lock: Arc<Mutex<()>>,
     _pending_release_sides: Arc<AtomicU8>,
 ) -> Result<()> {
     Ok(())
@@ -206,6 +221,22 @@ mod tests {
         assert!(!should_capture_motion(ActiveTarget::Local, true));
         assert!(!should_capture_motion(ActiveTarget::Right, false));
         assert!(should_capture_motion(ActiveTarget::Right, true));
+    }
+
+    #[test]
+    fn motion_is_suppressed_for_an_unlocked_remote_target() {
+        assert!(!should_suppress_unlocked_remote_motion(
+            ActiveTarget::Local,
+            false
+        ));
+        assert!(!should_suppress_unlocked_remote_motion(
+            ActiveTarget::Right,
+            true
+        ));
+        assert!(should_suppress_unlocked_remote_motion(
+            ActiveTarget::Right,
+            false
+        ));
     }
 
     #[test]

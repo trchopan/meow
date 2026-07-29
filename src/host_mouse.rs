@@ -1,5 +1,27 @@
 use anyhow::Result;
 
+const POINTER_DISSOCIATION_RETRIES: usize = 3;
+
+fn retry_pointer_operation<T, F>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let mut last_error = None;
+    for attempt in 0..POINTER_DISSOCIATION_RETRIES {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt + 1 < POINTER_DISSOCIATION_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("pointer operation must have an error after retries"))
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use anyhow::{Result, anyhow};
@@ -76,6 +98,10 @@ mod imp {
 }
 
 pub(crate) fn set_pointer_dissociation(enabled: bool) -> Result<()> {
+    retry_pointer_operation(|| imp::set_pointer_dissociation(enabled))
+}
+
+pub(crate) fn set_pointer_dissociation_once(enabled: bool) -> Result<()> {
     imp::set_pointer_dissociation(enabled)
 }
 
@@ -89,4 +115,40 @@ pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
 
 pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {
     imp::set_pointer_visible(visible)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use std::cell::Cell;
+
+    #[test]
+    fn pointer_operation_retries_until_success() {
+        let attempts = Cell::new(0);
+        let result = retry_pointer_operation(|| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt < POINTER_DISSOCIATION_RETRIES {
+                Err(anyhow!("temporary failure"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), POINTER_DISSOCIATION_RETRIES);
+    }
+
+    #[test]
+    fn pointer_operation_returns_error_after_retry_budget() {
+        let attempts = Cell::new(0);
+        let result = retry_pointer_operation(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(anyhow!("persistent failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), POINTER_DISSOCIATION_RETRIES);
+    }
 }

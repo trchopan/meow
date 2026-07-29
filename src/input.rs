@@ -56,6 +56,7 @@ pub(crate) fn run_input_grab(
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pointer_transition_lock: Arc<Mutex<()>>,
     pending_release_sides: Arc<AtomicU8>,
     detach_chord: DetachChord,
     edge_config: HostEdgeConfig,
@@ -66,6 +67,7 @@ pub(crate) fn run_input_grab(
         pointer_lock_active: pointer_lock_active.clone(),
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
+        pointer_transition_lock: pointer_transition_lock.clone(),
         pending_release_sides: pending_release_sides.clone(),
     };
 
@@ -179,13 +181,16 @@ pub(crate) fn run_input_grab(
             && (!detach_chord.meta || is_meta_down)
             && (!detach_chord.shift || is_shift_down)
         {
+            let _transition_guard = pointer_transition_lock
+                .lock()
+                .expect("pointer transition mutex poisoned");
             let previous_target = target;
             active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
             if let Some(side) = previous_target.to_side() {
                 pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
             }
             pointer_lock_active.store(false, Ordering::Relaxed);
-            if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+            if let Err(err) = host_mouse::set_pointer_dissociation_once(false) {
                 warn!("failed to disable pointer dissociation after detach chord: {err:#}");
             }
             let was_hidden = pointer_hidden.swap(false, Ordering::Relaxed);
@@ -243,47 +248,50 @@ pub(crate) fn run_input_grab(
             }
             _ => {
                 let captured_event = match event.event_type {
-                    EventType::MouseMove { x, y } => {
+                    EventType::MouseMove { x: _x, y: _y } => {
                         #[cfg(target_os = "macos")]
-                        if pointer_lock_active.load(Ordering::Relaxed) {
+                        {
                             return None;
                         }
 
-                        let (dx, dy) = if pointer_lock_active.load(Ordering::Relaxed) {
-                            let pinned = {
-                                let pinned = pinned_pointer_pos
-                                    .lock()
-                                    .expect("pinned pointer mutex poisoned");
-                                *pinned
-                            };
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let (dx, dy) = if pointer_lock_active.load(Ordering::Relaxed) {
+                                let pinned = {
+                                    let pinned = pinned_pointer_pos
+                                        .lock()
+                                        .expect("pinned pointer mutex poisoned");
+                                    *pinned
+                                };
 
-                            if let Some((pin_x, pin_y)) = pinned {
-                                let dx = x - pin_x;
-                                let dy = y - pin_y;
-                                if let Err(err) = host_mouse::warp_pointer(pin_x, pin_y) {
-                                    warn!(
-                                        "failed to warp pointer to pinned position ({pin_x:.2},{pin_y:.2}): {err:#}"
-                                    );
+                                if let Some((pin_x, pin_y)) = pinned {
+                                    let dx = _x - pin_x;
+                                    let dy = _y - pin_y;
+                                    if let Err(err) = host_mouse::warp_pointer(pin_x, pin_y) {
+                                        warn!(
+                                            "failed to warp pointer to pinned position ({pin_x:.2},{pin_y:.2}): {err:#}"
+                                        );
+                                    }
+                                    (dx, dy)
+                                } else {
+                                    (0.0, 0.0)
                                 }
+                            } else {
+                                let mut last_pos =
+                                    last_mouse_pos.lock().expect("mouse pos mutex poisoned");
+                                let (dx, dy) = if let Some((last_x, last_y)) = *last_pos {
+                                    (_x - last_x, _y - last_y)
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                *last_pos = Some((_x, _y));
                                 (dx, dy)
-                            } else {
-                                (0.0, 0.0)
-                            }
-                        } else {
-                            let mut last_pos =
-                                last_mouse_pos.lock().expect("mouse pos mutex poisoned");
-                            let (dx, dy) = if let Some((last_x, last_y)) = *last_pos {
-                                (x - last_x, y - last_y)
-                            } else {
-                                (0.0, 0.0)
                             };
-                            *last_pos = Some((x, y));
-                            (dx, dy)
-                        };
 
-                        CapturedEvent::MouseMoveRelative {
-                            dx: clamp_relative_delta(dx),
-                            dy: clamp_relative_delta(dy),
+                            CapturedEvent::MouseMoveRelative {
+                                dx: clamp_relative_delta(dx),
+                                dy: clamp_relative_delta(dy),
+                            }
                         }
                     }
                     other => normalize_non_motion_event(other),
@@ -362,6 +370,7 @@ fn try_send_captured_input_with_policy(
                 &send_ctx.pointer_lock_active,
                 &send_ctx.pointer_hidden,
                 &send_ctx.pinned_pointer_pos,
+                &send_ctx.pointer_transition_lock,
                 &send_ctx.pending_release_sides,
             );
             send_ctx
@@ -410,6 +419,7 @@ struct CaptureSendContext {
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pointer_transition_lock: Arc<Mutex<()>>,
     pending_release_sides: Arc<AtomicU8>,
 }
 
@@ -418,8 +428,12 @@ fn force_local_on_capture_saturation(
     pointer_lock_active: &Arc<AtomicBool>,
     pointer_hidden: &Arc<AtomicBool>,
     pinned_pointer_pos: &Arc<Mutex<Option<(f64, f64)>>>,
+    pointer_transition_lock: &Arc<Mutex<()>>,
     pending_release_sides: &Arc<AtomicU8>,
 ) {
+    let _transition_guard = pointer_transition_lock
+        .lock()
+        .expect("pointer transition mutex poisoned");
     let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
     if matches!(target, ActiveTarget::Local) {
         return;
@@ -430,7 +444,7 @@ fn force_local_on_capture_saturation(
         pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
     }
     pointer_lock_active.store(false, Ordering::Relaxed);
-    if let Err(err) = host_mouse::set_pointer_dissociation(false) {
+    if let Err(err) = host_mouse::set_pointer_dissociation_once(false) {
         warn!("failed to disable pointer dissociation after queue saturation: {err:#}");
     }
     let was_hidden = pointer_hidden.swap(false, Ordering::Relaxed);
@@ -1012,6 +1026,7 @@ mod tests {
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(Mutex::new(None)),
+            pointer_transition_lock: Arc::new(Mutex::new(())),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
         };
         let mut tracker = EdgeZoneTracker::new();
