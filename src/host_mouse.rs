@@ -113,6 +113,18 @@ pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
     imp::current_pointer_position()
 }
 
+pub(crate) fn center_pointer() -> Result<(f64, f64)> {
+    let (width, height) = rdev::display_size()
+        .map_err(|err| anyhow::anyhow!("failed to determine display size: {err:?}"))?;
+    if width == 0 || height == 0 {
+        return Err(anyhow::anyhow!("display size is zero"));
+    }
+
+    let position = (width as f64 / 2.0, height as f64 / 2.0);
+    warp_pointer(position.0, position.1)?;
+    Ok(position)
+}
+
 pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {
     imp::set_pointer_visible(visible)
 }

@@ -219,16 +219,27 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     let was_locked = state.pointer_lock_active.load(Ordering::Relaxed);
 
     if should_lock && !was_locked {
-        match host_mouse::current_pointer_position() {
-            Ok((x, y)) => {
+        match host_mouse::center_pointer() {
+            Ok(position) => {
                 let mut pinned = state
                     .pinned_pointer_pos
                     .lock()
                     .expect("pinned pointer mutex poisoned");
-                *pinned = Some((x, y));
+                *pinned = Some(position);
             }
             Err(err) => {
-                warn!("failed reading current pointer position: {err:#}");
+                warn!("failed centering pointer before remote switch: {err:#}");
+                match host_mouse::current_pointer_position() {
+                    Ok(position) => {
+                        *state
+                            .pinned_pointer_pos
+                            .lock()
+                            .expect("pinned pointer mutex poisoned") = Some(position);
+                    }
+                    Err(position_err) => {
+                        warn!("failed reading current pointer position: {position_err:#}");
+                    }
+                }
             }
         }
     }
