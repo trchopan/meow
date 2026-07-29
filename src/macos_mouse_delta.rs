@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use anyhow::Result;
@@ -21,6 +21,10 @@ fn should_suppress_unlocked_remote_motion(target: ActiveTarget, pointer_lock_act
     target.to_side().is_some() && !pointer_lock_active
 }
 
+fn should_preserve_remote_target_after_tap_disable(target: ActiveTarget) -> bool {
+    target.to_side().is_some()
+}
+
 const MAX_USER_DISABLE_RETRIES: u8 = 3;
 
 fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
@@ -37,10 +41,12 @@ pub(crate) fn run_macos_mouse_delta_capture(
     runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
+    pointer_tap_healthy: Arc<AtomicBool>,
+    pointer_tap_motion_generation: Arc<AtomicU64>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pointer_transition_lock: Arc<Mutex<()>>,
-    pending_release_sides: Arc<AtomicU8>,
+    _pending_release_sides: Arc<AtomicU8>,
 ) -> Result<()> {
     use anyhow::anyhow;
     use core_foundation::base::TCFType;
@@ -61,6 +67,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     let callback_tap_port = tap_port.clone();
     let user_disable_retries = Arc::new(AtomicU8::new(0));
     let callback_user_disable_retries = user_disable_retries.clone();
+    let callback_pointer_tap_healthy = pointer_tap_healthy.clone();
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -81,53 +88,78 @@ pub(crate) fn run_macos_mouse_delta_capture(
                     .lock()
                     .expect("pointer transition mutex poisoned");
                 let port = callback_tap_port.load(Ordering::Relaxed);
-                if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+                let tap_reenabled = if matches!(event_type, CGEventType::TapDisabledByTimeout) {
                     if !port.is_null() {
                         unsafe { CGEventTapEnable(port, true) };
                         info!("re-enabled macOS mouse CGEventTap after timeout");
+                        true
                     } else {
                         warn!("macOS mouse CGEventTap timed out before its port was ready");
+                        false
                     }
                 } else {
                     let attempt = callback_user_disable_retries.load(Ordering::Relaxed);
-                    if let Some(attempt) = next_user_disable_attempt(attempt, !port.is_null()) {
+                    let reenabled = if let Some(attempt) =
+                        next_user_disable_attempt(attempt, !port.is_null())
+                    {
                         callback_user_disable_retries.store(attempt, Ordering::Relaxed);
                         unsafe { CGEventTapEnable(port, true) };
                         info!(
                             "re-enabled macOS mouse CGEventTap after user-input disable (attempt {attempt}/{MAX_USER_DISABLE_RETRIES})"
                         );
+                        true
                     } else if attempt >= MAX_USER_DISABLE_RETRIES {
                         warn!(
                             "macOS mouse CGEventTap remained disabled after {MAX_USER_DISABLE_RETRIES} user-input recovery attempts"
                         );
+                        false
                     } else {
                         warn!("macOS mouse CGEventTap was disabled by user input before its port was ready");
-                    }
+                        false
+                    };
                     runtime_stats
                         .capture_tap_user_disabled
                         .fetch_add(1, Ordering::Relaxed);
-                }
+                    reenabled
+                };
+                callback_pointer_tap_healthy.store(tap_reenabled, Ordering::Release);
                 let previous_target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
-                active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
-                if let Some(side) = previous_target.to_side() {
-                    pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
-                }
-                pointer_lock_active.store(false, Ordering::Relaxed);
+                let lock_active = if should_preserve_remote_target_after_tap_disable(previous_target) {
+                    host_mouse::set_pointer_dissociation_once(true).is_ok()
+                } else {
+                    if let Err(err) = host_mouse::set_pointer_dissociation_once(false) {
+                        warn!("failed to restore pointer association after tap disable: {err:#}");
+                    }
+                    false
+                };
+                pointer_lock_active.store(lock_active, Ordering::Release);
                 runtime_stats
                     .recovery_events
                     .fetch_add(1, Ordering::Relaxed);
-                if let Err(err) = host_mouse::set_pointer_dissociation_once(false) {
-                    warn!("failed to restore pointer association after tap disable: {err:#}");
+                if should_preserve_remote_target_after_tap_disable(previous_target) {
+                    if !pointer_hidden.swap(true, Ordering::AcqRel)
+                        && let Err(err) = host_mouse::set_pointer_visible(false)
+                    {
+                        warn!("failed to hide pointer after tap recovery: {err:#}");
+                        pointer_hidden.store(false, Ordering::Release);
+                    }
+                } else {
+                    if pointer_hidden.swap(false, Ordering::AcqRel)
+                        && let Err(err) = host_mouse::set_pointer_visible(true)
+                    {
+                        warn!("failed to show pointer after tap disable: {err:#}");
+                        pointer_hidden.store(true, Ordering::Release);
+                    }
+                    *pinned_pointer_pos
+                        .lock()
+                        .expect("pinned pointer mutex poisoned") = None;
                 }
-                if pointer_hidden.swap(false, Ordering::Relaxed)
-                    && let Err(err) = host_mouse::set_pointer_visible(true)
-                {
-                    warn!("failed to show pointer after tap disable: {err:#}");
-                }
-                *pinned_pointer_pos
-                    .lock()
-                    .expect("pinned pointer mutex poisoned") = None;
-                return Some(event.clone());
+                return None;
+            }
+            callback_user_disable_retries.store(0, Ordering::Relaxed);
+            callback_pointer_tap_healthy.store(true, Ordering::Release);
+            if matches!(event_type, CGEventType::MouseMoved) {
+                pointer_tap_motion_generation.fetch_add(1, Ordering::AcqRel);
             }
             let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
             let pointer_lock_active = pointer_lock_active.load(Ordering::Relaxed);
@@ -183,6 +215,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
         tap.mach_port.as_concrete_TypeRef() as *mut std::ffi::c_void,
         Ordering::Relaxed,
     );
+    pointer_tap_healthy.store(true, Ordering::Release);
 
     let run_loop = CFRunLoop::get_current();
     let loop_source = tap
@@ -204,6 +237,8 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _runtime_stats: Arc<RuntimeStats>,
     _active_target: Arc<AtomicU8>,
     _pointer_lock_active: Arc<AtomicBool>,
+    _pointer_tap_healthy: Arc<AtomicBool>,
+    _pointer_tap_motion_generation: Arc<AtomicU64>,
     _pointer_hidden: Arc<AtomicBool>,
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     _pointer_transition_lock: Arc<Mutex<()>>,
@@ -236,6 +271,16 @@ mod tests {
         assert!(should_suppress_unlocked_remote_motion(
             ActiveTarget::Right,
             false
+        ));
+    }
+
+    #[test]
+    fn tap_disable_preserves_only_remote_targets() {
+        assert!(!should_preserve_remote_target_after_tap_disable(
+            ActiveTarget::Local
+        ));
+        assert!(should_preserve_remote_target_after_tap_disable(
+            ActiveTarget::Right
         ));
     }
 

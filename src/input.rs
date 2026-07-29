@@ -22,6 +22,11 @@ pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
 pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
 pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
 const EDGE_REARM_DISTANCE_MULTIPLIER: u32 = 2;
+const MAX_STALE_TAP_MOTION_EVENTS: u8 = 3;
+
+fn should_use_native_tap_motion(tap_healthy: bool, stale_events: u8) -> bool {
+    tap_healthy && stale_events < MAX_STALE_TAP_MOTION_EVENTS
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DetachChord {
@@ -54,6 +59,8 @@ pub(crate) fn run_input_grab(
     runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
     pointer_lock_active: Arc<AtomicBool>,
+    pointer_tap_healthy: Arc<AtomicBool>,
+    pointer_tap_motion_generation: Arc<AtomicU64>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pointer_transition_lock: Arc<Mutex<()>>,
@@ -140,6 +147,10 @@ pub(crate) fn run_input_grab(
     });
 
     let callback_previous_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
+    let last_tap_motion_generation = Arc::new(AtomicU64::new(0));
+    let stale_tap_motion_events = Arc::new(AtomicU8::new(0));
+    let callback_last_tap_motion_generation = last_tap_motion_generation.clone();
+    let callback_stale_tap_motion_events = stale_tap_motion_events.clone();
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         runtime_stats
             .captured_events
@@ -251,10 +262,28 @@ pub(crate) fn run_input_grab(
                     EventType::MouseMove { x: _x, y: _y } => {
                         #[cfg(target_os = "macos")]
                         {
-                            return None;
+                            let generation = pointer_tap_motion_generation.load(Ordering::Acquire);
+                            if generation
+                                == callback_last_tap_motion_generation.load(Ordering::Acquire)
+                            {
+                                callback_stale_tap_motion_events
+                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                                        Some(value.saturating_add(1))
+                                    })
+                                    .ok();
+                            } else {
+                                callback_last_tap_motion_generation
+                                    .store(generation, Ordering::Release);
+                                callback_stale_tap_motion_events.store(0, Ordering::Release);
+                            }
+                            if should_use_native_tap_motion(
+                                pointer_tap_healthy.load(Ordering::Acquire),
+                                callback_stale_tap_motion_events.load(Ordering::Acquire),
+                            ) {
+                                return None;
+                            }
                         }
 
-                        #[cfg(not(target_os = "macos"))]
                         {
                             let (dx, dy) = if pointer_lock_active.load(Ordering::Relaxed) {
                                 let pinned = {
@@ -1059,5 +1088,13 @@ mod tests {
             normalize_non_motion_event(EventType::KeyPress(Key::KeyA)),
             CapturedEvent::Raw(EventType::KeyPress(Key::KeyA))
         ));
+    }
+
+    #[test]
+    fn native_tap_fallback_starts_after_stale_motion_threshold() {
+        assert!(should_use_native_tap_motion(true, 0));
+        assert!(should_use_native_tap_motion(true, 2));
+        assert!(!should_use_native_tap_motion(true, 3));
+        assert!(!should_use_native_tap_motion(false, 0));
     }
 }

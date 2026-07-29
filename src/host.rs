@@ -82,6 +82,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let active_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let remote_pointer_mode = Arc::new(AtomicU8::new(persisted_state.remote_pointer_mode.to_u8()));
     let pointer_lock_active = Arc::new(AtomicBool::new(false));
+    let pointer_tap_healthy = Arc::new(AtomicBool::new(false));
+    let pointer_tap_motion_generation = Arc::new(AtomicU64::new(0));
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
     let pointer_transition_lock = Arc::new(Mutex::new(()));
@@ -128,6 +130,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
 
         let input_active_target = active_target.clone();
         let input_pointer_lock_active = pointer_lock_active.clone();
+        let input_pointer_tap_healthy = pointer_tap_healthy.clone();
+        let input_pointer_tap_motion_generation = pointer_tap_motion_generation.clone();
         let input_pointer_hidden = pointer_hidden.clone();
         let input_pinned_pointer_pos = pinned_pointer_pos.clone();
         let input_pointer_transition_lock = pointer_transition_lock.clone();
@@ -142,6 +146,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 input_runtime_stats,
                 input_active_target,
                 input_pointer_lock_active,
+                input_pointer_tap_healthy,
+                input_pointer_tap_motion_generation,
                 input_pointer_hidden,
                 input_pinned_pointer_pos,
                 input_pointer_transition_lock,
@@ -155,6 +161,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
 
         let mouse_delta_active_target = active_target.clone();
         let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
+        let mouse_delta_pointer_tap_healthy = pointer_tap_healthy.clone();
+        let mouse_delta_pointer_tap_motion_generation = pointer_tap_motion_generation.clone();
         let mouse_delta_pointer_hidden = pointer_hidden.clone();
         let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
         let mouse_delta_pointer_transition_lock = pointer_transition_lock.clone();
@@ -166,6 +174,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 mouse_delta_runtime_stats,
                 mouse_delta_active_target,
                 mouse_delta_pointer_lock_active,
+                mouse_delta_pointer_tap_healthy,
+                mouse_delta_pointer_tap_motion_generation,
                 mouse_delta_pointer_hidden,
                 mouse_delta_pinned_pointer_pos,
                 mouse_delta_pointer_transition_lock,
