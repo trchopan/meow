@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -198,6 +198,13 @@ fn persist_pointer_mode(endpoint_id: iroh::EndpointId, mode: RemotePointerMode) 
 }
 
 pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, context: &str) {
+    let _transition_guard = state
+        .pointer_transition_lock
+        .lock()
+        .expect("pointer transition mutex poisoned");
+    state
+        .pointer_lock_recovery_target
+        .store(target.to_u8(), Ordering::Release);
     let previous_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     if let Some(previous_side) = previous_target.to_side()
         && target.to_side() != Some(previous_side)
@@ -209,32 +216,56 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     state.active_target.store(target.to_u8(), Ordering::Relaxed);
 
     let should_lock = target.to_side().is_some();
-    let was_locked = state
-        .pointer_lock_active
-        .swap(should_lock, Ordering::Relaxed);
+    let was_locked = state.pointer_lock_active.load(Ordering::Relaxed);
 
     if should_lock && !was_locked {
-        match host_mouse::current_pointer_position() {
-            Ok((x, y)) => {
+        match host_mouse::center_pointer() {
+            Ok(position) => {
                 let mut pinned = state
                     .pinned_pointer_pos
                     .lock()
                     .expect("pinned pointer mutex poisoned");
-                *pinned = Some((x, y));
+                *pinned = Some(position);
             }
             Err(err) => {
-                warn!("failed reading current pointer position: {err:#}");
+                warn!("failed centering pointer before remote switch: {err:#}");
+                match host_mouse::current_pointer_position() {
+                    Ok(position) => {
+                        *state
+                            .pinned_pointer_pos
+                            .lock()
+                            .expect("pinned pointer mutex poisoned") = Some(position);
+                    }
+                    Err(position_err) => {
+                        warn!("failed reading current pointer position: {position_err:#}");
+                    }
+                }
             }
         }
     }
 
-    if was_locked != should_lock
-        && let Err(err) = host_mouse::set_pointer_dissociation(should_lock)
-    {
-        warn!("failed to update pointer dissociation enabled={should_lock}: {err:#}");
+    let lock_active = if should_lock {
+        match host_mouse::set_pointer_dissociation(true) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("failed to enable pointer dissociation: {err:#}");
+                false
+            }
+        }
+    } else {
+        if was_locked && let Err(err) = host_mouse::set_pointer_dissociation(false) {
+            warn!("failed to disable pointer dissociation: {err:#}");
+        }
+        false
+    };
+    state
+        .pointer_lock_active
+        .store(lock_active, Ordering::Relaxed);
+    if should_lock {
+        schedule_pointer_lock_recovery(state, target);
     }
 
-    let should_hide = should_lock;
+    let should_hide = lock_active;
     let was_hidden = state.pointer_hidden.swap(should_hide, Ordering::Relaxed);
     if was_hidden != should_hide
         && let Err(err) = host_mouse::set_pointer_visible(!should_hide)
@@ -252,6 +283,90 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     }
 
     info!("switched active target to {} via {}", target, context);
+}
+
+const POINTER_LOCK_RECOVERY_ATTEMPTS: u8 = 10;
+const POINTER_LOCK_RECOVERY_DELAY: Duration = Duration::from_millis(10);
+
+fn should_continue_pointer_lock_recovery(
+    active_target: ActiveTarget,
+    expected_target: ActiveTarget,
+) -> bool {
+    active_target == expected_target && expected_target.to_side().is_some()
+}
+
+fn schedule_pointer_lock_recovery(state: &HostState, expected_target: ActiveTarget) {
+    let generation = state
+        .pointer_lock_recovery_generation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    state
+        .pointer_lock_recovery_target
+        .store(expected_target.to_u8(), Ordering::Release);
+    if state
+        .pointer_lock_recovery_running
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+
+    let state = state.clone();
+    thread::spawn(move || {
+        for _ in 0..POINTER_LOCK_RECOVERY_ATTEMPTS {
+            thread::sleep(POINTER_LOCK_RECOVERY_DELAY);
+            let _transition_guard = state
+                .pointer_transition_lock
+                .lock()
+                .expect("pointer transition mutex poisoned");
+            let expected_target =
+                ActiveTarget::from_u8(state.pointer_lock_recovery_target.load(Ordering::Acquire));
+            let target = ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire));
+            if !should_continue_pointer_lock_recovery(target, expected_target) {
+                break;
+            }
+
+            let was_locked = state.pointer_lock_active.load(Ordering::Acquire);
+            let position = if was_locked {
+                None
+            } else {
+                host_mouse::current_pointer_position().ok()
+            };
+            if let Err(err) = host_mouse::set_pointer_dissociation(true) {
+                warn!("pointer lock recovery attempt failed: {err:#}");
+                continue;
+            }
+            if let Some(position) = position {
+                *state
+                    .pinned_pointer_pos
+                    .lock()
+                    .expect("pinned pointer mutex poisoned") = Some(position);
+            }
+            state.pointer_lock_active.store(true, Ordering::Release);
+            if !state.pointer_hidden.swap(true, Ordering::AcqRel)
+                && let Err(err) = host_mouse::set_pointer_visible(false)
+            {
+                warn!("failed to hide pointer during lock recovery: {err:#}");
+                state.pointer_hidden.store(false, Ordering::Release);
+            }
+            break;
+        }
+        state
+            .pointer_lock_recovery_running
+            .store(false, Ordering::Release);
+        let newer_recovery_requested = state
+            .pointer_lock_recovery_generation
+            .load(Ordering::Acquire)
+            != generation;
+        let target = ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire));
+        let expected_target =
+            ActiveTarget::from_u8(state.pointer_lock_recovery_target.load(Ordering::Acquire));
+        if newer_recovery_requested
+            && should_continue_pointer_lock_recovery(target, expected_target)
+            && !state.pointer_lock_active.load(Ordering::Acquire)
+        {
+            schedule_pointer_lock_recovery(&state, expected_target);
+        }
+    });
 }
 
 async fn status_payload(state: &HostState) -> StatusPayload {
@@ -329,6 +444,10 @@ mod tests {
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(std::sync::Mutex::new(None)),
+            pointer_transition_lock: Arc::new(std::sync::Mutex::new(())),
+            pointer_lock_recovery_running: Arc::new(AtomicBool::new(false)),
+            pointer_lock_recovery_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            pointer_lock_recovery_generation: Arc::new(AtomicU64::new(0)),
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
             next_remote_generation: Arc::new(AtomicU64::new(1)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
@@ -368,8 +487,10 @@ mod tests {
         let state = test_host_state();
         apply_target_change(&state, ActiveTarget::Right, "test attach");
         assert_eq!(state.pending_release_sides.load(Ordering::Acquire), 0);
+        assert!(state.pointer_lock_active.load(Ordering::Acquire));
 
         apply_target_change(&state, ActiveTarget::Local, "test detach");
+        assert!(!state.pointer_lock_active.load(Ordering::Acquire));
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit()
@@ -379,10 +500,27 @@ mod tests {
         apply_target_change(&state, ActiveTarget::Right, "test first side");
         apply_target_change(&state, ActiveTarget::Left, "test second side");
         apply_target_change(&state, ActiveTarget::Right, "test return side");
+        assert!(state.pointer_lock_active.load(Ordering::Acquire));
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit() | Side::Left.release_bit()
         );
+    }
+
+    #[test]
+    fn pointer_lock_recovery_stops_for_local_or_stale_targets() {
+        assert!(should_continue_pointer_lock_recovery(
+            ActiveTarget::Right,
+            ActiveTarget::Right
+        ));
+        assert!(!should_continue_pointer_lock_recovery(
+            ActiveTarget::Local,
+            ActiveTarget::Right
+        ));
+        assert!(!should_continue_pointer_lock_recovery(
+            ActiveTarget::Right,
+            ActiveTarget::Local
+        ));
     }
 
     #[test]

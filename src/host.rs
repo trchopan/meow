@@ -84,6 +84,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let pointer_lock_active = Arc::new(AtomicBool::new(false));
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
+    let pointer_transition_lock = Arc::new(Mutex::new(()));
+    let pointer_lock_recovery_running = Arc::new(AtomicBool::new(false));
+    let pointer_lock_recovery_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
+    let pointer_lock_recovery_generation = Arc::new(AtomicU64::new(0));
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let next_remote_generation = Arc::new(AtomicU64::new(1));
     let pending_release_sides = Arc::new(AtomicU8::new(0));
@@ -100,6 +104,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         pointer_lock_active: pointer_lock_active.clone(),
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
+        pointer_transition_lock: pointer_transition_lock.clone(),
+        pointer_lock_recovery_running: pointer_lock_recovery_running.clone(),
+        pointer_lock_recovery_target: pointer_lock_recovery_target.clone(),
+        pointer_lock_recovery_generation: pointer_lock_recovery_generation.clone(),
         remotes: remotes.clone(),
         next_remote_generation: next_remote_generation.clone(),
         pending_release_sides: pending_release_sides.clone(),
@@ -120,6 +128,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let input_pointer_lock_active = pointer_lock_active.clone();
         let input_pointer_hidden = pointer_hidden.clone();
         let input_pinned_pointer_pos = pinned_pointer_pos.clone();
+        let input_pointer_transition_lock = pointer_transition_lock.clone();
         let input_pending_release_sides = pending_release_sides.clone();
         let input_detach_chord = detach_chord.clone();
         let input_runtime_stats = runtime_stats.clone();
@@ -133,6 +142,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 input_pointer_lock_active,
                 input_pointer_hidden,
                 input_pinned_pointer_pos,
+                input_pointer_transition_lock,
                 input_pending_release_sides,
                 input_detach_chord,
                 input_edge_config,
@@ -145,6 +155,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
         let mouse_delta_pointer_hidden = pointer_hidden.clone();
         let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
+        let mouse_delta_pointer_transition_lock = pointer_transition_lock.clone();
         let mouse_delta_pending_release_sides = pending_release_sides.clone();
         let mouse_delta_runtime_stats = runtime_stats.clone();
         std::thread::spawn(move || {
@@ -155,6 +166,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 mouse_delta_pointer_lock_active,
                 mouse_delta_pointer_hidden,
                 mouse_delta_pinned_pointer_pos,
+                mouse_delta_pointer_transition_lock,
                 mouse_delta_pending_release_sides,
             ) {
                 error!("macOS mouse delta capture stopped: {err:#}");
@@ -1024,6 +1036,10 @@ mod tests {
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(Mutex::new(None)),
+            pointer_transition_lock: Arc::new(Mutex::new(())),
+            pointer_lock_recovery_running: Arc::new(AtomicBool::new(false)),
+            pointer_lock_recovery_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            pointer_lock_recovery_generation: Arc::new(AtomicU64::new(0)),
             remotes: Arc::new(tokio::sync::RwLock::new(HashMap::from([(
                 side,
                 RemotePeer {
