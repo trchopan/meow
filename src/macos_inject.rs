@@ -3,10 +3,22 @@ use rdev::{Button, EventType, Key};
 
 use crate::protocol::ModifierFlags;
 
+fn point_in_display(point: (f64, f64), bounds: (f64, f64, f64, f64)) -> bool {
+    let (x, y) = point;
+    let (origin_x, origin_y, width, height) = bounds;
+    x >= origin_x && x < origin_x + width && y >= origin_y && y < origin_y + height
+}
+
+fn display_center(bounds: (f64, f64, f64, f64)) -> (f64, f64) {
+    let (origin_x, origin_y, width, height) = bounds;
+    (origin_x + width / 2.0, origin_y + height / 2.0)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
     use core_graphics::{
+        display::CGDisplay,
         event::{
             CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
         },
@@ -118,6 +130,37 @@ mod imp {
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
         event.post(CGEventTapLocation::HID);
         Ok(())
+    }
+
+    pub(crate) fn center_pointer() -> Result<()> {
+        let current = current_location()?;
+        let display = CGDisplay::active_displays()
+            .map_err(|err| anyhow!("failed to list active displays: {err}"))?
+            .into_iter()
+            .map(CGDisplay::new)
+            .find(|display| {
+                let bounds = display.bounds();
+                point_in_display(
+                    (current.x, current.y),
+                    (
+                        bounds.origin.x,
+                        bounds.origin.y,
+                        bounds.size.width,
+                        bounds.size.height,
+                    ),
+                )
+            })
+            .unwrap_or_else(CGDisplay::main);
+        let bounds = display.bounds();
+        let (center_x, center_y) = display_center((
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        ));
+        let center = CGPoint::new(center_x, center_y);
+        CGDisplay::warp_mouse_cursor_position(center)
+            .map_err(|err| anyhow!("failed to center macOS pointer: {err}"))
     }
 
     fn current_location() -> Result<CGPoint> {
@@ -333,6 +376,12 @@ mod imp {
             "native macOS injection is unavailable on this platform"
         ))
     }
+
+    pub(crate) fn center_pointer() -> Result<()> {
+        Err(anyhow!(
+            "native macOS pointer centering is unavailable on this platform"
+        ))
+    }
 }
 
 pub(crate) fn inject_event(event: &EventType) -> Result<()> {
@@ -362,4 +411,29 @@ pub(crate) fn inject_relative_move_with_button(
     button: Option<Button>,
 ) -> Result<()> {
     imp::inject_relative_move_with_button(dx, dy, button)
+}
+
+pub(crate) fn center_pointer() -> Result<()> {
+    imp::center_pointer()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_center_preserves_global_origin() {
+        assert_eq!(
+            display_center((-1920.0, -200.0, 1920.0, 1080.0)),
+            (-960.0, 340.0)
+        );
+    }
+
+    #[test]
+    fn display_bounds_use_exclusive_right_and_bottom_edges() {
+        let bounds = (100.0, 50.0, 800.0, 600.0);
+        assert!(point_in_display((100.0, 50.0), bounds));
+        assert!(point_in_display((899.99, 649.99), bounds));
+        assert!(!point_in_display((900.0, 650.0), bounds));
+    }
 }

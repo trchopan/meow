@@ -268,6 +268,38 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     }
                 }
             }
+            HostToClientMessage::CenterPointer { seq } => {
+                if test_drop_sequence == Some(seq) {
+                    test_drop_sequence = None;
+                    warn!("test mode dropped center-pointer sequence {seq}");
+                    continue;
+                }
+                let seq_status = sequence_tracker.observe(seq);
+                if let Some(probe) = probe.as_mut() {
+                    probe.note_sequence(seq_status);
+                }
+                if should_recover_from_sequence_status(seq_status) && !args.no_inject {
+                    let failures = release_all_pressed_inputs(&mut enigo, &mut input_state);
+                    if failures > 0 {
+                        warn!("sequence anomaly recovery had {failures} injection failure(s)");
+                        replay_failures
+                            .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
+                            .await;
+                    }
+                    edge_push.reset();
+                    last_signaled_edge = None;
+                    input_overlay.clear();
+                }
+                if should_center_client_pointer(args.no_inject)
+                    && let Err(err) = center_client_pointer(&mut enigo)
+                {
+                    warn!("failed centering client pointer: {err:#}");
+                    replay_failures
+                        .report(&connection, ReplayFailureKind::CenterPointer, 1)
+                        .await;
+                }
+                debug!("client processed center-pointer sequence {seq}");
+            }
             HostToClientMessage::ReleaseAll { seq } => {
                 let seq_status = sequence_tracker.observe(seq);
                 if let Some(probe) = probe.as_mut() {
@@ -669,6 +701,28 @@ fn move_mouse_relative(enigo: &mut Enigo, dx: i32, dy: i32, drag_button: Option<
         }
     }
     enigo.mouse_move_relative(dx, dy);
+}
+
+fn center_client_pointer(_enigo: &mut Enigo) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_inject::center_pointer().context("native macOS centering failed")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Enigo 0.1 exposes only the primary display dimensions on these platforms.
+        let (width, height) = _enigo.main_display_size();
+        if width <= 0 || height <= 0 {
+            bail!("client display size is zero");
+        }
+        _enigo.mouse_move_to(width / 2, height / 2);
+        Ok(())
+    }
+}
+
+fn should_center_client_pointer(no_inject: bool) -> bool {
+    !no_inject
 }
 
 fn active_drag_button(state: &ClientInputState) -> Option<Button> {
@@ -1349,6 +1403,12 @@ pub(crate) async fn run_test_inject() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_inject_mode_does_not_center_client_pointer() {
+        assert!(!should_center_client_pointer(true));
+        assert!(should_center_client_pointer(false));
+    }
 
     #[test]
     fn detect_client_edge_push_left_when_blocked() {
