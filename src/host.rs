@@ -20,7 +20,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     cli::HostArgs,
-    input::{normalize_non_motion_event, parse_detach_chord, run_input_grab},
+    clipboard,
+    input::{
+        normalize_non_motion_event, parse_clipboard_chord, parse_detach_chord, run_input_grab,
+    },
     ipc::{
         IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
         run_control_socket, send_ipc,
@@ -29,14 +32,14 @@ use crate::{
     macos_mouse_delta::run_macos_mouse_delta_capture,
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
-        ActiveTarget, CapturedEvent, CapturedInput, HostState, RemotePeer, RemotePointerMode,
-        RuntimeStats, ScreenEdge, Side,
+        ActiveTarget, CapturedEvent, CapturedInput, HostState, PendingClipboardRequest, RemotePeer,
+        RemotePointerMode, RuntimeStats, ScreenEdge, Side,
     },
     presentation::print_host_ready,
     protocol::{
         ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
-        MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, ModifierFlags, WireEvent, WireKey,
-        read_framed_with_limit, write_framed,
+        MAX_AUTH_MSG_SIZE, MAX_CLIPBOARD_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, ModifierFlags, WireEvent,
+        WireKey, read_framed_with_limit, write_framed,
     },
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
 };
@@ -78,6 +81,14 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
             state_path.display()
         )
     })?;
+    let clipboard_chord =
+        parse_clipboard_chord(&persisted_state.clipboard_key).with_context(|| {
+            format!(
+                "invalid clipboard_key {:?} in {}",
+                persisted_state.clipboard_key,
+                state_path.display()
+            )
+        })?;
 
     let active_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let remote_pointer_mode = Arc::new(AtomicU8::new(persisted_state.remote_pointer_mode.to_u8()));
@@ -87,6 +98,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let next_remote_generation = Arc::new(AtomicU64::new(1));
     let pending_release_sides = Arc::new(AtomicU8::new(0));
+    let last_remote_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
+    let target_epoch = Arc::new(AtomicU64::new(0));
+    let next_clipboard_request = Arc::new(AtomicU64::new(1));
+    let pending_clipboard_request = Arc::new(Mutex::new(None));
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -103,6 +118,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         remotes: remotes.clone(),
         next_remote_generation: next_remote_generation.clone(),
         pending_release_sides: pending_release_sides.clone(),
+        last_remote_target: last_remote_target.clone(),
+        target_epoch: target_epoch.clone(),
+        next_clipboard_request: next_clipboard_request.clone(),
+        pending_clipboard_request: pending_clipboard_request.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -117,11 +136,14 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let mouse_delta_tx = input_tx.clone();
 
         let input_active_target = active_target.clone();
+        let input_target_epoch = target_epoch.clone();
         let input_pointer_lock_active = pointer_lock_active.clone();
         let input_pointer_hidden = pointer_hidden.clone();
         let input_pinned_pointer_pos = pinned_pointer_pos.clone();
         let input_pending_release_sides = pending_release_sides.clone();
+        let input_pending_clipboard_request = pending_clipboard_request.clone();
         let input_detach_chord = detach_chord.clone();
+        let input_clipboard_chord = clipboard_chord.clone();
         let input_runtime_stats = runtime_stats.clone();
         let input_edge_config =
             crate::input::HostEdgeConfig::new(args.edge_zone_px, args.edge_dwell_ms);
@@ -130,11 +152,14 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 input_tx,
                 input_runtime_stats,
                 input_active_target,
+                input_target_epoch,
                 input_pointer_lock_active,
                 input_pointer_hidden,
                 input_pinned_pointer_pos,
                 input_pending_release_sides,
+                input_pending_clipboard_request,
                 input_detach_chord,
+                input_clipboard_chord,
                 input_edge_config,
             ) {
                 error!("input grab stopped: {err:#}");
@@ -258,6 +283,7 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
             },
         );
         if let Some(previous) = previous {
+            clear_pending_clipboard_request(&state, auth.side, previous.generation);
             let seq = previous.next_seq.fetch_add(1, Ordering::Relaxed);
             let _ = previous
                 .input_tx
@@ -304,6 +330,7 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
             is_current_remote(remotes.get(&auth.side), remote_id, feedback_generation);
         if removed_current {
             remotes.remove(&auth.side);
+            clear_pending_clipboard_request(&state, auth.side, feedback_generation);
         }
 
         if removed_current
@@ -337,7 +364,9 @@ async fn run_client_feedback_loop(
 ) -> Result<()> {
     loop {
         let mut recv = connection.accept_uni().await?;
-        let bytes = recv.read_to_end(MAX_FEEDBACK_MSG_SIZE).await?;
+        let bytes = recv
+            .read_to_end(MAX_CLIPBOARD_MSG_SIZE.max(MAX_FEEDBACK_MSG_SIZE))
+            .await?;
         let message: ClientToHostMessage = bincode::deserialize(&bytes)?;
         let is_current = {
             let remotes = state.remotes.read().await;
@@ -362,6 +391,44 @@ async fn run_client_feedback_loop(
                     "remote replay failure on {:?} ({}): kind={kind:?} count={count}",
                     side, peer_name
                 );
+            }
+            ClientToHostMessage::ClipboardData { request_id, text } => {
+                let mut pending_guard = state
+                    .pending_clipboard_request
+                    .lock()
+                    .expect("clipboard request mutex poisoned");
+                let valid = pending_guard.as_ref().is_some_and(|pending| {
+                    clipboard_response_matches(
+                        *pending,
+                        request_id,
+                        side,
+                        generation,
+                        state.target_epoch.load(Ordering::Acquire),
+                        ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+                    )
+                });
+                if !valid {
+                    debug!("ignoring stale clipboard response {request_id}");
+                    continue;
+                }
+                pending_guard.take();
+                drop(pending_guard);
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        clipboard::write_text(&text)
+                            .and_then(|_| crate::macos_inject::inject_paste())
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!("failed to paste clipboard response {request_id}: {err:#}");
+                        }
+                        Err(err) => {
+                            warn!("clipboard paste task failed {request_id}: {err:#}");
+                        }
+                    }
+                });
             }
         }
     }
@@ -471,6 +538,9 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
                     CapturedEvent::HostEdgeReached { edge } => {
                         maybe_switch_to_remote_on_host_edge(&state, edge).await;
                     }
+                    CapturedEvent::ClipboardPaste => {
+                        handle_clipboard_paste(&state, captured.target).await;
+                    }
                     CapturedEvent::Raw(event) => {
                         let Some(side) = captured.target.to_side() else {
                             continue;
@@ -528,6 +598,130 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
     }
 }
 
+async fn handle_clipboard_paste(state: &HostState, target: ActiveTarget) {
+    let request_id = state.next_clipboard_request.fetch_add(1, Ordering::Relaxed);
+    let side = match target.to_side() {
+        Some(side) => side,
+        None => match connected_clipboard_source(state).await {
+            Some((side, _)) => side,
+            None => {
+                warn!("clipboard paste requested locally without a connected remote source");
+                return;
+            }
+        },
+    };
+
+    if target.to_side().is_some() {
+        let target_epoch = state.target_epoch.load(Ordering::Acquire);
+        let text = match tokio::task::spawn_blocking(clipboard::read_text).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(err)) => {
+                warn!("failed to read host clipboard: {err:#}");
+                return;
+            }
+            Err(err) => {
+                warn!("host clipboard read task failed: {err:#}");
+                return;
+            }
+        };
+        if ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)) != target
+            || state.target_epoch.load(Ordering::Acquire) != target_epoch
+        {
+            debug!("discarding clipboard paste after target changed");
+            return;
+        }
+        let _ = send_to_side(
+            state,
+            side,
+            HostToClientMessage::ClipboardPaste { request_id, text },
+            false,
+        )
+        .await;
+    } else {
+        let Some((_, peer)) = connected_clipboard_source(state).await else {
+            return;
+        };
+        let pending = PendingClipboardRequest {
+            request_id,
+            side,
+            generation: peer.generation,
+            target_epoch: state.target_epoch.load(Ordering::Acquire),
+        };
+        *state
+            .pending_clipboard_request
+            .lock()
+            .expect("clipboard request mutex poisoned") = Some(pending);
+        if !send_to_side(
+            state,
+            side,
+            HostToClientMessage::ClipboardRequest { request_id },
+            false,
+        )
+        .await
+        {
+            state
+                .pending_clipboard_request
+                .lock()
+                .expect("clipboard request mutex poisoned")
+                .take();
+        }
+    }
+}
+
+fn clear_pending_clipboard_request(state: &HostState, side: Side, generation: u64) {
+    let mut pending = state
+        .pending_clipboard_request
+        .lock()
+        .expect("clipboard request mutex poisoned");
+    if pending.is_some_and(|request| request.side == side && request.generation == generation) {
+        pending.take();
+    }
+}
+
+async fn connected_clipboard_source(state: &HostState) -> Option<(Side, RemotePeer)> {
+    let preferred =
+        ActiveTarget::from_u8(state.last_remote_target.load(Ordering::Acquire)).to_side();
+    let remotes = state.remotes.read().await;
+    let generations = remotes
+        .iter()
+        .map(|(side, peer)| (*side, peer.generation))
+        .collect::<HashMap<_, _>>();
+    let side = choose_clipboard_side(ActiveTarget::Local, preferred, &generations)?;
+    remotes.get(&side).cloned().map(|peer| (side, peer))
+}
+
+fn choose_clipboard_side(
+    target: ActiveTarget,
+    last_remote_target: Option<Side>,
+    remote_generations: &HashMap<Side, u64>,
+) -> Option<Side> {
+    target
+        .to_side()
+        .filter(|side| remote_generations.contains_key(side))
+        .or_else(|| last_remote_target.filter(|side| remote_generations.contains_key(side)))
+        .or_else(|| {
+            remote_generations
+                .iter()
+                .max_by_key(|(_, generation)| *generation)
+                .map(|(side, _)| *side)
+        })
+}
+
+fn clipboard_response_matches(
+    pending: PendingClipboardRequest,
+    request_id: u64,
+    side: Side,
+    generation: u64,
+    target_epoch: u64,
+    active_target: ActiveTarget,
+) -> bool {
+    pending.request_id == request_id
+        && pending.side == side
+        && pending.generation == generation
+        && pending.target_epoch == target_epoch
+        && active_target == ActiveTarget::Local
+}
+
 fn is_stale_captured_target(captured_target: ActiveTarget, current_target: ActiveTarget) -> bool {
     captured_target != current_target
 }
@@ -560,7 +754,9 @@ fn side_requiring_ordered_flush(captured: &CapturedInput) -> Option<Side> {
         CapturedEvent::Raw(_)
         | CapturedEvent::MouseButton { .. }
         | CapturedEvent::MouseWheel { .. } => captured.target.to_side(),
-        CapturedEvent::MouseMoveRelative { .. } | CapturedEvent::HostEdgeReached { .. } => None,
+        CapturedEvent::MouseMoveRelative { .. }
+        | CapturedEvent::HostEdgeReached { .. }
+        | CapturedEvent::ClipboardPaste => None,
     }
 }
 
@@ -666,6 +862,8 @@ fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessag
             HostToClientMessage::RelativeMotion { seq, dx, dy }
         }
         HostToClientMessage::ReleaseAll { .. } => HostToClientMessage::ReleaseAll { seq },
+        message @ HostToClientMessage::ClipboardPaste { .. }
+        | message @ HostToClientMessage::ClipboardRequest { .. } => message,
     }
 }
 
@@ -1036,6 +1234,10 @@ mod tests {
             )]))),
             next_remote_generation: Arc::new(AtomicU64::new(2)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            last_remote_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            target_epoch: Arc::new(AtomicU64::new(0)),
+            next_clipboard_request: Arc::new(AtomicU64::new(1)),
+            pending_clipboard_request: Arc::new(Mutex::new(None)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -1068,6 +1270,69 @@ mod tests {
         assert!(is_host_facing_edge(Side::Down, ScreenEdge::Up));
         assert!(!is_host_facing_edge(Side::Right, ScreenEdge::Right));
         assert!(!is_host_facing_edge(Side::Up, ScreenEdge::Up));
+    }
+
+    #[test]
+    fn clipboard_uses_active_remote_or_last_connected_remote() {
+        let remotes = HashMap::from([(Side::Left, 1), (Side::Right, 2)]);
+        assert_eq!(
+            choose_clipboard_side(ActiveTarget::Right, Some(Side::Left), &remotes),
+            Some(Side::Right)
+        );
+        assert_eq!(
+            choose_clipboard_side(ActiveTarget::Local, Some(Side::Left), &remotes),
+            Some(Side::Left)
+        );
+        assert_eq!(
+            choose_clipboard_side(ActiveTarget::Local, Some(Side::Down), &remotes),
+            Some(Side::Right)
+        );
+        assert_eq!(
+            choose_clipboard_side(ActiveTarget::Local, None, &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn clipboard_response_rejects_focus_or_generation_changes() {
+        let pending = PendingClipboardRequest {
+            request_id: 7,
+            side: Side::Right,
+            generation: 3,
+            target_epoch: 2,
+        };
+        assert!(clipboard_response_matches(
+            pending,
+            7,
+            Side::Right,
+            3,
+            2,
+            ActiveTarget::Local
+        ));
+        assert!(!clipboard_response_matches(
+            pending,
+            7,
+            Side::Right,
+            4,
+            2,
+            ActiveTarget::Local
+        ));
+        assert!(!clipboard_response_matches(
+            pending,
+            7,
+            Side::Right,
+            3,
+            3,
+            ActiveTarget::Local
+        ));
+        assert!(!clipboard_response_matches(
+            pending,
+            7,
+            Side::Right,
+            3,
+            2,
+            ActiveTarget::Right
+        ));
     }
 
     #[test]

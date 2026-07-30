@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Added clipboard paste between host and client machines with a configurable shortcut.
+
 ## v0.2.0 - 2026-07-21
 
 - Added native macOS semantic keyboard and mouse forwarding.

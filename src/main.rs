@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod attach;
 mod cli;
+mod clipboard;
 mod dev;
 mod host;
 mod host_mouse;

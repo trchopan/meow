@@ -159,6 +159,7 @@ pub(crate) enum CapturedEvent {
     MouseWheel { delta_x: i64, delta_y: i64 },
     MouseMoveRelative { dx: i32, dy: i32 },
     HostEdgeReached { edge: ScreenEdge },
+    ClipboardPaste,
 }
 
 #[derive(Clone)]
@@ -181,9 +182,21 @@ pub(crate) struct HostState {
     pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
     pub(crate) next_remote_generation: Arc<AtomicU64>,
     pub(crate) pending_release_sides: Arc<AtomicU8>,
+    pub(crate) last_remote_target: Arc<AtomicU8>,
+    pub(crate) target_epoch: Arc<AtomicU64>,
+    pub(crate) next_clipboard_request: Arc<AtomicU64>,
+    pub(crate) pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
     pub(crate) runtime_stats: Arc<RuntimeStats>,
     pub(crate) shutdown_requested: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingClipboardRequest {
+    pub(crate) request_id: u64,
+    pub(crate) side: Side,
+    pub(crate) generation: u64,
+    pub(crate) target_epoch: u64,
 }
 
 #[derive(Default)]

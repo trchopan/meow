@@ -199,6 +199,19 @@ fn persist_pointer_mode(endpoint_id: iroh::EndpointId, mode: RemotePointerMode) 
 
 pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, context: &str) {
     let previous_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
+    if previous_target != target {
+        state.target_epoch.fetch_add(1, Ordering::AcqRel);
+        state
+            .pending_clipboard_request
+            .lock()
+            .expect("clipboard request mutex poisoned")
+            .take();
+    }
+    if let Some(side) = target.to_side() {
+        state
+            .last_remote_target
+            .store(ActiveTarget::from(side).to_u8(), Ordering::Relaxed);
+    }
     if let Some(previous_side) = previous_target.to_side()
         && target.to_side() != Some(previous_side)
     {
@@ -319,7 +332,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::sync::{Notify, RwLock};
 
-    use crate::model::{HostState, RuntimeStats};
+    use crate::model::{HostState, PendingClipboardRequest, RuntimeStats};
 
     fn test_host_state() -> HostState {
         HostState {
@@ -332,6 +345,10 @@ mod tests {
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
             next_remote_generation: Arc::new(AtomicU64::new(1)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            last_remote_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            target_epoch: Arc::new(AtomicU64::new(0)),
+            next_clipboard_request: Arc::new(AtomicU64::new(1)),
+            pending_clipboard_request: Arc::new(std::sync::Mutex::new(None)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -366,8 +383,25 @@ mod tests {
     #[test]
     fn target_change_records_release_for_previous_remote_side() {
         let state = test_host_state();
+        *state
+            .pending_clipboard_request
+            .lock()
+            .expect("clipboard request mutex poisoned") = Some(PendingClipboardRequest {
+            request_id: 1,
+            side: Side::Right,
+            generation: 1,
+            target_epoch: 0,
+        });
         apply_target_change(&state, ActiveTarget::Right, "test attach");
         assert_eq!(state.pending_release_sides.load(Ordering::Acquire), 0);
+        assert_eq!(state.target_epoch.load(Ordering::Acquire), 1);
+        assert!(
+            state
+                .pending_clipboard_request
+                .lock()
+                .expect("clipboard request mutex poisoned")
+                .is_none()
+        );
 
         apply_target_change(&state, ActiveTarget::Local, "test detach");
         assert_eq!(

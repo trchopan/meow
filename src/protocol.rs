@@ -8,6 +8,7 @@ pub(crate) const ALPN: &[u8] = b"meow/remote-input/2";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
+pub(crate) const MAX_CLIPBOARD_MSG_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AuthRequest {
@@ -27,6 +28,8 @@ pub(crate) enum HostToClientMessage {
     Event { seq: u64, event: WireEvent },
     RelativeMotion { seq: u64, dx: i32, dy: i32 },
     ReleaseAll { seq: u64 },
+    ClipboardPaste { request_id: u64, text: String },
+    ClipboardRequest { request_id: u64 },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +92,7 @@ pub(crate) enum ReplayFailureKind {
 pub(crate) enum ClientToHostMessage {
     ClientEdgeReached { edge: ScreenEdge },
     ReplayFailure { kind: ReplayFailureKind, count: u64 },
+    ClipboardData { request_id: u64, text: String },
 }
 
 pub(crate) async fn send_client_feedback(
@@ -113,10 +117,10 @@ pub(crate) async fn write_framed<T: Serialize>(
     Ok(())
 }
 
-pub(crate) async fn read_framed_with_size<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn read_framed_with_clipboard_size<T: for<'de> Deserialize<'de>>(
     stream: &mut iroh::endpoint::RecvStream,
 ) -> Result<(T, usize)> {
-    read_framed_with_size_limit(stream, MAX_INPUT_MSG_SIZE).await
+    read_framed_with_size_limit(stream, MAX_INPUT_MSG_SIZE.max(MAX_CLIPBOARD_MSG_SIZE)).await
 }
 
 pub(crate) async fn read_framed_with_limit<T: for<'de> Deserialize<'de>>(
@@ -203,6 +207,31 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_messages_round_trip_serde() {
+        let outbound = HostToClientMessage::ClipboardPaste {
+            request_id: 12,
+            text: "hello".to_string(),
+        };
+        let bytes = bincode::serialize(&outbound).expect("serialize");
+        let round_trip: HostToClientMessage = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(
+            round_trip,
+            HostToClientMessage::ClipboardPaste { request_id: 12, text } if text == "hello"
+        ));
+
+        let response = ClientToHostMessage::ClipboardData {
+            request_id: 12,
+            text: "hello".to_string(),
+        };
+        let bytes = bincode::serialize(&response).expect("serialize");
+        let round_trip: ClientToHostMessage = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(
+            round_trip,
+            ClientToHostMessage::ClipboardData { request_id: 12, text } if text == "hello"
+        ));
+    }
+
+    #[test]
     fn client_edge_feedback_round_trip_serde() {
         let msg = ClientToHostMessage::ClientEdgeReached {
             edge: ScreenEdge::Left,
@@ -215,6 +244,9 @@ mod tests {
             }
             ClientToHostMessage::ReplayFailure { .. } => {
                 panic!("unexpected replay failure feedback")
+            }
+            ClientToHostMessage::ClipboardData { .. } => {
+                panic!("unexpected clipboard feedback")
             }
         }
     }
