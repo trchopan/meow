@@ -61,6 +61,7 @@ You can switch active targets from the host with directional commands (`meow rig
 - Persistent host identity and attach secret.
 - Local control socket for status and runtime control commands.
 - Optional remote input overlay for displaying pressed keys and buttons.
+- Clipboard paste between host and client machines with `ctrl+alt+cmd+p`.
 
 ## Requirements
 
@@ -212,11 +213,24 @@ Example `host_state.json`:
   "endpoint_id": "...",
   "attach_secret": "...",
   "detach_key": "ctrl+alt+cmd+l",
+  "clipboard_key": "ctrl+alt+cmd+p",
   "remote_pointer_mode": "edge_to_edge"
 }
 ```
 
 `detach_key` format is `modifier+modifier+key` (case-insensitive). Supported modifiers: `ctrl`, `alt`, `cmd` (or `meta`, `super`, `win`), `shift`. Supported keys: `a-z`, `0-9`, `space`, `tab`, `enter`, `escape`.
+
+## Clipboard Paste
+
+Press `ctrl+alt+cmd+p` to transfer plain-text clipboard contents and paste them into the
+currently focused application. When a client is focused, the host clipboard is pasted on
+that client. When the host is focused, the clipboard is read from the most recently active
+client and pasted on the host.
+
+The shortcut can be customized with `clipboard_key` in `host_state.json`, using the same
+format as `detach_key`. Clipboard synchronization currently supports plain text and limits
+payloads to approximately 900 KiB. Clipboard requests are authorized by the existing attach
+secret, so only attach clients that trust the host should be connected.
 
 Use `meow reset-identity` (while daemon is stopped) to remove identity files and force a new host id on the next `meow host` run.
 

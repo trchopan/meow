@@ -15,10 +15,14 @@ use tracing::{info, warn};
 
 use crate::{
     host_mouse,
-    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats, ScreenEdge, Side},
+    model::{
+        ActiveTarget, CapturedEvent, CapturedInput, PendingClipboardRequest, RuntimeStats,
+        ScreenEdge, Side,
+    },
 };
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
+pub(crate) const DEFAULT_CLIPBOARD_KEY: &str = "ctrl+alt+cmd+p";
 pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
 pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
 const EDGE_REARM_DISTANCE_MULTIPLIER: u32 = 2;
@@ -53,20 +57,25 @@ pub(crate) fn run_input_grab(
     tx: mpsc::Sender<CapturedInput>,
     runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
+    target_epoch: Arc<AtomicU64>,
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pending_release_sides: Arc<AtomicU8>,
+    pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
     detach_chord: DetachChord,
+    clipboard_chord: DetachChord,
     edge_config: HostEdgeConfig,
 ) -> Result<()> {
     let send_ctx = CaptureSendContext {
         runtime_stats: runtime_stats.clone(),
         active_target: active_target.clone(),
+        target_epoch: target_epoch.clone(),
         pointer_lock_active: pointer_lock_active.clone(),
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
         pending_release_sides: pending_release_sides.clone(),
+        pending_clipboard_request: pending_clipboard_request.clone(),
     };
 
     let pressed_keys: Arc<Mutex<HashSet<Key>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -138,6 +147,8 @@ pub(crate) fn run_input_grab(
     });
 
     let callback_previous_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
+    let clipboard_key_active = Arc::new(AtomicBool::new(false));
+    let callback_clipboard_key_active = clipboard_key_active.clone();
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         runtime_stats
             .captured_events
@@ -181,6 +192,11 @@ pub(crate) fn run_input_grab(
         {
             let previous_target = target;
             active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+            target_epoch.fetch_add(1, Ordering::AcqRel);
+            pending_clipboard_request
+                .lock()
+                .expect("clipboard request mutex poisoned")
+                .take();
             if let Some(side) = previous_target.to_side() {
                 pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
             }
@@ -204,6 +220,37 @@ pub(crate) fn run_input_grab(
                 detach_chord.config_value, previous_target
             );
             return None;
+        }
+
+        if cfg!(target_os = "macos") {
+            let clipboard_modifiers_match = (!clipboard_chord.ctrl || is_ctrl_down)
+                && (!clipboard_chord.alt || is_alt_down)
+                && (!clipboard_chord.meta || is_meta_down)
+                && (!clipboard_chord.shift || is_shift_down);
+            match event.event_type {
+                EventType::KeyPress(key)
+                    if key == clipboard_chord.key && clipboard_modifiers_match =>
+                {
+                    callback_clipboard_key_active.store(true, Ordering::Relaxed);
+                    try_send_captured_input(
+                        &tx,
+                        &send_ctx,
+                        CapturedInput {
+                            target,
+                            event: CapturedEvent::ClipboardPaste,
+                        },
+                    );
+                    return None;
+                }
+                EventType::KeyRelease(key)
+                    if key == clipboard_chord.key
+                        && callback_clipboard_key_active.load(Ordering::Relaxed) =>
+                {
+                    callback_clipboard_key_active.store(false, Ordering::Relaxed);
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         match target {
@@ -359,10 +406,12 @@ fn try_send_captured_input_with_policy(
                 .fetch_add(1, Ordering::Relaxed);
             force_local_on_capture_saturation(
                 &send_ctx.active_target,
+                &send_ctx.target_epoch,
                 &send_ctx.pointer_lock_active,
                 &send_ctx.pointer_hidden,
                 &send_ctx.pinned_pointer_pos,
                 &send_ctx.pending_release_sides,
+                &send_ctx.pending_clipboard_request,
             );
             send_ctx
                 .runtime_stats
@@ -407,18 +456,22 @@ fn try_send_host_edge(
 struct CaptureSendContext {
     runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
+    target_epoch: Arc<AtomicU64>,
     pointer_lock_active: Arc<AtomicBool>,
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pending_release_sides: Arc<AtomicU8>,
+    pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
 }
 
 fn force_local_on_capture_saturation(
     active_target: &Arc<AtomicU8>,
+    target_epoch: &Arc<AtomicU64>,
     pointer_lock_active: &Arc<AtomicBool>,
     pointer_hidden: &Arc<AtomicBool>,
     pinned_pointer_pos: &Arc<Mutex<Option<(f64, f64)>>>,
     pending_release_sides: &Arc<AtomicU8>,
+    pending_clipboard_request: &Arc<Mutex<Option<PendingClipboardRequest>>>,
 ) {
     let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
     if matches!(target, ActiveTarget::Local) {
@@ -426,6 +479,11 @@ fn force_local_on_capture_saturation(
     }
 
     active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
+    target_epoch.fetch_add(1, Ordering::AcqRel);
+    pending_clipboard_request
+        .lock()
+        .expect("clipboard request mutex poisoned")
+        .take();
     if let Some(side) = target.to_side() {
         pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
     }
@@ -445,6 +503,14 @@ fn force_local_on_capture_saturation(
 }
 
 pub(crate) fn parse_detach_chord(chord: &str) -> Result<DetachChord> {
+    parse_chord(chord, "detach_key", DEFAULT_DETACH_KEY)
+}
+
+pub(crate) fn parse_clipboard_chord(chord: &str) -> Result<DetachChord> {
+    parse_chord(chord, "clipboard_key", DEFAULT_CLIPBOARD_KEY)
+}
+
+fn parse_chord(chord: &str, setting_name: &str, example: &str) -> Result<DetachChord> {
     let mut ctrl = false;
     let mut alt = false;
     let mut meta = false;
@@ -454,7 +520,7 @@ pub(crate) fn parse_detach_chord(chord: &str) -> Result<DetachChord> {
     for token in chord.split('+') {
         let token = token.trim().to_ascii_lowercase();
         if token.is_empty() {
-            bail!("detach_key contains an empty token")
+            bail!("{setting_name} contains an empty token")
         }
         match token.as_str() {
             "ctrl" | "control" => ctrl = true,
@@ -463,19 +529,15 @@ pub(crate) fn parse_detach_chord(chord: &str) -> Result<DetachChord> {
             "shift" => shift = true,
             _ => {
                 if key.is_some() {
-                    bail!("detach_key must include exactly one non-modifier key")
+                    bail!("{setting_name} must include exactly one non-modifier key")
                 }
                 key = Some(parse_detach_key(&token)?);
             }
         }
     }
 
-    let key = key.ok_or_else(|| {
-        anyhow!(
-            "detach_key must include a key, for example {}",
-            DEFAULT_DETACH_KEY
-        )
-    })?;
+    let key =
+        key.ok_or_else(|| anyhow!("{setting_name} must include a key, for example {example}"))?;
     Ok(DetachChord {
         key,
         ctrl,
@@ -540,6 +602,10 @@ pub(crate) fn parse_detach_key(token: &str) -> Result<Key> {
 
 pub(crate) fn default_detach_key() -> String {
     DEFAULT_DETACH_KEY.to_string()
+}
+
+pub(crate) fn default_clipboard_key() -> String {
+    DEFAULT_CLIPBOARD_KEY.to_string()
 }
 
 pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
@@ -683,6 +749,14 @@ mod tests {
         assert!(chord.meta);
         assert!(!chord.shift);
         assert_eq!(chord.config_value, "Ctrl+Alt+Cmd+L");
+    }
+
+    #[test]
+    fn default_clipboard_chord_is_ctrl_alt_cmd_p() {
+        let chord = parse_clipboard_chord(&default_clipboard_key()).expect("valid clipboard chord");
+        assert_eq!(chord.key, Key::KeyP);
+        assert!(chord.ctrl && chord.alt && chord.meta);
+        assert!(!chord.shift);
     }
 
     #[test]
@@ -1009,10 +1083,12 @@ mod tests {
         let send_ctx = CaptureSendContext {
             runtime_stats: Arc::new(RuntimeStats::default()),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            target_epoch: Arc::new(AtomicU64::new(0)),
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(Mutex::new(None)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            pending_clipboard_request: Arc::new(Mutex::new(None)),
         };
         let mut tracker = EdgeZoneTracker::new();
         let start = Instant::now();

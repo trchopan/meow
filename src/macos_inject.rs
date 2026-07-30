@@ -88,6 +88,25 @@ mod imp {
         Ok(())
     }
 
+    pub(crate) fn inject_paste() -> Result<()> {
+        let modifiers = ModifierFlags {
+            left_meta: true,
+            ..ModifierFlags::default()
+        };
+        inject_key_with_modifiers(
+            keycode(Key::KeyV).ok_or_else(|| anyhow!("missing V keycode"))?,
+            true,
+            false,
+            &modifiers,
+        )?;
+        inject_key_with_modifiers(
+            keycode(Key::KeyV).ok_or_else(|| anyhow!("missing V keycode"))?,
+            false,
+            false,
+            &modifiers,
+        )
+    }
+
     pub(crate) fn inject_relative_move_with_button(
         dx: i32,
         dy: i32,
@@ -313,6 +332,10 @@ mod imp {
         None
     }
 
+    pub(crate) fn inject_paste() -> Result<()> {
+        Err(anyhow!("paste injection is only supported on macOS"))
+    }
+
     pub(crate) fn inject_key_with_modifiers(
         _keycode: u16,
         _down: bool,
@@ -354,6 +377,10 @@ pub(crate) fn inject_key_with_modifiers(
     modifiers: &ModifierFlags,
 ) -> Result<()> {
     imp::inject_key_with_modifiers(keycode, down, repeat, modifiers)
+}
+
+pub(crate) fn inject_paste() -> Result<()> {
+    imp::inject_paste()
 }
 
 pub(crate) fn inject_relative_move_with_button(

@@ -11,13 +11,14 @@ use uuid::Uuid;
 
 use crate::{
     cli::AttachArgs,
+    clipboard,
     input_overlay::InputOverlay,
     macos_inject,
     model::ScreenEdge,
     protocol::{
         ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
-        MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, WireKey, read_framed_with_limit,
-        read_framed_with_size, send_client_feedback, write_framed,
+        MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, WireKey, read_framed_with_clipboard_size,
+        read_framed_with_limit, send_client_feedback, write_framed,
     },
 };
 
@@ -132,7 +133,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     Err(err) => break Err(err.into()),
                 }
             }
-            frame = read_framed_with_size(&mut recv) => frame,
+            frame = read_framed_with_clipboard_size(&mut recv) => frame,
         } {
             Ok(frame) => frame,
             Err(err) => break Err(err),
@@ -296,6 +297,47 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     }
                     input_overlay.clear();
                 }
+            }
+            HostToClientMessage::ClipboardPaste { request_id, text } => {
+                if args.no_inject {
+                    debug!("client skipped clipboard paste {request_id} in no-inject mode");
+                    continue;
+                }
+                let result = tokio::task::spawn_blocking(move || {
+                    clipboard::write_text(&text).and_then(|_| macos_inject::inject_paste())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!("failed to apply clipboard paste {request_id}: {err:#}");
+                    }
+                    Err(err) => {
+                        warn!("clipboard paste task failed {request_id}: {err:#}");
+                    }
+                }
+            }
+            HostToClientMessage::ClipboardRequest { request_id } => {
+                if args.no_inject {
+                    continue;
+                }
+                let feedback_connection = connection.clone();
+                tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(clipboard::read_text).await {
+                        Ok(Ok(text)) => {
+                            let message = ClientToHostMessage::ClipboardData { request_id, text };
+                            if let Err(err) =
+                                send_client_feedback(&feedback_connection, &message).await
+                            {
+                                warn!("failed sending clipboard response {request_id}: {err:#}");
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            warn!("failed to read client clipboard {request_id}: {err:#}")
+                        }
+                        Err(err) => warn!("clipboard read task failed {request_id}: {err:#}"),
+                    }
+                });
             }
         }
     };
