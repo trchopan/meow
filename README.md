@@ -62,6 +62,7 @@ You can switch active targets from the host with directional commands (`meow rig
 - Local control socket for status and runtime control commands.
 - Optional remote input overlay for displaying pressed keys and buttons.
 - Clipboard paste between host and client machines with `ctrl+alt+cmd+p`.
+- Directional target shortcuts with `ctrl+alt+cmd+<arrow key>`.
 
 ## Requirements
 
@@ -187,6 +188,16 @@ When input is forwarded to a remote machine, press `ctrl+alt+cmd+l` on the host 
 
 You can customize this by editing `detach_key` in `host_state.json`.
 
+Directional target switching is available with these default shortcuts:
+
+- `ctrl+alt+cmd+up` switches to `meow up`.
+- `ctrl+alt+cmd+down` switches to `meow down`.
+- `ctrl+alt+cmd+left` switches to `meow left`.
+- `ctrl+alt+cmd+right` switches to `meow right`.
+
+Customize them with `up_key`, `down_key`, `left_key`, and `right_key` in
+`host_state.json`.
+
 ## State Files
 
 `meow` stores host state in:
@@ -214,11 +225,15 @@ Example `host_state.json`:
   "attach_secret": "...",
   "detach_key": "ctrl+alt+cmd+l",
   "clipboard_key": "ctrl+alt+cmd+p",
+  "up_key": "ctrl+alt+cmd+up",
+  "down_key": "ctrl+alt+cmd+down",
+  "left_key": "ctrl+alt+cmd+left",
+  "right_key": "ctrl+alt+cmd+right",
   "remote_pointer_mode": "edge_to_edge"
 }
 ```
 
-`detach_key` format is `modifier+modifier+key` (case-insensitive). Supported modifiers: `ctrl`, `alt`, `cmd` (or `meta`, `super`, `win`), `shift`. Supported keys: `a-z`, `0-9`, `space`, `tab`, `enter`, `escape`.
+Shortcut format is `modifier+modifier+key` (case-insensitive). Supported modifiers: `ctrl`, `alt`, `cmd` (or `meta`, `super`, `win`), `shift`. Supported keys: `a-z`, `0-9`, `space`, `tab`, `enter`, `escape`, `up`, `down`, `left`, `right`.
 
 ## Clipboard Paste
 

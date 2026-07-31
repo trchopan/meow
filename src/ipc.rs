@@ -148,7 +148,7 @@ pub(crate) fn ensure_pointer_restored() {
 #[cfg(test)]
 pub(crate) fn ensure_pointer_restored() {}
 
-async fn switch_target(state: &HostState, target: ActiveTarget) -> IpcResponse {
+pub(crate) async fn switch_target(state: &HostState, target: ActiveTarget) -> IpcResponse {
     if let Some(side) = target.to_side() {
         let side_exists = {
             let remotes = state.remotes.read().await;

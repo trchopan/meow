@@ -10,7 +10,9 @@ use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 
 use crate::input::{
-    default_clipboard_key, default_detach_key, parse_clipboard_chord, parse_detach_chord,
+    default_clipboard_key, default_detach_key, default_down_key, default_left_key,
+    default_right_key, default_up_key, parse_clipboard_chord, parse_detach_chord,
+    parse_directional_chord,
 };
 use crate::model::RemotePointerMode;
 use crate::presentation::{print_identity_reset_complete, print_rotate_secret_complete};
@@ -30,6 +32,14 @@ pub(crate) struct PersistedHostState {
     pub(crate) remote_pointer_mode: RemotePointerMode,
     #[serde(default = "default_clipboard_key")]
     pub(crate) clipboard_key: String,
+    #[serde(default = "default_up_key")]
+    pub(crate) up_key: String,
+    #[serde(default = "default_down_key")]
+    pub(crate) down_key: String,
+    #[serde(default = "default_left_key")]
+    pub(crate) left_key: String,
+    #[serde(default = "default_right_key")]
+    pub(crate) right_key: String,
 }
 
 pub(crate) fn app_data_dir() -> Result<PathBuf> {
@@ -125,9 +135,12 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
     if state_path.exists() {
         let bytes = fs::read(&state_path)
             .with_context(|| format!("failed to read {}", state_path.display()))?;
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", state_path.display()))?;
         let state: PersistedHostState = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", state_path.display()))?;
-        let (state, changed) = repair_host_state_for_endpoint(state, endpoint_id);
+        let missing_shortcut = state_has_missing_directional_shortcuts(&raw);
+        let (state, repaired) = repair_host_state_for_endpoint(state, endpoint_id);
         parse_detach_chord(&state.detach_key).with_context(|| {
             format!(
                 "invalid detach_key {:?} in {}",
@@ -135,6 +148,18 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
                 state_path.display()
             )
         })?;
+        for (name, value) in [
+            ("up_key", &state.up_key),
+            ("down_key", &state.down_key),
+            ("left_key", &state.left_key),
+            ("right_key", &state.right_key),
+        ] {
+            parse_directional_chord(value, name, value).with_context(|| {
+                format!("invalid {name} {:?} in {}", value, state_path.display())
+            })?;
+        }
+        validate_shortcut_conflicts(&state)?;
+        let changed = repaired || missing_shortcut;
         parse_clipboard_chord(&state.clipboard_key).with_context(|| {
             format!(
                 "invalid clipboard_key {:?} in {}",
@@ -155,9 +180,60 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
         detach_key: default_detach_key(),
         remote_pointer_mode: default_remote_pointer_mode(),
         clipboard_key: default_clipboard_key(),
+        up_key: default_up_key(),
+        down_key: default_down_key(),
+        left_key: default_left_key(),
+        right_key: default_right_key(),
     };
     write_host_state_file(&state_path, &state)?;
     Ok(state)
+}
+
+fn validate_shortcut_conflicts(state: &PersistedHostState) -> Result<()> {
+    let shortcuts = [
+        ("detach_key", parse_detach_chord(&state.detach_key)?),
+        (
+            "clipboard_key",
+            parse_clipboard_chord(&state.clipboard_key)?,
+        ),
+        (
+            "up_key",
+            parse_directional_chord(&state.up_key, "up_key", &state.up_key)?,
+        ),
+        (
+            "down_key",
+            parse_directional_chord(&state.down_key, "down_key", &state.down_key)?,
+        ),
+        (
+            "left_key",
+            parse_directional_chord(&state.left_key, "left_key", &state.left_key)?,
+        ),
+        (
+            "right_key",
+            parse_directional_chord(&state.right_key, "right_key", &state.right_key)?,
+        ),
+    ];
+    for (index, (name, chord)) in shortcuts.iter().enumerate() {
+        for (other_name, other_chord) in shortcuts.iter().skip(index + 1) {
+            if chord.key == other_chord.key
+                && (modifiers_are_subset(chord, other_chord)
+                    || modifiers_are_subset(other_chord, chord))
+            {
+                bail!("shortcut conflict: {name} and {other_name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn state_has_missing_directional_shortcuts(raw: &serde_json::Value) -> bool {
+    ["up_key", "down_key", "left_key", "right_key"]
+        .iter()
+        .any(|key| raw.get(key).is_none())
+}
+
+fn modifiers_are_subset(a: &crate::input::DetachChord, b: &crate::input::DetachChord) -> bool {
+    (!a.ctrl || b.ctrl) && (!a.alt || b.alt) && (!a.meta || b.meta) && (!a.shift || b.shift)
 }
 
 pub(crate) fn write_host_state_file(path: &Path, state: &PersistedHostState) -> Result<()> {
@@ -267,6 +343,18 @@ fn repair_host_state_for_endpoint(
         changed = true;
     }
 
+    for (value, default) in [
+        (&mut state.up_key, default_up_key()),
+        (&mut state.down_key, default_down_key()),
+        (&mut state.left_key, default_left_key()),
+        (&mut state.right_key, default_right_key()),
+    ] {
+        if value.trim().is_empty() {
+            *value = default;
+            changed = true;
+        }
+    }
+
     (state, changed)
 }
 
@@ -288,6 +376,10 @@ mod tests {
             detach_key: " ".to_string(),
             remote_pointer_mode: RemotePointerMode::Confine,
             clipboard_key: " ".to_string(),
+            up_key: " ".to_string(),
+            down_key: " ".to_string(),
+            left_key: " ".to_string(),
+            right_key: " ".to_string(),
         };
 
         let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
@@ -296,6 +388,10 @@ mod tests {
         assert!(!repaired.attach_secret.trim().is_empty());
         assert_eq!(repaired.detach_key, default_detach_key());
         assert_eq!(repaired.clipboard_key, default_clipboard_key());
+        assert_eq!(repaired.up_key, default_up_key());
+        assert_eq!(repaired.down_key, default_down_key());
+        assert_eq!(repaired.left_key, default_left_key());
+        assert_eq!(repaired.right_key, default_right_key());
         assert_eq!(repaired.remote_pointer_mode, RemotePointerMode::Confine);
     }
 
@@ -309,6 +405,10 @@ mod tests {
             detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
             clipboard_key: default_clipboard_key(),
+            up_key: default_up_key(),
+            down_key: default_down_key(),
+            left_key: default_left_key(),
+            right_key: default_right_key(),
         };
 
         let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
@@ -327,6 +427,10 @@ mod tests {
             detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
             clipboard_key: default_clipboard_key(),
+            up_key: default_up_key(),
+            down_key: default_down_key(),
+            left_key: default_left_key(),
+            right_key: default_right_key(),
         };
 
         let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
@@ -337,5 +441,50 @@ mod tests {
         assert_eq!(repaired.detach_key, default_detach_key());
         assert_eq!(repaired.remote_pointer_mode, default_remote_pointer_mode());
         assert_eq!(repaired.clipboard_key, default_clipboard_key());
+        assert_eq!(repaired.up_key, default_up_key());
+        assert_eq!(repaired.down_key, default_down_key());
+        assert_eq!(repaired.left_key, default_left_key());
+        assert_eq!(repaired.right_key, default_right_key());
+    }
+
+    #[test]
+    fn shortcut_conflicts_are_rejected_when_matching_can_overlap() {
+        let endpoint_id = sample_endpoint_id();
+        let state = PersistedHostState {
+            schema_version: 1,
+            endpoint_id: endpoint_id.to_string(),
+            attach_secret: "secret".to_string(),
+            detach_key: "ctrl+alt+cmd+l".to_string(),
+            remote_pointer_mode: default_remote_pointer_mode(),
+            clipboard_key: "ctrl+alt+cmd+p".to_string(),
+            up_key: "ctrl+alt+cmd+up".to_string(),
+            down_key: "ctrl+alt+cmd+down".to_string(),
+            left_key: "ctrl+alt+cmd+right".to_string(),
+            right_key: "ctrl+alt+cmd+right".to_string(),
+        };
+
+        let err = validate_shortcut_conflicts(&state).expect_err("conflict should fail");
+        assert!(err.to_string().contains("left_key and right_key"));
+    }
+
+    #[test]
+    fn legacy_state_is_detected_as_missing_directional_shortcuts() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "endpoint_id": "endpoint",
+            "attach_secret": "secret",
+            "detach_key": default_detach_key(),
+            "clipboard_key": default_clipboard_key(),
+            "remote_pointer_mode": "edge_to_edge"
+        });
+        assert!(state_has_missing_directional_shortcuts(&raw));
+        assert!(!state_has_missing_directional_shortcuts(
+            &serde_json::json!({
+                "up_key": default_up_key(),
+                "down_key": default_down_key(),
+                "left_key": default_left_key(),
+                "right_key": default_right_key()
+            })
+        ));
     }
 }

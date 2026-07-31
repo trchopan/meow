@@ -22,7 +22,8 @@ use crate::{
     cli::HostArgs,
     clipboard,
     input::{
-        normalize_non_motion_event, parse_clipboard_chord, parse_detach_chord, run_input_grab,
+        normalize_non_motion_event, parse_clipboard_chord, parse_detach_chord,
+        parse_directional_chord, run_input_grab,
     },
     ipc::{
         IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
@@ -89,6 +90,16 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 state_path.display()
             )
         })?;
+    let up_chord = parse_directional_chord(&persisted_state.up_key, "up_key", "ctrl+alt+cmd+up")?;
+    let down_chord =
+        parse_directional_chord(&persisted_state.down_key, "down_key", "ctrl+alt+cmd+down")?;
+    let left_chord =
+        parse_directional_chord(&persisted_state.left_key, "left_key", "ctrl+alt+cmd+left")?;
+    let right_chord = parse_directional_chord(
+        &persisted_state.right_key,
+        "right_key",
+        "ctrl+alt+cmd+right",
+    )?;
 
     let active_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let remote_pointer_mode = Arc::new(AtomicU8::new(persisted_state.remote_pointer_mode.to_u8()));
@@ -128,6 +139,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     };
 
     let (input_tx, input_rx) = mpsc::channel::<CapturedInput>(captured_input_channel_capacity());
+    let (directional_switch_tx, directional_switch_rx) = mpsc::unbounded_channel();
     if bench_flush_enabled() {
         tokio::spawn(run_bench_synthetic_input(input_tx.clone(), state.clone()));
     } else if dev_smoke_enabled() {
@@ -158,8 +170,13 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 input_pinned_pointer_pos,
                 input_pending_release_sides,
                 input_pending_clipboard_request,
+                directional_switch_tx,
                 input_detach_chord,
                 input_clipboard_chord,
+                up_chord,
+                down_chord,
+                left_chord,
+                right_chord,
                 input_edge_config,
             ) {
                 error!("input grab stopped: {err:#}");
@@ -187,7 +204,11 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         });
     }
 
-    tokio::spawn(run_forward_loop(input_rx, state.clone()));
+    tokio::spawn(run_forward_loop(
+        input_rx,
+        directional_switch_rx,
+        state.clone(),
+    ));
 
     let control_state = state.clone();
     tokio::spawn(async move {
@@ -479,7 +500,11 @@ fn is_host_facing_edge(side: Side, edge: ScreenEdge) -> bool {
     )
 }
 
-async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostState) {
+async fn run_forward_loop(
+    mut rx: mpsc::Receiver<CapturedInput>,
+    mut directional_switch_rx: mpsc::UnboundedReceiver<ActiveTarget>,
+    state: HostState,
+) {
     use tokio::time::{self, MissedTickBehavior};
 
     let mut pending_relative: HashMap<Side, (i32, i32)> = HashMap::new();
@@ -508,6 +533,12 @@ async fn run_forward_loop(mut rx: mpsc::Receiver<CapturedInput>, state: HostStat
             }
             _ = flush_tick.tick() => {
                 flush_pending_relative(&state, &mut pending_relative).await;
+            }
+            Some(target) = directional_switch_rx.recv() => {
+                let response = crate::ipc::switch_target(&state, target).await;
+                if !response.ok {
+                    warn!("directional shortcut failed: {}", response.message);
+                }
             }
                     maybe_captured = rx.recv() => {
                         let Some(captured) = maybe_captured else {
