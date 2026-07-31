@@ -21,12 +21,12 @@ use crate::{
     },
 };
 
-pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
+pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+u";
 pub(crate) const DEFAULT_CLIPBOARD_KEY: &str = "ctrl+alt+cmd+p";
-pub(crate) const DEFAULT_UP_KEY: &str = "ctrl+alt+cmd+up";
-pub(crate) const DEFAULT_DOWN_KEY: &str = "ctrl+alt+cmd+down";
-pub(crate) const DEFAULT_LEFT_KEY: &str = "ctrl+alt+cmd+left";
-pub(crate) const DEFAULT_RIGHT_KEY: &str = "ctrl+alt+cmd+right";
+pub(crate) const DEFAULT_UP_KEY: &str = "ctrl+alt+cmd+k";
+pub(crate) const DEFAULT_DOWN_KEY: &str = "ctrl+alt+cmd+j";
+pub(crate) const DEFAULT_LEFT_KEY: &str = "ctrl+alt+cmd+h";
+pub(crate) const DEFAULT_RIGHT_KEY: &str = "ctrl+alt+cmd+l";
 pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
 pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
 const EDGE_REARM_DISTANCE_MULTIPLIER: u32 = 2;
@@ -842,6 +842,13 @@ mod tests {
     }
 
     #[test]
+    fn default_detach_chord_is_ctrl_alt_cmd_u() {
+        let chord = parse_detach_chord(&default_detach_key()).expect("valid detach chord");
+        assert_eq!(chord.key, Key::KeyU);
+        assert!(chord.ctrl && chord.alt && chord.meta);
+    }
+
+    #[test]
     fn default_clipboard_chord_is_ctrl_alt_cmd_p() {
         let chord = parse_clipboard_chord(&default_clipboard_key()).expect("valid clipboard chord");
         assert_eq!(chord.key, Key::KeyP);
@@ -860,12 +867,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_directional_chord_accepts_arrow_keys() {
+    fn parse_directional_chord_accepts_vim_motion_keys() {
         for (value, key) in [
-            (default_up_key(), Key::UpArrow),
-            (default_down_key(), Key::DownArrow),
-            (default_left_key(), Key::LeftArrow),
-            (default_right_key(), Key::RightArrow),
+            (default_up_key(), Key::KeyK),
+            (default_down_key(), Key::KeyJ),
+            (default_left_key(), Key::KeyH),
+            (default_right_key(), Key::KeyL),
         ] {
             let chord =
                 parse_directional_chord(&value, "direction_key", &value).expect("valid chord");
@@ -876,11 +883,11 @@ mod tests {
 
     #[test]
     fn directional_chord_matching_requires_configured_modifiers() {
-        let chord = parse_directional_chord("ctrl+alt+cmd+up", "up_key", DEFAULT_UP_KEY)
+        let chord = parse_directional_chord("ctrl+alt+cmd+k", "up_key", DEFAULT_UP_KEY)
             .expect("valid chord");
         assert!(!chord_matches_key(
             &chord,
-            Key::UpArrow,
+            Key::KeyK,
             true,
             true,
             false,
@@ -888,7 +895,7 @@ mod tests {
         ));
         assert!(chord_matches_key(
             &chord,
-            Key::UpArrow,
+            Key::KeyK,
             true,
             true,
             true,
@@ -896,7 +903,7 @@ mod tests {
         ));
         assert!(!chord_matches_key(
             &chord,
-            Key::DownArrow,
+            Key::KeyJ,
             true,
             true,
             true,

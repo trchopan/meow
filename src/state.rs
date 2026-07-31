@@ -10,10 +10,17 @@ use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 
 use crate::input::{
+    DEFAULT_DETACH_KEY, DEFAULT_DOWN_KEY, DEFAULT_LEFT_KEY, DEFAULT_RIGHT_KEY, DEFAULT_UP_KEY,
     default_clipboard_key, default_detach_key, default_down_key, default_left_key,
     default_right_key, default_up_key, parse_clipboard_chord, parse_detach_chord,
     parse_directional_chord,
 };
+
+const LEGACY_DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
+const LEGACY_DEFAULT_UP_KEY: &str = "ctrl+alt+cmd+up";
+const LEGACY_DEFAULT_DOWN_KEY: &str = "ctrl+alt+cmd+down";
+const LEGACY_DEFAULT_LEFT_KEY: &str = "ctrl+alt+cmd+left";
+const LEGACY_DEFAULT_RIGHT_KEY: &str = "ctrl+alt+cmd+right";
 use crate::model::RemotePointerMode;
 use crate::presentation::{print_identity_reset_complete, print_rotate_secret_complete};
 
@@ -139,6 +146,7 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
             .with_context(|| format!("failed to parse {}", state_path.display()))?;
         let state: PersistedHostState = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", state_path.display()))?;
+        let (state, migrated) = migrate_shortcut_defaults(state, &raw);
         let missing_shortcut = state_has_missing_directional_shortcuts(&raw);
         let (state, repaired) = repair_host_state_for_endpoint(state, endpoint_id);
         parse_detach_chord(&state.detach_key).with_context(|| {
@@ -159,7 +167,7 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
             })?;
         }
         validate_shortcut_conflicts(&state)?;
-        let changed = repaired || missing_shortcut;
+        let changed = migrated || repaired || missing_shortcut;
         parse_clipboard_chord(&state.clipboard_key).with_context(|| {
             format!(
                 "invalid clipboard_key {:?} in {}",
@@ -187,6 +195,52 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
     };
     write_host_state_file(&state_path, &state)?;
     Ok(state)
+}
+
+fn migrate_shortcut_defaults(
+    mut state: PersistedHostState,
+    raw: &serde_json::Value,
+) -> (PersistedHostState, bool) {
+    let mut changed = false;
+    if (raw.get("detach_key").is_none() || state.detach_key == LEGACY_DEFAULT_DETACH_KEY)
+        && state.detach_key != DEFAULT_DETACH_KEY
+    {
+        state.detach_key = default_detach_key();
+        changed = true;
+    }
+
+    for (field, value, legacy, default) in [
+        (
+            "up_key",
+            &mut state.up_key,
+            LEGACY_DEFAULT_UP_KEY,
+            DEFAULT_UP_KEY,
+        ),
+        (
+            "down_key",
+            &mut state.down_key,
+            LEGACY_DEFAULT_DOWN_KEY,
+            DEFAULT_DOWN_KEY,
+        ),
+        (
+            "left_key",
+            &mut state.left_key,
+            LEGACY_DEFAULT_LEFT_KEY,
+            DEFAULT_LEFT_KEY,
+        ),
+        (
+            "right_key",
+            &mut state.right_key,
+            LEGACY_DEFAULT_RIGHT_KEY,
+            DEFAULT_RIGHT_KEY,
+        ),
+    ] {
+        if (raw.get(field).is_none() || *value == legacy) && *value != default {
+            *value = default.to_string();
+            changed = true;
+        }
+    }
+    (state, changed)
 }
 
 fn validate_shortcut_conflicts(state: &PersistedHostState) -> Result<()> {
@@ -486,5 +540,36 @@ mod tests {
                 "right_key": default_right_key()
             })
         ));
+    }
+
+    #[test]
+    fn legacy_shortcut_defaults_migrate_to_vim_defaults() {
+        let endpoint_id = sample_endpoint_id();
+        let raw = serde_json::json!({
+            "detach_key": LEGACY_DEFAULT_DETACH_KEY,
+            "up_key": LEGACY_DEFAULT_UP_KEY,
+            "down_key": LEGACY_DEFAULT_DOWN_KEY,
+            "left_key": LEGACY_DEFAULT_LEFT_KEY,
+            "right_key": LEGACY_DEFAULT_RIGHT_KEY
+        });
+        let state = PersistedHostState {
+            schema_version: 1,
+            endpoint_id: endpoint_id.to_string(),
+            attach_secret: "secret".to_string(),
+            detach_key: LEGACY_DEFAULT_DETACH_KEY.to_string(),
+            remote_pointer_mode: default_remote_pointer_mode(),
+            clipboard_key: default_clipboard_key(),
+            up_key: LEGACY_DEFAULT_UP_KEY.to_string(),
+            down_key: LEGACY_DEFAULT_DOWN_KEY.to_string(),
+            left_key: LEGACY_DEFAULT_LEFT_KEY.to_string(),
+            right_key: LEGACY_DEFAULT_RIGHT_KEY.to_string(),
+        };
+        let (migrated, changed) = migrate_shortcut_defaults(state, &raw);
+        assert!(changed);
+        assert_eq!(migrated.detach_key, default_detach_key());
+        assert_eq!(migrated.up_key, default_up_key());
+        assert_eq!(migrated.down_key, default_down_key());
+        assert_eq!(migrated.left_key, default_left_key());
+        assert_eq!(migrated.right_key, default_right_key());
     }
 }

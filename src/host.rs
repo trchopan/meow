@@ -90,16 +90,13 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 state_path.display()
             )
         })?;
-    let up_chord = parse_directional_chord(&persisted_state.up_key, "up_key", "ctrl+alt+cmd+up")?;
+    let up_chord = parse_directional_chord(&persisted_state.up_key, "up_key", "ctrl+alt+cmd+k")?;
     let down_chord =
-        parse_directional_chord(&persisted_state.down_key, "down_key", "ctrl+alt+cmd+down")?;
+        parse_directional_chord(&persisted_state.down_key, "down_key", "ctrl+alt+cmd+j")?;
     let left_chord =
-        parse_directional_chord(&persisted_state.left_key, "left_key", "ctrl+alt+cmd+left")?;
-    let right_chord = parse_directional_chord(
-        &persisted_state.right_key,
-        "right_key",
-        "ctrl+alt+cmd+right",
-    )?;
+        parse_directional_chord(&persisted_state.left_key, "left_key", "ctrl+alt+cmd+h")?;
+    let right_chord =
+        parse_directional_chord(&persisted_state.right_key, "right_key", "ctrl+alt+cmd+l")?;
 
     let active_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let remote_pointer_mode = Arc::new(AtomicU8::new(persisted_state.remote_pointer_mode.to_u8()));
@@ -500,6 +497,16 @@ fn is_host_facing_edge(side: Side, edge: ScreenEdge) -> bool {
     )
 }
 
+fn resolve_directional_target(active: ActiveTarget, requested: ActiveTarget) -> ActiveTarget {
+    match (active, requested) {
+        (ActiveTarget::Right, ActiveTarget::Left)
+        | (ActiveTarget::Left, ActiveTarget::Right)
+        | (ActiveTarget::Up, ActiveTarget::Down)
+        | (ActiveTarget::Down, ActiveTarget::Up) => ActiveTarget::Local,
+        _ => requested,
+    }
+}
+
 async fn run_forward_loop(
     mut rx: mpsc::Receiver<CapturedInput>,
     mut directional_switch_rx: mpsc::UnboundedReceiver<ActiveTarget>,
@@ -535,6 +542,8 @@ async fn run_forward_loop(
                 flush_pending_relative(&state, &mut pending_relative).await;
             }
             Some(target) = directional_switch_rx.recv() => {
+                let active = ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire));
+                let target = resolve_directional_target(active, target);
                 let response = crate::ipc::switch_target(&state, target).await;
                 if !response.ok {
                     warn!("directional shortcut failed: {}", response.message);
@@ -1301,6 +1310,42 @@ mod tests {
         assert!(is_host_facing_edge(Side::Down, ScreenEdge::Up));
         assert!(!is_host_facing_edge(Side::Right, ScreenEdge::Right));
         assert!(!is_host_facing_edge(Side::Up, ScreenEdge::Up));
+    }
+
+    #[test]
+    fn opposite_directional_shortcut_returns_to_local() {
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Right, ActiveTarget::Left),
+            ActiveTarget::Local
+        );
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Left, ActiveTarget::Right),
+            ActiveTarget::Local
+        );
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Up, ActiveTarget::Down),
+            ActiveTarget::Local
+        );
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Down, ActiveTarget::Up),
+            ActiveTarget::Local
+        );
+    }
+
+    #[test]
+    fn directional_shortcut_keeps_requested_target_when_not_opposite() {
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Local, ActiveTarget::Right),
+            ActiveTarget::Right
+        );
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Right, ActiveTarget::Right),
+            ActiveTarget::Right
+        );
+        assert_eq!(
+            resolve_directional_target(ActiveTarget::Right, ActiveTarget::Up),
+            ActiveTarget::Up
+        );
     }
 
     #[test]
