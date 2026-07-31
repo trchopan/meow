@@ -10,17 +10,10 @@ use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 
 use crate::input::{
-    DEFAULT_DETACH_KEY, DEFAULT_DOWN_KEY, DEFAULT_LEFT_KEY, DEFAULT_RIGHT_KEY, DEFAULT_UP_KEY,
     default_clipboard_key, default_detach_key, default_down_key, default_left_key,
     default_right_key, default_up_key, parse_clipboard_chord, parse_detach_chord,
     parse_directional_chord,
 };
-
-const LEGACY_DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
-const LEGACY_DEFAULT_UP_KEY: &str = "ctrl+alt+cmd+up";
-const LEGACY_DEFAULT_DOWN_KEY: &str = "ctrl+alt+cmd+down";
-const LEGACY_DEFAULT_LEFT_KEY: &str = "ctrl+alt+cmd+left";
-const LEGACY_DEFAULT_RIGHT_KEY: &str = "ctrl+alt+cmd+right";
 use crate::model::RemotePointerMode;
 use crate::presentation::{print_identity_reset_complete, print_rotate_secret_complete};
 
@@ -33,19 +26,13 @@ pub(crate) struct PersistedHostState {
     pub(crate) schema_version: u8,
     pub(crate) endpoint_id: String,
     pub(crate) attach_secret: String,
-    #[serde(default = "default_detach_key")]
     pub(crate) detach_key: String,
     #[serde(default = "default_remote_pointer_mode")]
     pub(crate) remote_pointer_mode: RemotePointerMode,
-    #[serde(default = "default_clipboard_key")]
     pub(crate) clipboard_key: String,
-    #[serde(default = "default_up_key")]
     pub(crate) up_key: String,
-    #[serde(default = "default_down_key")]
     pub(crate) down_key: String,
-    #[serde(default = "default_left_key")]
     pub(crate) left_key: String,
-    #[serde(default = "default_right_key")]
     pub(crate) right_key: String,
 }
 
@@ -142,12 +129,8 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
     if state_path.exists() {
         let bytes = fs::read(&state_path)
             .with_context(|| format!("failed to read {}", state_path.display()))?;
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse {}", state_path.display()))?;
         let state: PersistedHostState = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", state_path.display()))?;
-        let (state, migrated) = migrate_shortcut_defaults(state, &raw);
-        let missing_shortcut = state_has_missing_directional_shortcuts(&raw);
         let (state, repaired) = repair_host_state_for_endpoint(state, endpoint_id);
         parse_detach_chord(&state.detach_key).with_context(|| {
             format!(
@@ -167,7 +150,7 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
             })?;
         }
         validate_shortcut_conflicts(&state)?;
-        let changed = migrated || repaired || missing_shortcut;
+        let changed = repaired;
         parse_clipboard_chord(&state.clipboard_key).with_context(|| {
             format!(
                 "invalid clipboard_key {:?} in {}",
@@ -195,52 +178,6 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
     };
     write_host_state_file(&state_path, &state)?;
     Ok(state)
-}
-
-fn migrate_shortcut_defaults(
-    mut state: PersistedHostState,
-    raw: &serde_json::Value,
-) -> (PersistedHostState, bool) {
-    let mut changed = false;
-    if (raw.get("detach_key").is_none() || state.detach_key == LEGACY_DEFAULT_DETACH_KEY)
-        && state.detach_key != DEFAULT_DETACH_KEY
-    {
-        state.detach_key = default_detach_key();
-        changed = true;
-    }
-
-    for (field, value, legacy, default) in [
-        (
-            "up_key",
-            &mut state.up_key,
-            LEGACY_DEFAULT_UP_KEY,
-            DEFAULT_UP_KEY,
-        ),
-        (
-            "down_key",
-            &mut state.down_key,
-            LEGACY_DEFAULT_DOWN_KEY,
-            DEFAULT_DOWN_KEY,
-        ),
-        (
-            "left_key",
-            &mut state.left_key,
-            LEGACY_DEFAULT_LEFT_KEY,
-            DEFAULT_LEFT_KEY,
-        ),
-        (
-            "right_key",
-            &mut state.right_key,
-            LEGACY_DEFAULT_RIGHT_KEY,
-            DEFAULT_RIGHT_KEY,
-        ),
-    ] {
-        if (raw.get(field).is_none() || *value == legacy) && *value != default {
-            *value = default.to_string();
-            changed = true;
-        }
-    }
-    (state, changed)
 }
 
 fn validate_shortcut_conflicts(state: &PersistedHostState) -> Result<()> {
@@ -278,12 +215,6 @@ fn validate_shortcut_conflicts(state: &PersistedHostState) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn state_has_missing_directional_shortcuts(raw: &serde_json::Value) -> bool {
-    ["up_key", "down_key", "left_key", "right_key"]
-        .iter()
-        .any(|key| raw.get(key).is_none())
 }
 
 fn modifiers_are_subset(a: &crate::input::DetachChord, b: &crate::input::DetachChord) -> bool {
@@ -522,54 +453,38 @@ mod tests {
     }
 
     #[test]
-    fn legacy_state_is_detected_as_missing_directional_shortcuts() {
-        let raw = serde_json::json!({
-            "schema_version": 1,
-            "endpoint_id": "endpoint",
-            "attach_secret": "secret",
-            "detach_key": default_detach_key(),
-            "clipboard_key": default_clipboard_key(),
-            "remote_pointer_mode": "edge_to_edge"
-        });
-        assert!(state_has_missing_directional_shortcuts(&raw));
-        assert!(!state_has_missing_directional_shortcuts(
-            &serde_json::json!({
-                "up_key": default_up_key(),
-                "down_key": default_down_key(),
-                "left_key": default_left_key(),
-                "right_key": default_right_key()
-            })
-        ));
-    }
-
-    #[test]
-    fn legacy_shortcut_defaults_migrate_to_vim_defaults() {
+    fn current_state_round_trips_with_all_shortcuts() {
         let endpoint_id = sample_endpoint_id();
-        let raw = serde_json::json!({
-            "detach_key": LEGACY_DEFAULT_DETACH_KEY,
-            "up_key": LEGACY_DEFAULT_UP_KEY,
-            "down_key": LEGACY_DEFAULT_DOWN_KEY,
-            "left_key": LEGACY_DEFAULT_LEFT_KEY,
-            "right_key": LEGACY_DEFAULT_RIGHT_KEY
-        });
         let state = PersistedHostState {
             schema_version: 1,
             endpoint_id: endpoint_id.to_string(),
             attach_secret: "secret".to_string(),
-            detach_key: LEGACY_DEFAULT_DETACH_KEY.to_string(),
+            detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
             clipboard_key: default_clipboard_key(),
-            up_key: LEGACY_DEFAULT_UP_KEY.to_string(),
-            down_key: LEGACY_DEFAULT_DOWN_KEY.to_string(),
-            left_key: LEGACY_DEFAULT_LEFT_KEY.to_string(),
-            right_key: LEGACY_DEFAULT_RIGHT_KEY.to_string(),
+            up_key: default_up_key(),
+            down_key: default_down_key(),
+            left_key: default_left_key(),
+            right_key: default_right_key(),
         };
-        let (migrated, changed) = migrate_shortcut_defaults(state, &raw);
-        assert!(changed);
-        assert_eq!(migrated.detach_key, default_detach_key());
-        assert_eq!(migrated.up_key, default_up_key());
-        assert_eq!(migrated.down_key, default_down_key());
-        assert_eq!(migrated.left_key, default_left_key());
-        assert_eq!(migrated.right_key, default_right_key());
+        let encoded = serde_json::to_vec(&state).expect("serialize current state");
+        let decoded: PersistedHostState =
+            serde_json::from_slice(&encoded).expect("deserialize current state");
+        assert_eq!(decoded.detach_key, default_detach_key());
+        assert_eq!(decoded.up_key, default_up_key());
+        assert_eq!(decoded.down_key, default_down_key());
+        assert_eq!(decoded.left_key, default_left_key());
+        assert_eq!(decoded.right_key, default_right_key());
+    }
+
+    #[test]
+    fn state_without_shortcut_fields_is_rejected() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "endpoint_id": "endpoint",
+            "attach_secret": "secret",
+            "remote_pointer_mode": "edge_to_edge"
+        });
+        assert!(serde_json::from_value::<PersistedHostState>(raw).is_err());
     }
 }
