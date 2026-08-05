@@ -62,6 +62,7 @@ You can switch active targets from the host with directional commands (`meow rig
 - Local control socket for status and runtime control commands.
 - Optional remote input overlay for displaying pressed keys and buttons.
 - Clipboard paste between host and client machines with `ctrl+alt+cmd+p`.
+- Directional target shortcuts with Vim motion keys `ctrl+alt+cmd+h/j/k/l`.
 
 ## Requirements
 
@@ -183,9 +184,22 @@ meow pointer-mode confine
 
 ## Escape Chord
 
-When input is forwarded to a remote machine, press `ctrl+alt+cmd+l` on the host to force control back to local.
+When input is forwarded to a remote machine, press `ctrl+alt+cmd+u` on the host to force control back to local.
 
 You can customize this by editing `detach_key` in `host_state.json`.
+
+Directional target switching is available with these default shortcuts:
+
+- `ctrl+alt+cmd+k` switches to `meow up`.
+- `ctrl+alt+cmd+j` switches to `meow down`.
+- `ctrl+alt+cmd+h` switches to `meow left`.
+- `ctrl+alt+cmd+l` switches to `meow right`.
+
+When targeting a remote, pressing the opposite direction returns to local control. For example,
+`ctrl+alt+cmd+l` switches from local to the right remote, and `ctrl+alt+cmd+h` returns to local.
+
+Customize them with `up_key`, `down_key`, `left_key`, and `right_key` in
+`host_state.json`.
 
 ## State Files
 
@@ -212,13 +226,17 @@ Example `host_state.json`:
   "schema_version": 1,
   "endpoint_id": "...",
   "attach_secret": "...",
-  "detach_key": "ctrl+alt+cmd+l",
+  "detach_key": "ctrl+alt+cmd+u",
   "clipboard_key": "ctrl+alt+cmd+p",
+  "up_key": "ctrl+alt+cmd+k",
+  "down_key": "ctrl+alt+cmd+j",
+  "left_key": "ctrl+alt+cmd+h",
+  "right_key": "ctrl+alt+cmd+l",
   "remote_pointer_mode": "edge_to_edge"
 }
 ```
 
-`detach_key` format is `modifier+modifier+key` (case-insensitive). Supported modifiers: `ctrl`, `alt`, `cmd` (or `meta`, `super`, `win`), `shift`. Supported keys: `a-z`, `0-9`, `space`, `tab`, `enter`, `escape`.
+Shortcut format is `modifier+modifier+key` (case-insensitive). Supported modifiers: `ctrl`, `alt`, `cmd` (or `meta`, `super`, `win`), `shift`. Supported keys: `a-z`, `0-9`, `space`, `tab`, `enter`, `escape`, `up`, `down`, `left`, `right`.
 
 ## Clipboard Paste
 

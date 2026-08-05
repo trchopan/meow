@@ -21,13 +21,17 @@ use crate::{
     },
 };
 
-pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+l";
+pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+u";
 pub(crate) const DEFAULT_CLIPBOARD_KEY: &str = "ctrl+alt+cmd+p";
+pub(crate) const DEFAULT_UP_KEY: &str = "ctrl+alt+cmd+k";
+pub(crate) const DEFAULT_DOWN_KEY: &str = "ctrl+alt+cmd+j";
+pub(crate) const DEFAULT_LEFT_KEY: &str = "ctrl+alt+cmd+h";
+pub(crate) const DEFAULT_RIGHT_KEY: &str = "ctrl+alt+cmd+l";
 pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
 pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
 const EDGE_REARM_DISTANCE_MULTIPLIER: u32 = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetachChord {
     pub(crate) key: Key,
     pub(crate) ctrl: bool,
@@ -63,8 +67,13 @@ pub(crate) fn run_input_grab(
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pending_release_sides: Arc<AtomicU8>,
     pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
+    directional_switch_tx: mpsc::UnboundedSender<ActiveTarget>,
     detach_chord: DetachChord,
     clipboard_chord: DetachChord,
+    up_chord: DetachChord,
+    down_chord: DetachChord,
+    left_chord: DetachChord,
+    right_chord: DetachChord,
     edge_config: HostEdgeConfig,
 ) -> Result<()> {
     let send_ctx = CaptureSendContext {
@@ -149,6 +158,8 @@ pub(crate) fn run_input_grab(
     let callback_previous_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let clipboard_key_active = Arc::new(AtomicBool::new(false));
     let callback_clipboard_key_active = clipboard_key_active.clone();
+    let directional_key_active = Arc::new(Mutex::new(HashSet::new()));
+    let callback_directional_key_active = directional_key_active.clone();
     let callback = move |event: rdev::Event| -> Option<rdev::Event> {
         runtime_stats
             .captured_events
@@ -251,6 +262,45 @@ pub(crate) fn run_input_grab(
                 }
                 _ => {}
             }
+        }
+
+        let directional_chords = [
+            (&up_chord, ActiveTarget::Up),
+            (&down_chord, ActiveTarget::Down),
+            (&left_chord, ActiveTarget::Left),
+            (&right_chord, ActiveTarget::Right),
+        ];
+        match event.event_type {
+            EventType::KeyPress(key) => {
+                if let Some((_, target)) = directional_chords.iter().find(|(chord, _)| {
+                    chord_matches_key(
+                        chord,
+                        key,
+                        is_ctrl_down,
+                        is_alt_down,
+                        is_meta_down,
+                        is_shift_down,
+                    )
+                }) {
+                    let first_press = callback_directional_key_active
+                        .lock()
+                        .expect("directional key mutex poisoned")
+                        .insert(key);
+                    if first_press && directional_switch_tx.send(*target).is_err() {
+                        warn!("directional shortcut channel closed; dropping target switch");
+                    }
+                    return None;
+                }
+            }
+            EventType::KeyRelease(key)
+                if callback_directional_key_active
+                    .lock()
+                    .expect("directional key mutex poisoned")
+                    .remove(&key) =>
+            {
+                return None;
+            }
+            _ => {}
         }
 
         match target {
@@ -510,6 +560,29 @@ pub(crate) fn parse_clipboard_chord(chord: &str) -> Result<DetachChord> {
     parse_chord(chord, "clipboard_key", DEFAULT_CLIPBOARD_KEY)
 }
 
+pub(crate) fn parse_directional_chord(
+    chord: &str,
+    setting_name: &str,
+    example: &str,
+) -> Result<DetachChord> {
+    parse_chord(chord, setting_name, example)
+}
+
+fn chord_matches_key(
+    chord: &DetachChord,
+    key: Key,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    shift: bool,
+) -> bool {
+    chord.key == key
+        && (!chord.ctrl || ctrl)
+        && (!chord.alt || alt)
+        && (!chord.meta || meta)
+        && (!chord.shift || shift)
+}
+
 fn parse_chord(chord: &str, setting_name: &str, example: &str) -> Result<DetachChord> {
     let mut ctrl = false;
     let mut alt = false;
@@ -531,7 +604,7 @@ fn parse_chord(chord: &str, setting_name: &str, example: &str) -> Result<DetachC
                 if key.is_some() {
                     bail!("{setting_name} must include exactly one non-modifier key")
                 }
-                key = Some(parse_detach_key(&token)?);
+                key = Some(parse_detach_key(&token, setting_name)?);
             }
         }
     }
@@ -548,7 +621,7 @@ fn parse_chord(chord: &str, setting_name: &str, example: &str) -> Result<DetachC
     })
 }
 
-pub(crate) fn parse_detach_key(token: &str) -> Result<Key> {
+pub(crate) fn parse_detach_key(token: &str, setting_name: &str) -> Result<Key> {
     let key = match token {
         "a" => Key::KeyA,
         "b" => Key::KeyB,
@@ -590,9 +663,13 @@ pub(crate) fn parse_detach_key(token: &str) -> Result<Key> {
         "tab" => Key::Tab,
         "enter" | "return" => Key::Return,
         "esc" | "escape" => Key::Escape,
+        "up" => Key::UpArrow,
+        "down" => Key::DownArrow,
+        "left" => Key::LeftArrow,
+        "right" => Key::RightArrow,
         _ => {
             bail!(
-                "unsupported detach key token {:?}; supported keys: a-z, 0-9, space, tab, enter, escape",
+                "unsupported {setting_name} key token {:?}; supported keys: a-z, 0-9, space, tab, enter, escape, up, down, left, right",
                 token
             )
         }
@@ -606,6 +683,19 @@ pub(crate) fn default_detach_key() -> String {
 
 pub(crate) fn default_clipboard_key() -> String {
     DEFAULT_CLIPBOARD_KEY.to_string()
+}
+
+pub(crate) fn default_up_key() -> String {
+    DEFAULT_UP_KEY.to_string()
+}
+pub(crate) fn default_down_key() -> String {
+    DEFAULT_DOWN_KEY.to_string()
+}
+pub(crate) fn default_left_key() -> String {
+    DEFAULT_LEFT_KEY.to_string()
+}
+pub(crate) fn default_right_key() -> String {
+    DEFAULT_RIGHT_KEY.to_string()
 }
 
 pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
@@ -752,6 +842,13 @@ mod tests {
     }
 
     #[test]
+    fn default_detach_chord_is_ctrl_alt_cmd_u() {
+        let chord = parse_detach_chord(&default_detach_key()).expect("valid detach chord");
+        assert_eq!(chord.key, Key::KeyU);
+        assert!(chord.ctrl && chord.alt && chord.meta);
+    }
+
+    #[test]
     fn default_clipboard_chord_is_ctrl_alt_cmd_p() {
         let chord = parse_clipboard_chord(&default_clipboard_key()).expect("valid clipboard chord");
         assert_eq!(chord.key, Key::KeyP);
@@ -770,6 +867,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_directional_chord_accepts_vim_motion_keys() {
+        for (value, key) in [
+            (default_up_key(), Key::KeyK),
+            (default_down_key(), Key::KeyJ),
+            (default_left_key(), Key::KeyH),
+            (default_right_key(), Key::KeyL),
+        ] {
+            let chord =
+                parse_directional_chord(&value, "direction_key", &value).expect("valid chord");
+            assert_eq!(chord.key, key);
+            assert!(chord.ctrl && chord.alt && chord.meta);
+        }
+    }
+
+    #[test]
+    fn directional_chord_matching_requires_configured_modifiers() {
+        let chord = parse_directional_chord("ctrl+alt+cmd+k", "up_key", DEFAULT_UP_KEY)
+            .expect("valid chord");
+        assert!(!chord_matches_key(
+            &chord,
+            Key::KeyK,
+            true,
+            true,
+            false,
+            false
+        ));
+        assert!(chord_matches_key(
+            &chord,
+            Key::KeyK,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!chord_matches_key(
+            &chord,
+            Key::KeyJ,
+            true,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
     fn parse_detach_chord_rejects_multiple_non_modifier_keys() {
         let err = parse_detach_chord("ctrl+a+b").expect_err("multiple keys should fail");
         assert!(
@@ -781,7 +923,7 @@ mod tests {
     #[test]
     fn parse_detach_chord_rejects_unknown_key() {
         let err = parse_detach_chord("ctrl+f13").expect_err("unsupported key should fail");
-        assert!(err.to_string().contains("unsupported detach key token"));
+        assert!(err.to_string().contains("unsupported detach_key key token"));
     }
 
     #[test]
