@@ -149,26 +149,39 @@ pub(crate) fn ensure_pointer_restored() {
 pub(crate) fn ensure_pointer_restored() {}
 
 pub(crate) async fn switch_target(state: &HostState, target: ActiveTarget) -> IpcResponse {
-    if let Some(side) = target.to_side() {
-        let side_exists = {
-            let remotes = state.remotes.read().await;
-            remotes.contains_key(&side)
+    if !switch_target_if_attached(state, target, "control command").await {
+        let side = target
+            .to_side()
+            .expect("detached target validation only applies to remote targets");
+        return IpcResponse {
+            ok: false,
+            message: format!("no remote attached on {side:?}").to_lowercase(),
+            status: Some(status_payload(state).await),
         };
-        if !side_exists {
-            return IpcResponse {
-                ok: false,
-                message: format!("no remote attached on {side:?}").to_lowercase(),
-                status: Some(status_payload(state).await),
-            };
-        }
     }
 
-    apply_target_change(state, target, "control command");
     IpcResponse {
         ok: true,
         message: format!("switched target to {target}"),
         status: Some(status_payload(state).await),
     }
+}
+
+pub(crate) async fn switch_target_if_attached(
+    state: &HostState,
+    target: ActiveTarget,
+    context: &str,
+) -> bool {
+    let remotes = state.remotes.write().await;
+    if target
+        .to_side()
+        .is_some_and(|side| !remotes.contains_key(&side))
+    {
+        return false;
+    }
+
+    apply_target_change(state, target, context);
+    true
 }
 
 async fn set_pointer_mode(state: &HostState, mode: RemotePointerMode) -> IpcResponse {
@@ -330,9 +343,10 @@ mod tests {
 
     use iroh::{EndpointId, SecretKey};
     use tokio::net::UnixStream;
-    use tokio::sync::{Notify, RwLock};
+    use tokio::sync::{Notify, RwLock, mpsc};
 
-    use crate::model::{HostState, PendingClipboardRequest, RuntimeStats};
+    use crate::model::{HostState, PendingClipboardRequest, RemotePeer, RuntimeStats};
+    use crate::protocol::HostToClientMessage;
 
     fn test_host_state() -> HostState {
         HostState {
@@ -416,6 +430,44 @@ mod tests {
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit() | Side::Left.release_bit()
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_target_rejects_detached_remote() {
+        let state = test_host_state();
+
+        let response = switch_target(&state, ActiveTarget::Right).await;
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "no remote attached on right");
+        assert_eq!(
+            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+            ActiveTarget::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_target_validates_and_activates_under_one_lock() {
+        let state = test_host_state();
+        let (input_tx, _input_rx) = mpsc::channel::<HostToClientMessage>(1);
+        state.remotes.write().await.insert(
+            Side::Right,
+            RemotePeer {
+                input_tx,
+                next_seq: Arc::new(AtomicU64::new(1)),
+                remote_id: EndpointId::from(SecretKey::generate().public()),
+                generation: 1,
+                name: "test-peer".to_string(),
+            },
+        );
+
+        let response = switch_target(&state, ActiveTarget::Right).await;
+
+        assert!(response.ok);
+        assert_eq!(
+            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+            ActiveTarget::Right
         );
     }
 

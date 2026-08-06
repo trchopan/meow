@@ -27,7 +27,7 @@ use crate::{
     },
     ipc::{
         IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
-        run_control_socket, send_ipc,
+        run_control_socket, send_ipc, switch_target_if_attached,
     },
     macos_keyboard::LayoutTranslator,
     macos_mouse_delta::run_macos_mouse_delta_capture,
@@ -1051,15 +1051,7 @@ async fn maybe_switch_to_remote_on_host_edge(state: &HostState, edge: ScreenEdge
 
     let side = side_from_edge(edge);
 
-    let has_remote = {
-        let remotes = state.remotes.read().await;
-        remotes.contains_key(&side)
-    };
-    if !has_remote {
-        return;
-    }
-
-    apply_target_change(state, ActiveTarget::from(side), "host edge reached");
+    switch_target_if_attached(state, ActiveTarget::from(side), "host edge reached").await;
 }
 
 fn saturating_add_i32(lhs: i32, rhs: i32) -> i32 {
