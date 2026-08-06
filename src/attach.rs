@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +13,9 @@ use uuid::Uuid;
 use crate::{
     cli::AttachArgs,
     clipboard,
+    display::{
+        DisplayGeometry, DisplayLayout, display_layout, main_display_geometry, pointer_location,
+    },
     input_overlay::InputOverlay,
     macos_inject,
     model::ScreenEdge,
@@ -92,13 +96,14 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     info!("client attach complete, waiting for forwarded events");
 
     let mut enigo = Enigo::new();
-    let mut probe = args.probe_received.then(|| {
-        ClientReceiveProbe::new(
-            &mut enigo,
+    let mut probe = if args.probe_received {
+        Some(ClientReceiveProbe::new(
             args.probe_duration_secs,
             !args.probe_summary_only,
-        )
-    });
+        )?)
+    } else {
+        None
+    };
     let probe_start = Instant::now();
     let mut last_signaled_edge: Option<ScreenEdge> = None;
     let mut edge_push = EdgePushTracker::new();
@@ -166,9 +171,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
                             .await;
                     }
+                    input_overlay.clear();
                     edge_push.reset();
                     last_signaled_edge = None;
-                    input_overlay.clear();
                 }
                 let meta = ProbeMessageMeta {
                     seq,
@@ -227,9 +232,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
                             .await;
                     }
+                    input_overlay.clear();
                     edge_push.reset();
                     last_signaled_edge = None;
-                    input_overlay.clear();
                 }
                 let meta = ProbeMessageMeta {
                     seq,
@@ -238,16 +243,27 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 };
                 if let Some(probe) = probe.as_mut() {
                     probe.note_sequence(seq_status);
-                    probe.on_relative_mouse(dx, dy, meta, &mut enigo, &input_state, args.no_inject);
+                    probe.on_relative_mouse(
+                        dx,
+                        dy,
+                        meta,
+                        &mut enigo,
+                        &input_state,
+                        args.no_inject,
+                    )?;
                     probe.note_held_counts(&input_state);
                 }
                 debug!("client received relative mouse move: dx={dx}, dy={dy}");
                 if probe.is_none() && !args.no_inject {
-                    let before = enigo.mouse_location();
+                    let before = pointer_location()?;
                     let drag_button = active_drag_button(&input_state);
                     move_mouse_relative(&mut enigo, dx, dy, drag_button);
-                    let after = enigo.mouse_location();
-                    let display = enigo.main_display_size();
+                    let after = pointer_location()?;
+                    let layout = display_layout()?;
+                    let display = layout
+                        .display_at(after.0, after.1)
+                        .or_else(|| layout.display_at(before.0, before.1))
+                        .unwrap_or_else(|| layout.main());
                     edge_push.reset_if_stale(Instant::now());
                     let push = detect_client_edge_push(before, after, display, dx, dy);
                     let Some((edge, push_amount)) = push else {
@@ -614,51 +630,71 @@ fn parse_logical_key(value: &str) -> Option<Key> {
 }
 
 fn detect_client_edge_push(
-    before: (i32, i32),
-    after: (i32, i32),
-    display: (i32, i32),
+    before: (f64, f64),
+    after: (f64, f64),
+    display: DisplayGeometry,
     dx: i32,
     dy: i32,
 ) -> Option<(ScreenEdge, i32)> {
-    let max_x = display.0.saturating_sub(1);
-    let max_y = display.1.saturating_sub(1);
+    let max_x = display.right() - 1.0;
+    let max_y = display.bottom() - 1.0;
     let actual_dx = after.0 - before.0;
     let actual_dy = after.1 - before.1;
 
-    if dx < 0 && after.0 <= EDGE_TOLERANCE_PX {
+    if dx < 0 && after.0 <= display.origin_x + EDGE_TOLERANCE_PX as f64 {
         let requested = -dx;
-        let actual_outward = (-actual_dx).max(0);
-        let blocked = requested.saturating_sub(actual_outward);
-        if blocked > 0 {
-            return Some((ScreenEdge::Left, blocked));
+        let actual_outward = (-actual_dx).max(0.0);
+        let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
+        if blocked > 0 || after.0 <= display.origin_x {
+            return Some((
+                ScreenEdge::Left,
+                edge_push_amount(blocked, requested, after.0 <= display.origin_x),
+            ));
         }
     }
-    if dx > 0 && after.0 >= max_x.saturating_sub(EDGE_TOLERANCE_PX) {
+    if dx > 0 && after.0 >= max_x - EDGE_TOLERANCE_PX as f64 {
         let requested = dx;
-        let actual_outward = actual_dx.max(0);
-        let blocked = requested.saturating_sub(actual_outward);
-        if blocked > 0 {
-            return Some((ScreenEdge::Right, blocked));
+        let actual_outward = actual_dx.max(0.0);
+        let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
+        if blocked > 0 || after.0 >= max_x {
+            return Some((
+                ScreenEdge::Right,
+                edge_push_amount(blocked, requested, after.0 >= max_x),
+            ));
         }
     }
-    if dy < 0 && after.1 <= EDGE_TOLERANCE_PX {
+    if dy < 0 && after.1 <= display.origin_y + EDGE_TOLERANCE_PX as f64 {
         let requested = -dy;
-        let actual_outward = (-actual_dy).max(0);
-        let blocked = requested.saturating_sub(actual_outward);
-        if blocked > 0 {
-            return Some((ScreenEdge::Up, blocked));
+        let actual_outward = (-actual_dy).max(0.0);
+        let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
+        if blocked > 0 || after.1 <= display.origin_y {
+            return Some((
+                ScreenEdge::Up,
+                edge_push_amount(blocked, requested, after.1 <= display.origin_y),
+            ));
         }
     }
-    if dy > 0 && after.1 >= max_y.saturating_sub(EDGE_TOLERANCE_PX) {
+    if dy > 0 && after.1 >= max_y - EDGE_TOLERANCE_PX as f64 {
         let requested = dy;
-        let actual_outward = actual_dy.max(0);
-        let blocked = requested.saturating_sub(actual_outward);
-        if blocked > 0 {
-            return Some((ScreenEdge::Down, blocked));
+        let actual_outward = actual_dy.max(0.0);
+        let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
+        if blocked > 0 || after.1 >= max_y {
+            return Some((
+                ScreenEdge::Down,
+                edge_push_amount(blocked, requested, after.1 >= max_y),
+            ));
         }
     }
 
     None
+}
+
+fn edge_push_amount(blocked: i32, requested: i32, reached_boundary: bool) -> i32 {
+    if blocked == 0 && reached_boundary {
+        requested
+    } else {
+        blocked
+    }
 }
 
 fn inject_input_event(
@@ -684,8 +720,9 @@ fn inject_input_event(
         return Ok(());
     }
 
-    if macos_inject::inject_event(event).is_err() {
-        simulate(event).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+    let prepared = macos_inject::prepare_event_for_injection(event)?;
+    if macos_inject::inject_prepared_event(&prepared).is_err() {
+        simulate(&prepared).map_err(|err| anyhow::anyhow!("{err:?}"))?;
     }
     match event {
         EventType::KeyPress(key) => {
@@ -709,6 +746,12 @@ fn move_mouse_relative(enigo: &mut Enigo, dx: i32, dy: i32, drag_button: Option<
         if macos_inject::inject_relative_move_with_button(dx, dy, drag_button).is_ok() {
             return;
         }
+        if let (Ok(layout), Ok((x, y))) = (display_layout(), pointer_location())
+            && let Some((target_x, target_y, _, _)) = layout.clamp_pointer_move(x, y, dx, dy)
+        {
+            enigo.mouse_move_to(target_x.round() as i32, target_y.round() as i32);
+            return;
+        }
     }
     enigo.mouse_move_relative(dx, dy);
 }
@@ -717,6 +760,54 @@ fn active_drag_button(state: &ClientInputState) -> Option<Button> {
     [Button::Left, Button::Right, Button::Middle]
         .into_iter()
         .find(|button| state.pressed_buttons.contains(button))
+}
+
+struct EdgePushTracker {
+    edge: Option<ScreenEdge>,
+    accumulated_px: i32,
+    last_update: Option<Instant>,
+}
+
+impl EdgePushTracker {
+    fn new() -> Self {
+        Self {
+            edge: None,
+            accumulated_px: 0,
+            last_update: None,
+        }
+    }
+
+    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: i32, now: Instant) -> bool {
+        if push_px <= 0 {
+            return false;
+        }
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.accumulated_px = 0;
+        }
+        self.accumulated_px = self.accumulated_px.saturating_add(push_px);
+        self.last_update = Some(now);
+        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
+            self.accumulated_px = 0;
+            return true;
+        }
+        false
+    }
+
+    fn reset_if_stale(&mut self, now: Instant) {
+        if self
+            .last_update
+            .is_some_and(|last_update| now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT)
+        {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.edge = None;
+        self.accumulated_px = 0;
+        self.last_update = None;
+    }
 }
 
 fn map_mouse_button_event(event: &EventType) -> Option<(MouseButton, bool)> {
@@ -897,58 +988,9 @@ fn is_modifier_key(key: Key) -> bool {
     )
 }
 
-struct EdgePushTracker {
-    edge: Option<ScreenEdge>,
-    accumulated_px: i32,
-    last_update: Option<Instant>,
-}
-
-impl EdgePushTracker {
-    fn new() -> Self {
-        Self {
-            edge: None,
-            accumulated_px: 0,
-            last_update: None,
-        }
-    }
-
-    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: i32, now: Instant) -> bool {
-        if push_px <= 0 {
-            return false;
-        }
-
-        if self.edge != Some(edge) {
-            self.edge = Some(edge);
-            self.accumulated_px = 0;
-        }
-
-        self.accumulated_px = self.accumulated_px.saturating_add(push_px);
-        self.last_update = Some(now);
-        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
-            self.accumulated_px = 0;
-            return true;
-        }
-        false
-    }
-
-    fn reset_if_stale(&mut self, now: Instant) {
-        if let Some(last_update) = self.last_update
-            && now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT
-        {
-            self.reset();
-        }
-    }
-
-    fn reset(&mut self) {
-        self.edge = None;
-        self.accumulated_px = 0;
-        self.last_update = None;
-    }
-}
-
 struct ClientReceiveProbe {
     start_cursor: (i32, i32),
-    display_size: (i32, i32),
+    layout: Arc<DisplayLayout>,
     duration_secs: u64,
     total_messages: u64,
     relative_messages: u64,
@@ -991,16 +1033,17 @@ struct ProbeMessageMeta {
 }
 
 impl ClientReceiveProbe {
-    fn new(enigo: &mut Enigo, duration_secs: u64, verbose_events: bool) -> Self {
-        let display_size = enigo.main_display_size();
-        let start_cursor = enigo.mouse_location();
+    fn new(duration_secs: u64, verbose_events: bool) -> Result<Self> {
+        let layout = display_layout()?;
+        let display = layout.main();
+        let start_cursor = pointer_location().map(|(x, y)| (x.round() as i32, y.round() as i32))?;
         println!(
-            "client probe start: duration={}s display=({},{}) cursor_start=({},{})",
-            duration_secs, display_size.0, display_size.1, start_cursor.0, start_cursor.1
+            "client probe start: duration={}s display=({:.0},{:.0}) cursor_start=({},{})",
+            duration_secs, display.width, display.height, start_cursor.0, start_cursor.1
         );
-        Self {
+        Ok(Self {
             start_cursor,
-            display_size,
+            layout,
             duration_secs,
             total_messages: 0,
             relative_messages: 0,
@@ -1033,7 +1076,7 @@ impl ClientReceiveProbe {
             max_inter_message_gap: std::time::Duration::ZERO,
             inter_message_gaps_ms: Vec::new(),
             verbose_events,
-        }
+        })
     }
 
     fn is_finished(&self, probe_start: Instant) -> bool {
@@ -1098,7 +1141,7 @@ impl ClientReceiveProbe {
         enigo: &mut Enigo,
         input_state: &ClientInputState,
         no_inject: bool,
-    ) {
+    ) -> Result<()> {
         self.note_message(meta.bytes_len, meta.elapsed);
         self.total_messages += 1;
         self.relative_messages += 1;
@@ -1112,26 +1155,35 @@ impl ClientReceiveProbe {
             self.zero_delta_messages += 1;
         }
 
-        let before = enigo.mouse_location();
-        let (width, height) = self.display_size;
-        let expected_x = (before.0 + dx).clamp(0, width.saturating_sub(1));
-        let expected_y = (before.1 + dy).clamp(0, height.saturating_sub(1));
+        let before = pointer_location().map(|(x, y)| (x.round() as i32, y.round() as i32))?;
+        let layout = display_layout().unwrap_or_else(|_| self.layout.clone());
+        let display = layout
+            .display_at(f64::from(before.0), f64::from(before.1))
+            .unwrap_or_else(|| layout.main());
+        let min_x = display.origin_x.round() as i32;
+        let min_y = display.origin_y.round() as i32;
+        let max_x = display.right().round() as i32 - 1;
+        let max_y = display.bottom().round() as i32 - 1;
+        let (expected_x, expected_y) = layout
+            .clamp_pointer_move(f64::from(before.0), f64::from(before.1), dx, dy)
+            .map(|(x, y, _, _)| (x.round() as i32, y.round() as i32))
+            .unwrap_or((before.0, before.1));
 
         if !no_inject {
             let drag_button = active_drag_button(input_state);
             move_mouse_relative(enigo, dx, dy, drag_button);
         }
 
-        let after = enigo.mouse_location();
+        let after = pointer_location().map(|(x, y)| (x.round() as i32, y.round() as i32))?;
         let actual_dx = after.0 - before.0;
         let actual_dy = after.1 - before.1;
         self.sum_cursor_dx += actual_dx as i64;
         self.sum_cursor_dy += actual_dy as i64;
 
-        let hit_edge = after.0 <= 0
-            || after.1 <= 0
-            || after.0 >= width.saturating_sub(1)
-            || after.1 >= height.saturating_sub(1)
+        let hit_edge = after.0 <= min_x
+            || after.1 <= min_y
+            || after.0 >= max_x
+            || after.1 >= max_y
             || after.0 != expected_x
             || after.1 != expected_y;
         if hit_edge {
@@ -1158,6 +1210,7 @@ impl ClientReceiveProbe {
                 self.sum_abs_dy
             );
         }
+        Ok(())
     }
 
     fn on_release_all(
@@ -1231,8 +1284,11 @@ impl ClientReceiveProbe {
 
         println!("client probe summary:");
         println!(
-            "  display_size=({}, {})",
-            self.display_size.0, self.display_size.1
+            "  display_origin=({:.0}, {:.0}) display_size=({:.0}, {:.0})",
+            self.layout.main().origin_x,
+            self.layout.main().origin_y,
+            self.layout.main().width,
+            self.layout.main().height
         );
         println!(
             "  start_cursor=({}, {})",
@@ -1337,9 +1393,10 @@ pub(crate) async fn run_test_inject() -> Result<()> {
     println!("this will move mouse slightly and type 'meowtest'");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let (x, y) = rdev::display_size().unwrap_or((0, 0));
-    let center_x = (x as f64 / 2.0).max(20.0);
-    let center_y = (y as f64 / 2.0).max(20.0);
+    let display = main_display_geometry()?;
+    let (center_x, center_y) = display.center();
+    let center_x = center_x.max(display.origin_x + 20.0);
+    let center_y = center_y.max(display.origin_y + 20.0);
 
     let sequence = [
         EventType::MouseMove {
@@ -1394,20 +1451,130 @@ mod tests {
 
     #[test]
     fn detect_client_edge_push_left_when_blocked() {
-        let edge = detect_client_edge_push((1, 100), (0, 100), (1920, 1080), -20, 0);
+        let edge = detect_client_edge_push(
+            (1.0, 100.0),
+            (0.0, 100.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            -20,
+            0,
+        );
         assert_eq!(edge, Some((ScreenEdge::Left, 19)));
     }
 
     #[test]
     fn detect_client_edge_push_right_when_blocked() {
-        let edge = detect_client_edge_push((1918, 100), (1919, 100), (1920, 1080), 12, 0);
+        let edge = detect_client_edge_push(
+            (1918.0, 100.0),
+            (1919.0, 100.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+            0,
+        );
         assert_eq!(edge, Some((ScreenEdge::Right, 11)));
     }
 
     #[test]
     fn detect_client_edge_push_none_when_not_at_edge() {
-        let edge = detect_client_edge_push((100, 100), (104, 100), (1920, 1080), 4, 0);
+        let edge = detect_client_edge_push(
+            (100.0, 100.0),
+            (104.0, 100.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            4,
+            0,
+        );
         assert_eq!(edge, None);
+    }
+
+    #[test]
+    fn detect_client_edge_push_handles_logical_retina_dimensions() {
+        let edge = detect_client_edge_push(
+            (1508.0, 500.0),
+            (1511.0, 500.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1512.0,
+                height: 982.0,
+            },
+            12,
+            0,
+        );
+        assert_eq!(edge, Some((ScreenEdge::Right, 9)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_respects_non_zero_display_origin() {
+        let display = DisplayGeometry {
+            origin_x: 100.0,
+            origin_y: 40.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+        let edge = detect_client_edge_push((1608.0, 500.0), (1611.0, 500.0), display, 12, 0);
+        assert_eq!(edge, Some((ScreenEdge::Right, 9)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_reports_overshoot() {
+        let edge = detect_client_edge_push(
+            (1500.0, 500.0),
+            (1520.0, 500.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1512.0,
+                height: 982.0,
+            },
+            20,
+            0,
+        );
+        assert_eq!(edge, Some((ScreenEdge::Right, 20)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_counts_motion_landing_on_edge() {
+        let edge = detect_client_edge_push(
+            (5.0, 100.0),
+            (0.0, 100.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            -5,
+            0,
+        );
+        assert_eq!(edge, Some((ScreenEdge::Left, 5)));
+    }
+
+    #[test]
+    fn edge_push_tracker_requires_threshold_and_resets_after_timeout() {
+        let start = Instant::now();
+        let mut tracker = EdgePushTracker::new();
+
+        assert!(!tracker.register_outward_push(ScreenEdge::Left, 5, start));
+        assert!(tracker.register_outward_push(ScreenEdge::Left, 11, start));
+        assert!(!tracker.register_outward_push(
+            ScreenEdge::Left,
+            15,
+            start + EDGE_PUSH_RESET_TIMEOUT
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod attach;
 mod cli;
 mod clipboard;
 mod dev;
+mod display;
 mod host;
 mod host_mouse;
 mod input;
