@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -170,9 +171,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
                             .await;
                     }
+                    input_overlay.clear();
                     edge_push.reset();
                     last_signaled_edge = None;
-                    input_overlay.clear();
                 }
                 let meta = ProbeMessageMeta {
                     seq,
@@ -231,9 +232,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                             .report(&connection, ReplayFailureKind::SequenceRecovery, failures)
                             .await;
                     }
+                    input_overlay.clear();
                     edge_push.reset();
                     last_signaled_edge = None;
-                    input_overlay.clear();
                 }
                 let meta = ProbeMessageMeta {
                     seq,
@@ -295,6 +296,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     enigo.mouse_move_to(x.round() as i32, y.round() as i32);
                 }
                 last_signaled_edge = None;
+                edge_push.reset();
                 debug!("centered pointer for remote activation");
             }
             HostToClientMessage::ReleaseAll { seq } => {
@@ -657,36 +659,56 @@ fn detect_client_edge_push(
         let requested = -dx;
         let actual_outward = (-actual_dx).max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 || after.0 < display.origin_x {
-            return Some((ScreenEdge::Left, blocked));
+        if blocked > 0 || after.0 <= display.origin_x {
+            return Some((
+                ScreenEdge::Left,
+                edge_push_amount(blocked, requested, after.0 <= display.origin_x),
+            ));
         }
     }
     if dx > 0 && after.0 >= max_x - EDGE_TOLERANCE_PX as f64 {
         let requested = dx;
         let actual_outward = actual_dx.max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 || after.0 > max_x {
-            return Some((ScreenEdge::Right, blocked));
+        if blocked > 0 || after.0 >= max_x {
+            return Some((
+                ScreenEdge::Right,
+                edge_push_amount(blocked, requested, after.0 >= max_x),
+            ));
         }
     }
     if dy < 0 && after.1 <= display.origin_y + EDGE_TOLERANCE_PX as f64 {
         let requested = -dy;
         let actual_outward = (-actual_dy).max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 || after.1 < display.origin_y {
-            return Some((ScreenEdge::Up, blocked));
+        if blocked > 0 || after.1 <= display.origin_y {
+            return Some((
+                ScreenEdge::Up,
+                edge_push_amount(blocked, requested, after.1 <= display.origin_y),
+            ));
         }
     }
     if dy > 0 && after.1 >= max_y - EDGE_TOLERANCE_PX as f64 {
         let requested = dy;
         let actual_outward = actual_dy.max(0.0);
         let blocked = (f64::from(requested) - actual_outward).max(0.0).round() as i32;
-        if blocked > 0 || after.1 > max_y {
-            return Some((ScreenEdge::Down, blocked));
+        if blocked > 0 || after.1 >= max_y {
+            return Some((
+                ScreenEdge::Down,
+                edge_push_amount(blocked, requested, after.1 >= max_y),
+            ));
         }
     }
 
     None
+}
+
+fn edge_push_amount(blocked: i32, requested: i32, reached_boundary: bool) -> i32 {
+    if blocked == 0 && reached_boundary {
+        requested
+    } else {
+        blocked
+    }
 }
 
 fn inject_input_event(
@@ -713,7 +735,7 @@ fn inject_input_event(
     }
 
     let prepared = macos_inject::prepare_event_for_injection(event)?;
-    if macos_inject::inject_event(&prepared).is_err() {
+    if macos_inject::inject_prepared_event(&prepared).is_err() {
         simulate(&prepared).map_err(|err| anyhow::anyhow!("{err:?}"))?;
     }
     match event {
@@ -752,6 +774,54 @@ fn active_drag_button(state: &ClientInputState) -> Option<Button> {
     [Button::Left, Button::Right, Button::Middle]
         .into_iter()
         .find(|button| state.pressed_buttons.contains(button))
+}
+
+struct EdgePushTracker {
+    edge: Option<ScreenEdge>,
+    accumulated_px: i32,
+    last_update: Option<Instant>,
+}
+
+impl EdgePushTracker {
+    fn new() -> Self {
+        Self {
+            edge: None,
+            accumulated_px: 0,
+            last_update: None,
+        }
+    }
+
+    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: i32, now: Instant) -> bool {
+        if push_px <= 0 {
+            return false;
+        }
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.accumulated_px = 0;
+        }
+        self.accumulated_px = self.accumulated_px.saturating_add(push_px);
+        self.last_update = Some(now);
+        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
+            self.accumulated_px = 0;
+            return true;
+        }
+        false
+    }
+
+    fn reset_if_stale(&mut self, now: Instant) {
+        if self
+            .last_update
+            .is_some_and(|last_update| now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT)
+        {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.edge = None;
+        self.accumulated_px = 0;
+        self.last_update = None;
+    }
 }
 
 fn map_mouse_button_event(event: &EventType) -> Option<(MouseButton, bool)> {
@@ -983,7 +1053,7 @@ impl EdgePushTracker {
 
 struct ClientReceiveProbe {
     start_cursor: (i32, i32),
-    layout: DisplayLayout,
+    layout: Arc<DisplayLayout>,
     duration_secs: u64,
     total_messages: u64,
     relative_messages: u64,
@@ -1536,7 +1606,38 @@ mod tests {
             20,
             0,
         );
-        assert_eq!(edge, Some((ScreenEdge::Right, 0)));
+        assert_eq!(edge, Some((ScreenEdge::Right, 20)));
+    }
+
+    #[test]
+    fn detect_client_edge_push_counts_motion_landing_on_edge() {
+        let edge = detect_client_edge_push(
+            (5.0, 100.0),
+            (0.0, 100.0),
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            -5,
+            0,
+        );
+        assert_eq!(edge, Some((ScreenEdge::Left, 5)));
+    }
+
+    #[test]
+    fn edge_push_tracker_requires_threshold_and_resets_after_timeout() {
+        let start = Instant::now();
+        let mut tracker = EdgePushTracker::new();
+
+        assert!(!tracker.register_outward_push(ScreenEdge::Left, 5, start));
+        assert!(tracker.register_outward_push(ScreenEdge::Left, 11, start));
+        assert!(!tracker.register_outward_push(
+            ScreenEdge::Left,
+            15,
+            start + EDGE_PUSH_RESET_TIMEOUT
+        ));
     }
 
     #[test]

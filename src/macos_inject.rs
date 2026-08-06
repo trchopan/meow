@@ -30,8 +30,7 @@ mod imp {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow!("failed to create macOS HID event source"))?;
 
-        let event = prepare_event_for_injection(event)?;
-        match &event {
+        match event {
             EventType::KeyPress(key) | EventType::KeyRelease(key) => {
                 let keycode =
                     keycode(*key).ok_or_else(|| anyhow!("unsupported macOS key: {key:?}"))?;
@@ -41,8 +40,8 @@ mod imp {
                 event.post(CGEventTapLocation::HID);
             }
             EventType::ButtonPress(button) | EventType::ButtonRelease(button) => {
-                let (event_type, mouse_button) = mouse_button_event(*button, &event)?;
-                let location = current_location()?;
+                let (event_type, mouse_button) = mouse_button_event(*button, event)?;
+                let location = bounded_pointer_location()?;
                 let event = CGEvent::new_mouse_event(source, event_type, location, mouse_button)
                     .map_err(|_| anyhow!("failed to create macOS mouse event"))?;
                 event.post(CGEventTapLocation::HID);
@@ -71,6 +70,10 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn inject_prepared_event(event: &EventType) -> Result<()> {
+        inject_event(event)
     }
 
     pub(crate) fn cancel_input_composition() -> Result<()> {
@@ -162,6 +165,15 @@ mod imp {
         Ok(CGEvent::new(source)
             .map_err(|_| anyhow!("failed to read current macOS pointer location"))?
             .location())
+    }
+
+    fn bounded_pointer_location() -> Result<CGPoint> {
+        let location = current_location()?;
+        let layout = display_layout()?;
+        let (x, y) = layout
+            .clamp_absolute_point(location.x, location.y, location.x, location.y)
+            .ok_or_else(|| anyhow!("macOS display layout is empty"))?;
+        Ok(CGPoint::new(x, y))
     }
 
     fn flags_for_modifiers(modifiers: &ModifierFlags) -> core_graphics::event::CGEventFlags {
@@ -341,6 +353,10 @@ mod imp {
         ))
     }
 
+    pub(crate) fn inject_prepared_event(event: &EventType) -> Result<()> {
+        inject_event(event)
+    }
+
     pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
         Ok(event.clone())
     }
@@ -380,7 +396,12 @@ mod imp {
 }
 
 pub(crate) fn inject_event(event: &EventType) -> Result<()> {
-    imp::inject_event(event)
+    let prepared = imp::prepare_event_for_injection(event)?;
+    imp::inject_event(&prepared)
+}
+
+pub(crate) fn inject_prepared_event(event: &EventType) -> Result<()> {
+    imp::inject_prepared_event(event)
 }
 
 pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {

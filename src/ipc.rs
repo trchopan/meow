@@ -244,6 +244,13 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
             .pending_release_sides
             .fetch_or(previous_side.release_bit(), Ordering::AcqRel);
     }
+    if let Some(target_side) = target.to_side()
+        && target != previous_target
+    {
+        state
+            .pending_center_target
+            .store(ActiveTarget::from(target_side).to_u8(), Ordering::Release);
+    }
     state.active_target.store(target.to_u8(), Ordering::Relaxed);
 
     let should_lock = target.to_side().is_some();
@@ -386,6 +393,7 @@ mod tests {
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
             next_remote_generation: Arc::new(AtomicU64::new(1)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            pending_center_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             last_remote_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),

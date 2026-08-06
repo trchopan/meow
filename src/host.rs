@@ -106,6 +106,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let next_remote_generation = Arc::new(AtomicU64::new(1));
     let pending_release_sides = Arc::new(AtomicU8::new(0));
+    let pending_center_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let last_remote_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
     let target_epoch = Arc::new(AtomicU64::new(0));
     let next_clipboard_request = Arc::new(AtomicU64::new(1));
@@ -126,6 +127,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         remotes: remotes.clone(),
         next_remote_generation: next_remote_generation.clone(),
         pending_release_sides: pending_release_sides.clone(),
+        pending_center_target: pending_center_target.clone(),
         last_remote_target: last_remote_target.clone(),
         target_epoch: target_epoch.clone(),
         next_clipboard_request: next_clipboard_request.clone(),
@@ -815,6 +817,22 @@ async fn reconcile_target_transition(
         *modifier_flags = ModifierFlags::default();
         pressed_keys.clear();
     }
+    let pending_center = ActiveTarget::from_u8(state.pending_center_target.load(Ordering::Acquire));
+    if pending_center == current_target
+        && pending_center.to_side().is_some()
+        && state
+            .pending_center_target
+            .compare_exchange(
+                pending_center.to_u8(),
+                ActiveTarget::Local.to_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        let side = pending_center.to_side().expect("remote target has a side");
+        let _ = send_to_side(state, side, HostToClientMessage::CenterPointer { seq: 0 }, false).await;
+    }
     current_target
 }
 
@@ -934,6 +952,7 @@ fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessag
             HostToClientMessage::RelativeMotion { seq, dx, dy }
         }
         HostToClientMessage::ReleaseAll { .. } => HostToClientMessage::ReleaseAll { seq },
+        HostToClientMessage::CenterPointer { .. } => HostToClientMessage::CenterPointer { seq },
         message @ HostToClientMessage::ClipboardPaste { .. }
         | message @ HostToClientMessage::ClipboardRequest { .. } => message,
     }
@@ -1309,6 +1328,7 @@ mod tests {
             )]))),
             next_remote_generation: Arc::new(AtomicU64::new(2)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
+            pending_center_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             last_remote_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),

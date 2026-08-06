@@ -1106,6 +1106,18 @@ mod tests {
     }
 
     #[test]
+    fn host_edge_zone_requires_dwell_after_remote_reset() {
+        let mut tracker = EdgeZoneTracker::new();
+        let start = Instant::now();
+        let dwell = Duration::from_millis(150);
+
+        tracker.mark_triggered();
+        tracker.reset();
+        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
+        assert!(tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
+    }
+
+    #[test]
     fn host_edge_zone_direction_change_starts_new_dwell() {
         let mut tracker = EdgeZoneTracker::new();
         let start = Instant::now();

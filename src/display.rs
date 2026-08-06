@@ -1,4 +1,4 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -138,13 +138,13 @@ fn distance_to_display(display: &DisplayGeometry, x: f64, y: f64) -> f64 {
 const DISPLAY_LAYOUT_CACHE_TTL: Duration = Duration::from_millis(100);
 
 struct DisplayLayoutCache {
-    layout: Option<DisplayLayout>,
+    layout: Option<Arc<DisplayLayout>>,
     refreshed_at: Instant,
 }
 
 static DISPLAY_LAYOUT_CACHE: OnceLock<Mutex<DisplayLayoutCache>> = OnceLock::new();
 
-pub(crate) fn display_layout() -> Result<DisplayLayout> {
+pub(crate) fn display_layout() -> Result<Arc<DisplayLayout>> {
     let cache = DISPLAY_LAYOUT_CACHE.get_or_init(|| {
         Mutex::new(DisplayLayoutCache {
             layout: None,
@@ -155,7 +155,7 @@ pub(crate) fn display_layout() -> Result<DisplayLayout> {
         .lock()
         .map_err(|_| anyhow::anyhow!("display layout cache mutex poisoned"))?;
     if cache.layout.is_none() || cache.refreshed_at.elapsed() >= DISPLAY_LAYOUT_CACHE_TTL {
-        cache.layout = Some(query_display_layout()?);
+        cache.layout = Some(Arc::new(query_display_layout()?));
         cache.refreshed_at = Instant::now();
     }
     cache
@@ -353,6 +353,55 @@ mod tests {
         assert_eq!(
             layout.clamp_absolute_point(150.0, 50.0, 20.0, 50.0),
             Some((99.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn absolute_point_outside_layout_is_clamped_to_nearest_display() {
+        let display = DisplayGeometry {
+            origin_x: 100.0,
+            origin_y: 40.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+        let layout = DisplayLayout {
+            displays: vec![display],
+            main: display,
+        };
+
+        assert_eq!(
+            layout.clamp_absolute_point(1800.0, 1200.0, 1800.0, 1200.0),
+            Some((1611.0, 1021.0))
+        );
+    }
+
+    #[test]
+    fn layout_handles_negative_and_vertically_offset_displays() {
+        let left = DisplayGeometry {
+            origin_x: -1280.0,
+            origin_y: 120.0,
+            width: 1280.0,
+            height: 800.0,
+        };
+        let main = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let layout = DisplayLayout {
+            displays: vec![left, main],
+            main,
+        };
+
+        assert_eq!(layout.display_at(-100.0, 200.0), Some(left));
+        assert_eq!(
+            layout.clamp_pointer_move(-10.0, 200.0, -20, 0),
+            Some((-30.0, 200.0, -20, 0))
+        );
+        assert_eq!(
+            layout.clamp_absolute_point(-1400.0, 1000.0, -100.0, 200.0),
+            Some((-1280.0, 919.0))
         );
     }
 }
