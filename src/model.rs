@@ -189,7 +189,6 @@ pub(crate) struct HostState {
     pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
     pub(crate) next_remote_generation: Arc<AtomicU64>,
     pub(crate) pending_release_sides: Arc<AtomicU8>,
-    pub(crate) pending_center_target: Arc<AtomicU8>,
     pub(crate) last_remote_target: Arc<AtomicU8>,
     pub(crate) target_epoch: Arc<AtomicU64>,
     pub(crate) next_clipboard_request: Arc<AtomicU64>,

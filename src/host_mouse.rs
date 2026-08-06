@@ -3,6 +3,8 @@ use anyhow::Result;
 #[cfg(target_os = "macos")]
 mod imp {
     use anyhow::{Result, anyhow};
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::{display::CGDisplay, geometry::CGPoint};
 
     pub(crate) fn set_pointer_dissociation(enabled: bool) -> Result<()> {
@@ -18,6 +20,14 @@ mod imp {
     pub(crate) fn warp_pointer(x: f64, y: f64) -> Result<()> {
         CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y))
             .map_err(|err| anyhow!("CGWarpMouseCursorPosition failed with code {}", err))
+    }
+
+    pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow!("failed to create CGEventSource"))?;
+        let event = CGEvent::new(source).map_err(|_| anyhow!("failed to create CGEvent"))?;
+        let location = event.location();
+        Ok((location.x, location.y))
     }
 
     pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {
@@ -53,6 +63,10 @@ mod imp {
         Ok(())
     }
 
+    pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
+        Ok((0.0, 0.0))
+    }
+
     pub(crate) fn set_pointer_visible(_visible: bool) -> Result<()> {
         Ok(())
     }
@@ -66,10 +80,8 @@ pub(crate) fn warp_pointer(x: f64, y: f64) -> Result<()> {
     imp::warp_pointer(x, y)
 }
 
-pub(crate) fn center_pointer() -> Result<(f64, f64)> {
-    let position = crate::display::main_display_geometry()?.center();
-    warp_pointer(position.0, position.1)?;
-    Ok(position)
+pub(crate) fn current_pointer_position() -> Result<(f64, f64)> {
+    imp::current_pointer_position()
 }
 
 pub(crate) fn set_pointer_visible(visible: bool) -> Result<()> {

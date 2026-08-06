@@ -285,20 +285,6 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     }
                 }
             }
-            HostToClientMessage::CenterPointer { seq } => {
-                let seq_status = sequence_tracker.observe(seq);
-                if let Some(probe) = probe.as_mut() {
-                    probe.note_sequence(seq_status);
-                }
-                if !args.no_inject {
-                    let display = main_display_geometry()?;
-                    let (x, y) = display.center();
-                    enigo.mouse_move_to(x.round() as i32, y.round() as i32);
-                }
-                last_signaled_edge = None;
-                edge_push.reset();
-                debug!("centered pointer for remote activation");
-            }
             HostToClientMessage::ReleaseAll { seq } => {
                 let seq_status = sequence_tracker.observe(seq);
                 if let Some(probe) = probe.as_mut() {
