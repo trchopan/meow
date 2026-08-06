@@ -33,8 +33,8 @@ use crate::{
     macos_mouse_delta::run_macos_mouse_delta_capture,
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
-        ActiveTarget, CapturedEvent, CapturedInput, HostState, PendingClipboardRequest, RemotePeer,
-        RemotePointerMode, RuntimeStats, ScreenEdge, Side,
+        ActiveTarget, CapturedEvent, CapturedInput, HostState, PeerMessage,
+        PendingClipboardRequest, RemotePeer, RemotePointerMode, RuntimeStats, ScreenEdge, Side,
     },
     presentation::print_host_ready,
     protocol::{
@@ -201,7 +201,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         });
     }
 
-    tokio::spawn(run_forward_loop(
+    let forward_task = tokio::spawn(run_forward_loop(
         input_rx,
         directional_switch_rx,
         state.clone(),
@@ -214,11 +214,22 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         }
     });
 
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         if state.shutdown_requested.load(Ordering::Relaxed) {
             break;
         }
         let incoming = tokio::select! {
+            signal = &mut ctrl_c => {
+                match signal {
+                    Ok(()) => info!("Ctrl+C received, shutting down host"),
+                    Err(err) => warn!("failed waiting for Ctrl+C; shutting down host: {err}"),
+                }
+                state.shutdown_requested.store(true, Ordering::Relaxed);
+                state.shutdown_notify.notify_waiters();
+                break;
+            }
             _ = state.shutdown_notify.notified() => {
                 break;
             }
@@ -226,7 +237,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         };
 
         let Some(incoming) = incoming else {
-            bail!("endpoint closed")
+            warn!("host endpoint closed, shutting down");
+            state.shutdown_requested.store(true, Ordering::Relaxed);
+            state.shutdown_notify.notify_waiters();
+            break;
         };
 
         let state = state.clone();
@@ -238,7 +252,11 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         });
     }
 
+    let forward_completed = forward_task.await.is_ok();
     apply_target_change(&state, ActiveTarget::Local, "daemon shutdown");
+    if !forward_completed {
+        release_all_remote_inputs(&state).await;
+    }
     ensure_pointer_restored();
     let _ = std::fs::remove_file(crate::state::socket_path()?);
     Ok(())
@@ -267,6 +285,10 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
         bail!("invalid secret from {remote_id}")
     }
 
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        bail!("host is shutting down");
+    }
+
     write_framed(
         &mut send,
         &AuthResponse {
@@ -276,12 +298,15 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
     )
     .await?;
 
-    let (input_tx, mut input_rx) =
-        mpsc::channel::<HostToClientMessage>(peer_writer_channel_capacity());
+    let (input_tx, mut input_rx) = mpsc::channel::<PeerMessage>(peer_writer_channel_capacity());
     tokio::spawn(async move {
         while let Some(message) = input_rx.recv().await {
-            if let Err(err) = write_framed(&mut send, &message).await {
-                debug!("host->client writer stream ended: {err:#}");
+            let written = write_framed(&mut send, &message.message).await.is_ok();
+            if let Some(complete) = message.complete {
+                let _ = complete.send(written);
+            }
+            if !written {
+                debug!("host->client writer stream ended");
                 break;
             }
         }
@@ -303,9 +328,12 @@ async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> 
         if let Some(previous) = previous {
             clear_pending_clipboard_request(&state, auth.side, previous.generation);
             let seq = previous.next_seq.fetch_add(1, Ordering::Relaxed);
-            let _ = previous
-                .input_tx
-                .try_send(HostToClientMessage::ReleaseAll { seq });
+            if !send_release_request(&previous, HostToClientMessage::ReleaseAll { seq }).await {
+                warn!(
+                    "failed delivering release-all to replaced remote {:?}",
+                    auth.side
+                );
+            }
             info!(
                 "replaced existing remote on {:?}: old={} new={}",
                 auth.side, previous.remote_id, remote_id
@@ -552,6 +580,7 @@ async fn run_forward_loop(
                     maybe_captured = rx.recv() => {
                         let Some(captured) = maybe_captured else {
                             flush_pending_relative(&state, &mut pending_relative).await;
+                            release_all_remote_inputs(&state).await;
                             break;
                         };
 
@@ -849,7 +878,10 @@ async fn send_to_side(
     let with_seq = assign_sequence(message, seq);
 
     debug!("forwarding input event to {:?} ({})", side, peer.name);
-    match peer.input_tx.try_send(with_seq) {
+    match peer.input_tx.try_send(PeerMessage {
+        message: with_seq,
+        complete: None,
+    }) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             if drop_if_full {
@@ -1010,16 +1042,8 @@ async fn send_release_all_to_side(state: &HostState, side: Side) {
     };
 
     let seq = peer.next_seq.fetch_add(1, Ordering::Relaxed);
-    let message = HostToClientMessage::ReleaseAll { seq };
-    let result = tokio::select! {
-        result = peer.input_tx.send(message) => result.map_err(|_| "writer channel closed"),
-        _ = time::sleep(Duration::from_millis(500)) => Err("writer queue timeout"),
-    };
-    if let Err(reason) = result {
-        warn!(
-            "failed sending release-all to {:?} ({}): {reason}",
-            side, peer.name
-        );
+    if !send_release_request(&peer, HostToClientMessage::ReleaseAll { seq }).await {
+        warn!("failed sending release-all to {:?} ({})", side, peer.name);
         state
             .runtime_stats
             .recovery_events
@@ -1029,6 +1053,25 @@ async fn send_release_all_to_side(state: &HostState, side: Side) {
         {
             apply_target_change(state, ActiveTarget::Local, "release-all delivery failure");
         }
+    }
+}
+
+async fn send_release_request(peer: &RemotePeer, message: HostToClientMessage) -> bool {
+    let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+    let request = PeerMessage {
+        message,
+        complete: Some(complete_tx),
+    };
+    let sent = tokio::time::timeout(Duration::from_millis(500), peer.input_tx.send(request))
+        .await
+        .is_ok_and(|result| result.is_ok());
+    if !sent {
+        return false;
+    }
+
+    match tokio::time::timeout(Duration::from_millis(500), complete_rx).await {
+        Ok(Ok(written)) => written,
+        Ok(Err(_)) | Err(_) => false,
     }
 }
 
@@ -1246,7 +1289,7 @@ mod tests {
     use super::*;
     use tokio::sync::Notify;
 
-    fn test_forward_state(side: Side, input_tx: mpsc::Sender<HostToClientMessage>) -> HostState {
+    fn test_forward_state(side: Side, input_tx: mpsc::Sender<PeerMessage>) -> HostState {
         HostState {
             endpoint_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
@@ -1530,6 +1573,25 @@ mod tests {
     async fn transition_flushes_motion_before_release_all() {
         let (input_tx, mut input_rx) = mpsc::channel(4);
         let state = test_forward_state(Side::Right, input_tx);
+        let order_task = tokio::spawn(async move {
+            assert!(matches!(
+                input_rx.recv().await,
+                Some(PeerMessage {
+                    message: HostToClientMessage::RelativeMotion { dx: 3, dy: 4, .. },
+                    ..
+                })
+            ));
+            let release = input_rx.recv().await.expect("release-all message");
+            assert!(matches!(
+                release.message,
+                HostToClientMessage::ReleaseAll { .. }
+            ));
+            release
+                .complete
+                .expect("release completion")
+                .send(true)
+                .expect("release completion receiver");
+        });
         state
             .pending_release_sides
             .store(Side::Right.release_bit(), Ordering::Release);
@@ -1548,16 +1610,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            input_rx.recv().await,
-            Some(HostToClientMessage::RelativeMotion { dx: 3, dy: 4, .. })
-        ));
-        assert!(matches!(
-            input_rx.recv().await,
-            Some(HostToClientMessage::ReleaseAll { .. })
-        ));
         assert_eq!(modifier_flags, ModifierFlags::default());
         assert!(pressed_keys.is_empty());
+        order_task.await.expect("writer order task");
     }
 
     #[tokio::test]

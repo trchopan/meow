@@ -10,7 +10,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use crate::{
     host_mouse,
     input::clamp_relative_delta,
-    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats},
+    model::{ActiveTarget, CapturedEvent, CapturedInput, RuntimeStats, TARGET_TRANSITION_LOCK},
 };
 
 fn should_capture_motion(target: ActiveTarget, pointer_lock_active: bool) -> bool {
@@ -71,6 +71,9 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 event_type,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
+                let _transition_guard = TARGET_TRANSITION_LOCK
+                    .lock()
+                    .expect("target transition mutex poisoned");
                 let port = callback_tap_port.load(Ordering::Relaxed);
                 if matches!(event_type, CGEventType::TapDisabledByTimeout) {
                     if !port.is_null() {
@@ -114,6 +117,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                     && let Err(err) = host_mouse::set_pointer_visible(true)
                 {
                     warn!("failed to show pointer after tap disable: {err:#}");
+                    pointer_hidden.store(true, Ordering::Relaxed);
                 }
                 *pinned_pointer_pos
                     .lock()

@@ -17,7 +17,7 @@ use crate::{
     host_mouse,
     model::{
         ActiveTarget, CapturedEvent, CapturedInput, PendingClipboardRequest, RuntimeStats,
-        ScreenEdge, Side,
+        ScreenEdge, Side, TARGET_TRANSITION_LOCK,
     },
 };
 
@@ -201,6 +201,9 @@ pub(crate) fn run_input_grab(
             && (!detach_chord.meta || is_meta_down)
             && (!detach_chord.shift || is_shift_down)
         {
+            let _transition_guard = TARGET_TRANSITION_LOCK
+                .lock()
+                .expect("target transition mutex poisoned");
             let previous_target = target;
             active_target.store(ActiveTarget::Local.to_u8(), Ordering::Relaxed);
             target_epoch.fetch_add(1, Ordering::AcqRel);
@@ -523,6 +526,9 @@ fn force_local_on_capture_saturation(
     pending_release_sides: &Arc<AtomicU8>,
     pending_clipboard_request: &Arc<Mutex<Option<PendingClipboardRequest>>>,
 ) {
+    let _transition_guard = TARGET_TRANSITION_LOCK
+        .lock()
+        .expect("target transition mutex poisoned");
     let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
     if matches!(target, ActiveTarget::Local) {
         return;

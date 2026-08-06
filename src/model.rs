@@ -16,6 +16,8 @@ use tokio::sync::mpsc;
 
 use crate::protocol::HostToClientMessage;
 
+pub(crate) static TARGET_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Side {
@@ -164,11 +166,16 @@ pub(crate) enum CapturedEvent {
 
 #[derive(Clone)]
 pub(crate) struct RemotePeer {
-    pub(crate) input_tx: mpsc::Sender<HostToClientMessage>,
+    pub(crate) input_tx: mpsc::Sender<PeerMessage>,
     pub(crate) next_seq: Arc<AtomicU64>,
     pub(crate) remote_id: EndpointId,
     pub(crate) generation: u64,
     pub(crate) name: String,
+}
+
+pub(crate) struct PeerMessage {
+    pub(crate) message: HostToClientMessage,
+    pub(crate) complete: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 #[derive(Clone)]
