@@ -1002,55 +1002,6 @@ fn is_modifier_key(key: Key) -> bool {
     )
 }
 
-struct EdgePushTracker {
-    edge: Option<ScreenEdge>,
-    accumulated_px: i32,
-    last_update: Option<Instant>,
-}
-
-impl EdgePushTracker {
-    fn new() -> Self {
-        Self {
-            edge: None,
-            accumulated_px: 0,
-            last_update: None,
-        }
-    }
-
-    fn register_outward_push(&mut self, edge: ScreenEdge, push_px: i32, now: Instant) -> bool {
-        if push_px <= 0 {
-            return false;
-        }
-
-        if self.edge != Some(edge) {
-            self.edge = Some(edge);
-            self.accumulated_px = 0;
-        }
-
-        self.accumulated_px = self.accumulated_px.saturating_add(push_px);
-        self.last_update = Some(now);
-        if self.accumulated_px >= EDGE_PUSH_THRESHOLD_PX {
-            self.accumulated_px = 0;
-            return true;
-        }
-        false
-    }
-
-    fn reset_if_stale(&mut self, now: Instant) {
-        if let Some(last_update) = self.last_update
-            && now.duration_since(last_update) >= EDGE_PUSH_RESET_TIMEOUT
-        {
-            self.reset();
-        }
-    }
-
-    fn reset(&mut self) {
-        self.edge = None;
-        self.accumulated_px = 0;
-        self.last_update = None;
-    }
-}
-
 struct ClientReceiveProbe {
     start_cursor: (i32, i32),
     layout: Arc<DisplayLayout>,

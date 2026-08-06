@@ -208,6 +208,17 @@ mod tests {
     }
 
     #[test]
+    fn host_center_pointer_round_trip_serde() {
+        let msg = HostToClientMessage::CenterPointer { seq: 12 };
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let round_trip: HostToClientMessage = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(
+            round_trip,
+            HostToClientMessage::CenterPointer { seq: 12 }
+        ));
+    }
+
+    #[test]
     fn clipboard_messages_round_trip_serde() {
         let outbound = HostToClientMessage::ClipboardPaste {
             request_id: 12,

@@ -782,11 +782,11 @@ impl EdgeZoneTracker {
         self.disarmed_edge = edge;
     }
 
-    fn rearm_if_far(&mut self, x: f64, y: f64, width: u64, height: u64, zone_px: u32) {
+    fn rearm_if_far(&mut self, x: f64, y: f64, display: DisplayGeometry, zone_px: u32) {
         let Some(edge) = self.disarmed_edge else {
             return;
         };
-        if is_far_from_edge(x, y, width, height, edge, zone_px) {
+        if is_far_from_edge(x, y, display, edge, zone_px) {
             self.disarmed_edge = None;
         }
     }
@@ -1155,14 +1155,34 @@ mod tests {
         tracker.disarm(Some(ScreenEdge::Right));
         assert!(!tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
 
-        tracker.rearm_if_far(1894.0, 500.0, 1920, 1080, 12);
+        tracker.rearm_if_far(
+            1894.0,
+            500.0,
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+        );
         assert!(!tracker.enter_or_stay(
             ScreenEdge::Right,
             start + dwell + Duration::from_millis(1),
             dwell
         ));
 
-        tracker.rearm_if_far(25.0, 500.0, 1920, 1080, 12);
+        tracker.rearm_if_far(
+            25.0,
+            500.0,
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+        );
         assert!(!tracker.enter_or_stay(
             ScreenEdge::Right,
             start + dwell + Duration::from_millis(2),
@@ -1182,7 +1202,17 @@ mod tests {
         let dwell = Duration::from_millis(150);
 
         tracker.disarm(Some(ScreenEdge::Right));
-        tracker.rearm_if_far(25.0, 500.0, 1920, 1080, 12);
+        tracker.rearm_if_far(
+            25.0,
+            500.0,
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+        );
 
         assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
         assert!(tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
@@ -1190,70 +1220,61 @@ mod tests {
 
     #[test]
     fn edge_rearm_distance_has_explicit_boundaries_for_each_edge() {
-        let display = (1920, 1080);
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
         let zone = 12;
 
         assert!(!is_far_from_edge(
             24.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Left,
             zone
         ));
         assert!(is_far_from_edge(
             25.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Left,
             zone
         ));
         assert!(!is_far_from_edge(
             1895.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Right,
             zone
         ));
         assert!(is_far_from_edge(
             1894.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Right,
             zone
         ));
         assert!(!is_far_from_edge(
             500.0,
             24.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Up,
             zone
         ));
-        assert!(is_far_from_edge(
-            500.0,
-            25.0,
-            display.0,
-            display.1,
-            ScreenEdge::Up,
-            zone
-        ));
+        assert!(is_far_from_edge(500.0, 25.0, display, ScreenEdge::Up, zone));
         assert!(!is_far_from_edge(
             500.0,
             1055.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Down,
             zone
         ));
         assert!(is_far_from_edge(
             500.0,
             1054.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Down,
             zone
         ));
@@ -1261,38 +1282,39 @@ mod tests {
 
     #[test]
     fn edge_rearm_distance_remains_reachable_for_large_zones() {
-        let display = (1440, 900);
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
         let zone = 1000;
 
         assert!(is_far_from_edge(
             1439.0,
             450.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Left,
             zone
         ));
         assert!(is_far_from_edge(
             0.0,
             450.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Right,
             zone
         ));
         assert!(is_far_from_edge(
             720.0,
             899.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Up,
             zone
         ));
         assert!(is_far_from_edge(
             720.0,
             0.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Down,
             zone
         ));

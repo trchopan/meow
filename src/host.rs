@@ -510,7 +510,15 @@ async fn maybe_switch_to_local_on_edge(
         return;
     }
 
+    drop(remotes);
     apply_target_change(state, ActiveTarget::Local, "client edge reached");
+    let _ = send_to_side(
+        state,
+        side,
+        HostToClientMessage::CenterPointer { seq: 0 },
+        false,
+    )
+    .await;
     info!(
         "switched to local after host-facing edge {:?} from {:?} ({})",
         edge, side, peer_name
@@ -831,7 +839,13 @@ async fn reconcile_target_transition(
             .is_ok()
     {
         let side = pending_center.to_side().expect("remote target has a side");
-        let _ = send_to_side(state, side, HostToClientMessage::CenterPointer { seq: 0 }, false).await;
+        let _ = send_to_side(
+            state,
+            side,
+            HostToClientMessage::CenterPointer { seq: 0 },
+            false,
+        )
+        .await;
     }
     current_target
 }
