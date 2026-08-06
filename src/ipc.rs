@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     host_mouse,
-    model::{ActiveTarget, HostState, RemotePointerMode, Side},
+    model::{ActiveTarget, HostState, RemotePointerMode, Side, TARGET_TRANSITION_LOCK},
     presentation::print_status_response,
     state::{host_state_path, load_or_create_host_state, socket_path, write_host_state_file},
 };
@@ -115,10 +115,10 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
             status: Some(status_payload(&state).await),
         },
         IpcCommand::Stop => {
-            apply_target_change(&state, ActiveTarget::Local, "daemon stop");
-            ensure_pointer_restored();
             state.shutdown_requested.store(true, Ordering::Relaxed);
             state.shutdown_notify.notify_waiters();
+            apply_target_change(&state, ActiveTarget::Local, "daemon stop");
+            ensure_pointer_restored();
             let response = IpcResponse {
                 ok: true,
                 message: "stopping host daemon".to_string(),
@@ -137,6 +137,9 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
 
 #[cfg(not(test))]
 pub(crate) fn ensure_pointer_restored() {
+    let _transition_guard = TARGET_TRANSITION_LOCK
+        .lock()
+        .expect("target transition mutex poisoned");
     if let Err(err) = host_mouse::set_pointer_dissociation(false) {
         warn!("failed to disable pointer dissociation during shutdown: {err:#}");
     }
@@ -172,6 +175,9 @@ pub(crate) async fn switch_target_if_attached(
     target: ActiveTarget,
     context: &str,
 ) -> bool {
+    if state.shutdown_requested.load(Ordering::Acquire) && target != ActiveTarget::Local {
+        return false;
+    }
     let remotes = state.remotes.write().await;
     if target
         .to_side()
@@ -211,6 +217,12 @@ fn persist_pointer_mode(endpoint_id: iroh::EndpointId, mode: RemotePointerMode) 
 }
 
 pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, context: &str) {
+    let _transition_guard = TARGET_TRANSITION_LOCK
+        .lock()
+        .expect("target transition mutex poisoned");
+    if state.shutdown_requested.load(Ordering::Acquire) && target != ActiveTarget::Local {
+        return;
+    }
     let previous_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     if previous_target != target {
         state.target_epoch.fetch_add(1, Ordering::AcqRel);
@@ -235,9 +247,7 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     state.active_target.store(target.to_u8(), Ordering::Relaxed);
 
     let should_lock = target.to_side().is_some();
-    let was_locked = state
-        .pointer_lock_active
-        .swap(should_lock, Ordering::Relaxed);
+    let was_locked = state.pointer_lock_active.load(Ordering::Relaxed);
 
     if should_lock && !was_locked {
         match host_mouse::current_pointer_position() {
@@ -254,13 +264,31 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
         }
     }
 
-    if was_locked != should_lock
-        && let Err(err) = host_mouse::set_pointer_dissociation(should_lock)
-    {
-        warn!("failed to update pointer dissociation enabled={should_lock}: {err:#}");
-    }
+    let lock_active = if should_lock {
+        if !was_locked {
+            match host_mouse::set_pointer_dissociation(true) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!("failed to enable pointer dissociation: {err:#}");
+                    false
+                }
+            }
+        } else {
+            true
+        }
+    } else {
+        if (was_locked || previous_target.to_side().is_some())
+            && let Err(err) = host_mouse::set_pointer_dissociation(false)
+        {
+            warn!("failed to disable pointer dissociation: {err:#}");
+        }
+        false
+    };
+    state
+        .pointer_lock_active
+        .store(lock_active, Ordering::Relaxed);
 
-    let should_hide = should_lock;
+    let should_hide = lock_active;
     let was_hidden = state.pointer_hidden.swap(should_hide, Ordering::Relaxed);
     if was_hidden != should_hide
         && let Err(err) = host_mouse::set_pointer_visible(!should_hide)
@@ -345,8 +373,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::sync::{Notify, RwLock, mpsc};
 
-    use crate::model::{HostState, PendingClipboardRequest, RemotePeer, RuntimeStats};
-    use crate::protocol::HostToClientMessage;
+    use crate::model::{HostState, PeerMessage, PendingClipboardRequest, RemotePeer, RuntimeStats};
 
     fn test_host_state() -> HostState {
         HostState {
@@ -408,6 +435,7 @@ mod tests {
         });
         apply_target_change(&state, ActiveTarget::Right, "test attach");
         assert_eq!(state.pending_release_sides.load(Ordering::Acquire), 0);
+        assert!(state.pointer_lock_active.load(Ordering::Acquire));
         assert_eq!(state.target_epoch.load(Ordering::Acquire), 1);
         assert!(
             state
@@ -418,6 +446,7 @@ mod tests {
         );
 
         apply_target_change(&state, ActiveTarget::Local, "test detach");
+        assert!(!state.pointer_lock_active.load(Ordering::Acquire));
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit()
@@ -431,6 +460,20 @@ mod tests {
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit() | Side::Left.release_bit()
         );
+    }
+
+    #[test]
+    fn shutdown_rejects_new_remote_target_changes() {
+        let state = test_host_state();
+        state.shutdown_requested.store(true, Ordering::Release);
+
+        apply_target_change(&state, ActiveTarget::Right, "late remote switch");
+
+        assert_eq!(
+            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+            ActiveTarget::Local
+        );
+        assert!(!state.pointer_lock_active.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -450,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn switch_target_validates_and_activates_under_one_lock() {
         let state = test_host_state();
-        let (input_tx, _input_rx) = mpsc::channel::<HostToClientMessage>(1);
+        let (input_tx, _input_rx) = mpsc::channel::<PeerMessage>(1);
         state.remotes.write().await.insert(
             Side::Right,
             RemotePeer {
