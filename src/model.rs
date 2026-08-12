@@ -180,6 +180,7 @@ pub(crate) struct PeerMessage {
 
 #[derive(Clone)]
 pub(crate) struct HostState {
+    pub(crate) blob_runtime: Arc<crate::blob::BlobRuntime>,
     pub(crate) endpoint_id: EndpointId,
     pub(crate) active_target: Arc<AtomicU8>,
     pub(crate) remote_pointer_mode: Arc<AtomicU8>,
@@ -194,7 +195,6 @@ pub(crate) struct HostState {
     pub(crate) next_clipboard_request: Arc<AtomicU64>,
     pub(crate) pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
     pub(crate) pending_clipboard_file: Arc<Mutex<Option<PendingClipboardFile>>>,
-    pub(crate) pending_clipboard_offer: Arc<Mutex<Option<PendingClipboardOffer>>>,
     pub(crate) runtime_stats: Arc<RuntimeStats>,
     pub(crate) shutdown_requested: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
@@ -214,12 +214,6 @@ pub(crate) struct PendingClipboardFile {
     pub(crate) side: Side,
     pub(crate) generation: u64,
     pub(crate) target_epoch: u64,
-    pub(crate) file: crate::clipboard::ClipboardFile,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PendingClipboardOffer {
-    pub(crate) request_id: u64,
 }
 
 #[derive(Default)]

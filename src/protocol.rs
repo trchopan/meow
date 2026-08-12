@@ -49,20 +49,12 @@ pub(crate) enum HostToClientMessage {
         request_id: u64,
         name: String,
         size: u64,
-        digest: [u8; 32],
+        blob_endpoint_id: String,
+        blob: String,
     },
     ClipboardFileDecision {
         request_id: u64,
         accepted: bool,
-    },
-    ClipboardFileData {
-        request_id: u64,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    ClipboardFileComplete {
-        request_id: u64,
-        digest: [u8; 32],
     },
 }
 
@@ -139,20 +131,12 @@ pub(crate) enum ClientToHostMessage {
         request_id: u64,
         name: String,
         size: u64,
-        digest: [u8; 32],
+        blob_endpoint_id: String,
+        blob: String,
     },
     ClipboardFileDecision {
         request_id: u64,
         accepted: bool,
-    },
-    ClipboardFileData {
-        request_id: u64,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    ClipboardFileComplete {
-        request_id: u64,
-        digest: [u8; 32],
     },
 }
 
@@ -296,32 +280,6 @@ mod tests {
             round_trip,
             ClientToHostMessage::ClipboardData { request_id: 12, text } if text == "hello"
         ));
-
-        let file = HostToClientMessage::ClipboardFileData {
-            request_id: 13,
-            offset: 0,
-            data: vec![1, 2, 3],
-        };
-        let bytes = bincode::serialize(&file).expect("serialize file");
-        let round_trip: HostToClientMessage =
-            bincode::deserialize(&bytes).expect("deserialize file");
-        assert!(matches!(
-            round_trip,
-            HostToClientMessage::ClipboardFileData { request_id: 13, offset: 0, data }
-                if data == vec![1, 2, 3]
-        ));
-
-        let complete = ClientToHostMessage::ClipboardFileComplete {
-            request_id: 13,
-            digest: [7; 32],
-        };
-        let bytes = bincode::serialize(&complete).expect("serialize completion");
-        let round_trip: ClientToHostMessage =
-            bincode::deserialize(&bytes).expect("deserialize completion");
-        assert!(matches!(
-            round_trip,
-            ClientToHostMessage::ClipboardFileComplete { request_id: 13, digest } if digest == [7; 32]
-        ));
     }
 
     #[test]
@@ -342,9 +300,7 @@ mod tests {
                 panic!("unexpected clipboard feedback")
             }
             ClientToHostMessage::ClipboardFileOffer { .. }
-            | ClientToHostMessage::ClipboardFileDecision { .. }
-            | ClientToHostMessage::ClipboardFileData { .. }
-            | ClientToHostMessage::ClipboardFileComplete { .. } => {
+            | ClientToHostMessage::ClipboardFileDecision { .. } => {
                 panic!("unexpected clipboard file feedback")
             }
         }

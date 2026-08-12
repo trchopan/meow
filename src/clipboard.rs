@@ -9,7 +9,6 @@ pub(crate) struct ClipboardFile {
     pub(crate) path: std::path::PathBuf,
     pub(crate) name: String,
     pub(crate) size: u64,
-    pub(crate) digest: [u8; 32],
 }
 
 pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
@@ -45,7 +44,6 @@ pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
                 MAX_FILE_SIZE / (1024 * 1024)
             );
         }
-        let digest = digest_file(&path)?;
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -55,7 +53,6 @@ pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
             path,
             name,
             size: metadata.len(),
-            digest,
         }))
     }
 
@@ -63,37 +60,6 @@ pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
     {
         Ok(None)
     }
-}
-
-pub(crate) fn read_file_chunk(file: &ClipboardFile, offset: u64) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    if offset > file.size {
-        bail!("clipboard file offset is out of bounds");
-    }
-    let mut source = std::fs::File::open(&file.path)?;
-    source.seek(SeekFrom::Start(offset))?;
-    let remaining = file.size - offset;
-    let mut chunk = vec![0u8; remaining.min(crate::protocol::FILE_CHUNK_SIZE as u64) as usize];
-    let read = source.read(&mut chunk)?;
-    chunk.truncate(read);
-    Ok(chunk)
-}
-
-fn digest_file(path: &std::path::Path) -> Result<[u8; 32]> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(target_os = "macos")]

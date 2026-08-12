@@ -236,11 +236,6 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
             .lock()
             .expect("clipboard file mutex poisoned")
             .take();
-        state
-            .pending_clipboard_offer
-            .lock()
-            .expect("clipboard offer mutex poisoned")
-            .take();
     }
     if let Some(side) = target.to_side() {
         state
@@ -387,6 +382,7 @@ mod tests {
 
     fn test_host_state() -> HostState {
         HostState {
+            blob_runtime: crate::blob::BlobRuntime::disabled(),
             endpoint_id: EndpointId::from(SecretKey::generate().public()),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
@@ -401,7 +397,6 @@ mod tests {
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(std::sync::Mutex::new(None)),
             pending_clipboard_file: Arc::new(std::sync::Mutex::new(None)),
-            pending_clipboard_offer: Arc::new(std::sync::Mutex::new(None)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

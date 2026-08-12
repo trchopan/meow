@@ -42,9 +42,14 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         }
         result = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::generate())
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
             .bind() => result.context("failed to create iroh endpoint"),
     }?;
+    let blob_runtime = crate::blob::BlobRuntime::start(endpoint.clone(), "client").await?;
+    let blob_router = iroh::protocol::Router::builder(endpoint.clone())
+        .accept(iroh_blobs::ALPN, blob_runtime.protocol())
+        .spawn();
+    endpoint.online().await;
 
     let connection = tokio::select! {
         signal = &mut ctrl_c => {
@@ -116,8 +121,6 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         args.input_overlay_position,
         args.input_overlay_idle_ms,
     );
-    let mut pending_file_offer: Option<(u64, String, u64, [u8; 32])> = None;
-    let mut incoming_file: Option<crate::file_transfer::IncomingFile> = None;
 
     let mut probe_completed = false;
     let mut interrupted = false;
@@ -340,14 +343,30 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     continue;
                 }
                 let feedback_connection = connection.clone();
+                let feedback_blob_runtime = blob_runtime.clone();
                 tokio::spawn(async move {
                     match tokio::task::spawn_blocking(clipboard::read_file).await {
                         Ok(Ok(Some(file))) => {
+                            let blob = match feedback_blob_runtime.add_path(&file.path).await {
+                                Ok(blob) => blob,
+                                Err(err) => {
+                                    warn!("failed to index clipboard file {request_id}: {err:#}");
+                                    return;
+                                }
+                            };
+                            let blob_endpoint_id = match feedback_blob_runtime.endpoint_id() {
+                                Ok(id) => id.to_string(),
+                                Err(err) => {
+                                    warn!("blob endpoint unavailable: {err:#}");
+                                    return;
+                                }
+                            };
                             let message = ClientToHostMessage::ClipboardFileOffer {
                                 request_id,
                                 name: file.name,
                                 size: file.size,
-                                digest: file.digest,
+                                blob_endpoint_id,
+                                blob,
                             };
                             if let Err(err) =
                                 send_client_feedback(&feedback_connection, &message).await
@@ -385,7 +404,8 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 request_id,
                 name,
                 size,
-                digest,
+                blob_endpoint_id,
+                blob,
             } => {
                 if args.no_inject {
                     continue;
@@ -396,118 +416,38 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                 })
                 .await
                 .unwrap_or(false);
-                if accepted {
-                    match crate::file_transfer::IncomingFile::new(&name, size, digest) {
-                        Ok(file) => incoming_file = Some(file),
+                let target = if accepted {
+                    match crate::file_transfer::DownloadTarget::new(&name) {
+                        Ok(target) => Some(target),
                         Err(err) => {
                             warn!("failed to prepare clipboard file {request_id}: {err:#}");
                             accepted = false;
+                            None
                         }
                     }
-                }
-                if accepted {
-                    pending_file_offer = Some((request_id, name, size, digest));
-                }
+                } else {
+                    None
+                };
                 let message = ClientToHostMessage::ClipboardFileDecision {
                     request_id,
                     accepted,
                 };
                 if let Err(err) = send_client_feedback(&connection, &message).await {
                     warn!("failed sending clipboard file decision {request_id}: {err:#}");
-                    pending_file_offer = None;
-                    incoming_file = None;
-                }
-            }
-            HostToClientMessage::ClipboardFileDecision {
-                request_id,
-                accepted,
-            } => {
-                if args.no_inject || !accepted {
-                    continue;
-                }
-                let feedback_connection = connection.clone();
-                tokio::spawn(async move {
-                    let file = match tokio::task::spawn_blocking(clipboard::read_file).await {
-                        Ok(Ok(Some(file))) => file,
-                        Ok(Ok(None)) => {
-                            warn!("clipboard file disappeared before approval {request_id}");
-                            return;
-                        }
-                        Ok(Err(err)) => {
-                            warn!("failed to reread clipboard file {request_id}: {err:#}");
-                            return;
-                        }
-                        Err(err) => {
-                            warn!("clipboard file reread task failed {request_id}: {err:#}");
-                            return;
-                        }
-                    };
-                    let mut offset = 0;
-                    loop {
-                        let chunk = match clipboard::read_file_chunk(&file, offset) {
-                            Ok(chunk) if chunk.is_empty() => break,
-                            Ok(chunk) => chunk,
-                            Err(err) => {
-                                warn!("failed to read clipboard file {request_id}: {err:#}");
-                                return;
-                            }
-                        };
-                        let chunk_len = chunk.len() as u64;
-                        let message = ClientToHostMessage::ClipboardFileData {
-                            request_id,
-                            offset,
-                            data: chunk,
-                        };
-                        if let Err(err) = send_client_feedback(&feedback_connection, &message).await
-                        {
-                            warn!("failed sending clipboard file {request_id}: {err:#}");
-                            return;
-                        }
-                        offset += chunk_len;
-                    }
-                    let message = ClientToHostMessage::ClipboardFileComplete {
-                        request_id,
-                        digest: file.digest,
-                    };
-                    if let Err(err) = send_client_feedback(&feedback_connection, &message).await {
-                        warn!("failed completing clipboard file {request_id}: {err:#}");
-                    }
-                });
-            }
-            HostToClientMessage::ClipboardFileData {
-                request_id,
-                offset,
-                data,
-            } => {
-                if args.no_inject {
-                    continue;
-                }
-                let valid = pending_file_offer
-                    .as_ref()
-                    .is_some_and(|(expected_id, _, _, _)| *expected_id == request_id);
-                if !valid
-                    || incoming_file
-                        .as_mut()
-                        .is_none_or(|file| file.write_chunk(offset, &data).is_err())
-                {
-                    warn!("rejecting clipboard file chunk {request_id}");
-                    continue;
-                }
-            }
-            HostToClientMessage::ClipboardFileComplete { request_id, digest } => {
-                let valid = pending_file_offer
-                    .as_ref()
-                    .is_some_and(|(expected_id, _, _, _)| *expected_id == request_id);
-                if !valid {
-                    continue;
-                }
-                pending_file_offer = None;
-                if let Some(file) = incoming_file.take() {
-                    match file.finish(digest) {
+                } else if let Some(target) = target {
+                    let path = target.path().to_path_buf();
+                    match blob_runtime
+                        .download_to(&blob_endpoint_id, &blob, path)
+                        .await
+                        .and_then(|_| target.finish())
+                    {
                         Ok(path) => info!("received clipboard file at {}", path.display()),
                         Err(err) => warn!("failed to save clipboard file {request_id}: {err:#}"),
                     }
                 }
+            }
+            HostToClientMessage::ClipboardFileDecision { .. } => {
+                continue;
             }
         }
     };
@@ -524,6 +464,12 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     }
 
     replay_failures.flush(&connection).await;
+    if let Err(err) = blob_runtime.shutdown().await {
+        warn!("blob store shutdown failed: {err:#}");
+    }
+    if let Err(err) = blob_router.shutdown().await {
+        warn!("blob router shutdown failed: {err:#}");
+    }
 
     if let Some(probe) = probe.as_mut() {
         probe.note_held_counts(&input_state);

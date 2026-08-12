@@ -10,7 +10,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint,
-    endpoint::{Incoming, presets},
+    endpoint::{Connection, presets},
+    protocol::{ProtocolHandler, Router},
 };
 use rdev::{EventType, Key};
 use tokio::sync::mpsc;
@@ -34,8 +35,7 @@ use crate::{
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
         ActiveTarget, CapturedEvent, CapturedInput, HostState, PeerMessage, PendingClipboardFile,
-        PendingClipboardOffer, PendingClipboardRequest, RemotePeer, RemotePointerMode,
-        RuntimeStats, ScreenEdge, Side,
+        PendingClipboardRequest, RemotePeer, RemotePointerMode, RuntimeStats, ScreenEdge, Side,
     },
     presentation::print_host_ready,
     protocol::{
@@ -64,13 +64,13 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     cleanup_stale_socket().await?;
 
     let host_secret_key = load_or_create_host_secret_key()?;
-
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(host_secret_key)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
         .bind()
         .await
         .context("failed to create iroh endpoint")?;
+    let blob_runtime = crate::blob::BlobRuntime::start(endpoint.clone(), "host").await?;
 
     let endpoint_id = endpoint.id();
     let state_path = host_state_path()?;
@@ -112,7 +112,6 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let next_clipboard_request = Arc::new(AtomicU64::new(1));
     let pending_clipboard_request = Arc::new(Mutex::new(None));
     let pending_clipboard_file = Arc::new(Mutex::new(None));
-    let pending_clipboard_offer = Arc::new(Mutex::new(None));
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -120,6 +119,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     print_host_ready(&endpoint_id.to_string(), &secret);
 
     let state = HostState {
+        blob_runtime: blob_runtime.clone(),
         endpoint_id,
         active_target: active_target.clone(),
         remote_pointer_mode: remote_pointer_mode.clone(),
@@ -134,7 +134,6 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         next_clipboard_request: next_clipboard_request.clone(),
         pending_clipboard_request: pending_clipboard_request.clone(),
         pending_clipboard_file: pending_clipboard_file.clone(),
-        pending_clipboard_offer: pending_clipboard_offer.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -219,13 +218,22 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         }
     });
 
+    let router = Router::builder(endpoint.clone())
+        .accept(
+            ALPN,
+            HostProtocol {
+                state: state.clone(),
+                secret: secret.clone(),
+            },
+        )
+        .accept(iroh_blobs::ALPN, blob_runtime.protocol())
+        .spawn();
+    endpoint.online().await;
+
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    loop {
-        if state.shutdown_requested.load(Ordering::Relaxed) {
-            break;
-        }
-        let incoming = tokio::select! {
+    if !state.shutdown_requested.load(Ordering::Relaxed) {
+        tokio::select! {
             signal = &mut ctrl_c => {
                 match signal {
                     Ok(()) => info!("Ctrl+C received, shutting down host"),
@@ -233,28 +241,9 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 }
                 state.shutdown_requested.store(true, Ordering::Relaxed);
                 state.shutdown_notify.notify_waiters();
-                break;
             }
-            _ = state.shutdown_notify.notified() => {
-                break;
-            }
-            incoming = endpoint.accept() => incoming,
-        };
-
-        let Some(incoming) = incoming else {
-            warn!("host endpoint closed, shutting down");
-            state.shutdown_requested.store(true, Ordering::Relaxed);
-            state.shutdown_notify.notify_waiters();
-            break;
-        };
-
-        let state = state.clone();
-        let secret = secret.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_incoming(incoming, state, &secret).await {
-                warn!("incoming peer rejected/failed: {err:#}");
-            }
-        });
+            _ = state.shutdown_notify.notified() => {}
+        }
     }
 
     let forward_completed = forward_task.await.is_ok();
@@ -263,12 +252,37 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         release_all_remote_inputs(&state).await;
     }
     ensure_pointer_restored();
+    if let Err(err) = blob_runtime.shutdown().await {
+        warn!("blob store shutdown failed: {err:#}");
+    }
+    router.shutdown().await?;
     let _ = std::fs::remove_file(crate::state::socket_path()?);
     Ok(())
 }
 
-async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> Result<()> {
-    let connection = incoming.accept()?.await?;
+struct HostProtocol {
+    state: HostState,
+    secret: String,
+}
+
+impl std::fmt::Debug for HostProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostProtocol")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for HostProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        if let Err(err) = handle_incoming(connection, self.state.clone(), &self.secret).await {
+            warn!("incoming peer rejected/failed: {err:#}");
+        }
+        Ok(())
+    }
+}
+
+async fn handle_incoming(connection: Connection, state: HostState, secret: &str) -> Result<()> {
     let remote_id = connection.remote_id();
     let (mut send, mut recv) = connection.accept_bi().await?;
 
@@ -413,7 +427,6 @@ async fn run_client_feedback_loop(
     generation: u64,
     peer_name: &str,
 ) -> Result<()> {
-    let mut incoming_file: Option<crate::file_transfer::IncomingFile> = None;
     loop {
         let mut recv = connection.accept_uni().await?;
         let bytes = recv
@@ -486,7 +499,8 @@ async fn run_client_feedback_loop(
                 request_id,
                 name,
                 size,
-                digest,
+                blob_endpoint_id,
+                blob,
             } => {
                 let valid = state
                     .pending_clipboard_request
@@ -504,34 +518,15 @@ async fn run_client_feedback_loop(
                         )
                     });
                 if !valid {
-                    incoming_file = None;
                     continue;
                 }
-                *state
-                    .pending_clipboard_offer
-                    .lock()
-                    .expect("clipboard offer mutex poisoned") =
-                    Some(PendingClipboardOffer { request_id });
                 let dialog_name = name.clone();
                 let accepted = tokio::task::spawn_blocking(move || {
                     crate::macos_dialog::confirm_file_transfer(&dialog_name, size).unwrap_or(false)
                 })
                 .await
                 .unwrap_or(false);
-                let accepted = if accepted {
-                    match crate::file_transfer::IncomingFile::new(&name, size, digest) {
-                        Ok(file) => {
-                            incoming_file = Some(file);
-                            true
-                        }
-                        Err(err) => {
-                            warn!("failed to prepare clipboard file {request_id}: {err:#}");
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
+                let accepted = accepted && size <= crate::file_transfer::MAX_FILE_SIZE;
                 let delivered = send_to_side(
                     &state,
                     side,
@@ -543,17 +538,40 @@ async fn run_client_feedback_loop(
                 )
                 .await;
                 if !delivered || !accepted {
-                    incoming_file = None;
-                    state
-                        .pending_clipboard_offer
-                        .lock()
-                        .expect("clipboard offer mutex poisoned")
-                        .take();
                     state
                         .pending_clipboard_request
                         .lock()
                         .expect("clipboard request mutex poisoned")
                         .take();
+                } else {
+                    state
+                        .pending_clipboard_request
+                        .lock()
+                        .expect("clipboard request mutex poisoned")
+                        .take();
+                    let transfer_epoch = state.target_epoch.load(Ordering::Acquire);
+                    match crate::file_transfer::DownloadTarget::new(&name) {
+                        Ok(target) => {
+                            let path = target.path().to_path_buf();
+                            let result = state
+                                .blob_runtime
+                                .download_to(&blob_endpoint_id, &blob, path)
+                                .await;
+                            if state.target_epoch.load(Ordering::Acquire) != transfer_epoch {
+                                warn!(
+                                    "discarding clipboard file {request_id} after target changed"
+                                );
+                                continue;
+                            }
+                            match result.and_then(|_| target.finish()) {
+                                Ok(path) => info!("received clipboard file at {}", path.display()),
+                                Err(err) => {
+                                    warn!("failed to save clipboard file {request_id}: {err:#}")
+                                }
+                            }
+                        }
+                        Err(err) => warn!("failed to prepare clipboard file {request_id}: {err:#}"),
+                    }
                 }
             }
             ClientToHostMessage::ClipboardFileDecision {
@@ -587,127 +605,11 @@ async fn run_client_feedback_loop(
                     .lock()
                     .expect("clipboard file mutex poisoned")
                     .take();
-                let file = pending.file;
-                let mut offset = 0;
-                let mut completed = true;
-                loop {
-                    if ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)).to_side()
-                        != Some(side)
-                        || state.target_epoch.load(Ordering::Acquire) != pending.target_epoch
-                    {
-                        completed = false;
-                        break;
-                    }
-                    let chunk = match clipboard::read_file_chunk(&file, offset) {
-                        Ok(chunk) if chunk.is_empty() => break,
-                        Ok(chunk) => chunk,
-                        Err(err) => {
-                            warn!("failed to read clipboard file {request_id}: {err:#}");
-                            completed = false;
-                            break;
-                        }
-                    };
-                    let chunk_len = chunk.len() as u64;
-                    if !send_to_side(
-                        &state,
-                        side,
-                        HostToClientMessage::ClipboardFileData {
-                            request_id,
-                            offset,
-                            data: chunk,
-                        },
-                        false,
-                    )
-                    .await
-                    {
-                        completed = false;
-                        break;
-                    }
-                    offset += chunk_len;
-                }
-                if completed {
-                    let _ = send_to_side(
-                        &state,
-                        side,
-                        HostToClientMessage::ClipboardFileComplete {
-                            request_id,
-                            digest: file.digest,
-                        },
-                        false,
-                    )
-                    .await;
-                }
                 state
                     .pending_clipboard_request
                     .lock()
                     .expect("clipboard request mutex poisoned")
                     .take();
-            }
-            ClientToHostMessage::ClipboardFileData {
-                request_id,
-                offset,
-                data,
-            } => {
-                let valid = state
-                    .pending_clipboard_request
-                    .lock()
-                    .expect("clipboard request mutex poisoned")
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        clipboard_response_matches(
-                            *pending,
-                            request_id,
-                            side,
-                            generation,
-                            state.target_epoch.load(Ordering::Acquire),
-                            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
-                        )
-                    });
-                if !valid {
-                    incoming_file = None;
-                    continue;
-                }
-                if !state
-                    .pending_clipboard_offer
-                    .lock()
-                    .expect("clipboard offer mutex poisoned")
-                    .as_ref()
-                    .is_some_and(|offer| offer.request_id == request_id)
-                    || incoming_file
-                        .as_mut()
-                        .is_none_or(|file| file.write_chunk(offset, &data).is_err())
-                {
-                    warn!("rejecting clipboard file chunk {request_id}");
-                    continue;
-                }
-            }
-            ClientToHostMessage::ClipboardFileComplete { request_id, digest } => {
-                let valid = state
-                    .pending_clipboard_offer
-                    .lock()
-                    .expect("clipboard offer mutex poisoned")
-                    .as_ref()
-                    .is_some_and(|offer| offer.request_id == request_id);
-                if !valid {
-                    incoming_file = None;
-                    continue;
-                }
-                state
-                    .pending_clipboard_offer
-                    .lock()
-                    .expect("clipboard offer mutex poisoned")
-                    .take();
-                state
-                    .pending_clipboard_request
-                    .lock()
-                    .expect("clipboard request mutex poisoned")
-                    .take();
-                if let Some(file) = incoming_file.take() {
-                    match file.finish(digest) {
-                        Ok(path) => info!("received clipboard file at {}", path.display()),
-                        Err(err) => warn!("failed to save clipboard file {request_id}: {err:#}"),
-                    }
-                }
             }
         }
     }
@@ -932,6 +834,20 @@ async fn handle_clipboard_paste(state: &HostState, target: ActiveTarget) {
                 remotes.get(&side).cloned()
             };
             let Some(peer) = peer else { return };
+            let blob = match state.blob_runtime.add_path(&file.path).await {
+                Ok(blob) => blob,
+                Err(err) => {
+                    warn!("failed to index clipboard file: {err:#}");
+                    return;
+                }
+            };
+            let blob_endpoint_id = match state.blob_runtime.endpoint_id() {
+                Ok(id) => id.to_string(),
+                Err(err) => {
+                    warn!("blob endpoint unavailable: {err:#}");
+                    return;
+                }
+            };
             *state
                 .pending_clipboard_file
                 .lock()
@@ -940,7 +856,6 @@ async fn handle_clipboard_paste(state: &HostState, target: ActiveTarget) {
                 side,
                 generation: peer.generation,
                 target_epoch,
-                file: file.clone(),
             });
             *state
                 .pending_clipboard_request
@@ -958,7 +873,8 @@ async fn handle_clipboard_paste(state: &HostState, target: ActiveTarget) {
                     request_id,
                     name: file.name,
                     size: file.size,
-                    digest: file.digest,
+                    blob_endpoint_id,
+                    blob,
                 },
                 false,
             )
@@ -1050,11 +966,6 @@ fn clear_pending_clipboard_request(state: &HostState, side: Side, generation: u6
     {
         file.take();
     }
-    state
-        .pending_clipboard_offer
-        .lock()
-        .expect("clipboard offer mutex poisoned")
-        .take();
 }
 
 async fn connected_clipboard_source(state: &HostState) -> Option<(Side, RemotePeer)> {
@@ -1247,9 +1158,7 @@ fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessag
         message @ HostToClientMessage::ClipboardPaste { .. }
         | message @ HostToClientMessage::ClipboardRequest { .. }
         | message @ HostToClientMessage::ClipboardFileOffer { .. }
-        | message @ HostToClientMessage::ClipboardFileDecision { .. }
-        | message @ HostToClientMessage::ClipboardFileData { .. }
-        | message @ HostToClientMessage::ClipboardFileComplete { .. } => message,
+        | message @ HostToClientMessage::ClipboardFileDecision { .. } => message,
     }
 }
 
@@ -1605,6 +1514,7 @@ mod tests {
 
     fn test_forward_state(side: Side, input_tx: mpsc::Sender<PeerMessage>) -> HostState {
         HostState {
+            blob_runtime: crate::blob::BlobRuntime::disabled(),
             endpoint_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
@@ -1628,7 +1538,6 @@ mod tests {
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(Mutex::new(None)),
             pending_clipboard_file: Arc::new(Mutex::new(None)),
-            pending_clipboard_offer: Arc::new(Mutex::new(None)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

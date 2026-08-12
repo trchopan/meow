@@ -249,7 +249,8 @@ The shortcut can be customized with `clipboard_key` in `host_state.json`, using 
 format as `detach_key`. Clipboard synchronization supports plain text up to approximately 900
 KiB and one file up to 100 MiB per request. Existing destination names are preserved by adding
 `-1`, `-2`, and so on before the extension. Clipboard requests are authorized by the existing
-attach secret, so only attach clients that trust the host should be connected.
+attach secret, and file bytes are transferred through iroh-blobs using a content hash; source
+paths are never sent. Only attach clients that trust the host should be connected.
 
 Use `meow reset-identity` (while daemon is stopped) to remove identity files and force a new host id on the next `meow host` run.
 

@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 mod attach;
+mod blob;
 mod cli;
 mod clipboard;
 mod dev;

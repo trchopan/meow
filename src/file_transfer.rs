@@ -1,9 +1,7 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::{fs::File, io::Write};
 
 use anyhow::{Context, Result, bail};
-
-use crate::protocol::FILE_CHUNK_SIZE;
 
 pub(crate) const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
@@ -65,58 +63,30 @@ pub(crate) fn collision_path(directory: &Path, filename: &str) -> PathBuf {
     unreachable!()
 }
 
-pub(crate) struct IncomingFile {
+pub(crate) struct DownloadTarget {
     temporary_path: PathBuf,
-    temporary: File,
     directory: PathBuf,
     filename: String,
-    expected_size: u64,
-    expected_digest: [u8; 32],
-    received: u64,
-    hasher: blake3::Hasher,
 }
 
-impl IncomingFile {
-    pub(crate) fn new(filename: &str, size: u64, digest: [u8; 32]) -> Result<Self> {
-        if size > MAX_FILE_SIZE {
-            bail!(
-                "file exceeds the {} MiB limit",
-                MAX_FILE_SIZE / (1024 * 1024)
-            );
-        }
+impl DownloadTarget {
+    pub(crate) fn new(filename: &str) -> Result<Self> {
         let home = dirs::home_dir().context("home directory is unavailable")?;
         let directory = home.join("Downloads").join("meow");
         std::fs::create_dir_all(&directory).context("failed to create ~/Downloads/meow")?;
-        let (temporary_path, temporary) = create_temporary_file(&directory, filename)?;
+        let (temporary_path, _) = create_temporary_file(&directory, filename)?;
         Ok(Self {
             temporary_path,
-            temporary,
             directory,
             filename: sanitize_filename(filename),
-            expected_size: size,
-            expected_digest: digest,
-            received: 0,
-            hasher: blake3::Hasher::new(),
         })
     }
 
-    pub(crate) fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<()> {
-        let next = validate_chunk(self.received, self.expected_size, offset, data.len())?;
-        self.temporary.write_all(data)?;
-        self.hasher.update(data);
-        self.received = next;
-        Ok(())
+    pub(crate) fn path(&self) -> &Path {
+        &self.temporary_path
     }
 
-    pub(crate) fn finish(mut self, digest: [u8; 32]) -> Result<PathBuf> {
-        if self.received != self.expected_size
-            || digest != self.expected_digest
-            || self.hasher.finalize().as_bytes() != &digest
-        {
-            bail!("clipboard file transfer failed integrity checks");
-        }
-        self.temporary.flush()?;
-        self.temporary.sync_all()?;
+    pub(crate) fn finish(self) -> Result<PathBuf> {
         loop {
             let destination = collision_path(&self.directory, &self.filename);
             match std::fs::hard_link(&self.temporary_path, &destination) {
@@ -131,18 +101,7 @@ impl IncomingFile {
     }
 }
 
-fn validate_chunk(received: u64, expected_size: u64, offset: u64, length: usize) -> Result<u64> {
-    if length > FILE_CHUNK_SIZE || offset != received {
-        bail!("invalid clipboard file chunk");
-    }
-    let next = received.saturating_add(length as u64);
-    if next > expected_size {
-        bail!("clipboard file exceeds offered size");
-    }
-    Ok(next)
-}
-
-impl Drop for IncomingFile {
+impl Drop for DownloadTarget {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.temporary_path);
     }
@@ -188,14 +147,6 @@ mod tests {
             directory.join("hello-1.txt")
         );
         let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn chunk_validation_requires_order_and_offered_size() {
-        assert!(validate_chunk(0, 10, 0, 4).is_ok());
-        assert!(validate_chunk(4, 10, 0, 4).is_err());
-        assert!(validate_chunk(8, 10, 8, 4).is_err());
-        assert!(validate_chunk(0, 10, 0, FILE_CHUNK_SIZE + 1).is_err());
     }
 
     fn tempfile_dir() -> PathBuf {
