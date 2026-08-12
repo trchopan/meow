@@ -14,6 +14,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{info, warn};
 
 use crate::{
+    display::{DisplayGeometry, display_layout},
     host_mouse,
     model::{
         ActiveTarget, CapturedEvent, CapturedInput, PendingClipboardRequest, RuntimeStats,
@@ -136,10 +137,15 @@ pub(crate) fn run_input_grab(
             let Some((x, y)) = position else {
                 continue;
             };
-            let display = rdev::display_size().unwrap_or((0, 0));
-            edge_zone.rearm_if_far(x, y, display.0, display.1, edge_config.zone_px);
-            let Some(edge) =
-                detect_host_edge_zone_in_display(x, y, display.0, display.1, edge_config.zone_px)
+            let display = display_layout()
+                .ok()
+                .and_then(|layout| layout.display_at(x, y));
+            let Some(display) = display else {
+                edge_zone.reset();
+                continue;
+            };
+            edge_zone.rearm_if_far(x, y, display, edge_config.zone_px);
+            let Some(edge) = detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
             else {
                 edge_zone.reset();
                 continue;
@@ -317,15 +323,12 @@ pub(crate) fn run_input_grab(
 
                     let now = Instant::now();
                     let mut edge_zone = local_edge_zone.lock().expect("local edge mutex poisoned");
-                    let display = rdev::display_size().unwrap_or((0, 0));
-                    edge_zone.rearm_if_far(x, y, display.0, display.1, edge_config.zone_px);
-                    if let Some(edge) = detect_host_edge_zone_in_display(
-                        x,
-                        y,
-                        display.0,
-                        display.1,
-                        edge_config.zone_px,
-                    ) {
+                    if let Some(display) = display_layout()
+                        .ok()
+                        .and_then(|layout| layout.display_at(x, y))
+                        && let Some(edge) =
+                            detect_host_edge_zone_in_display(x, y, display, edge_config.zone_px)
+                    {
                         try_send_host_edge(
                             &tx,
                             &send_ctx,
@@ -712,28 +715,27 @@ pub(crate) fn clamp_relative_delta(delta: f64) -> i32 {
 fn detect_host_edge_zone_in_display(
     x: f64,
     y: f64,
-    width: u64,
-    height: u64,
+    display: DisplayGeometry,
     zone_px: u32,
 ) -> Option<ScreenEdge> {
-    if width == 0 || height == 0 {
+    if display.width <= 0.0 || display.height <= 0.0 {
         return None;
     }
 
     let zone = zone_px as f64;
-    let max_x = width.saturating_sub(1) as f64;
-    let max_y = height.saturating_sub(1) as f64;
+    let max_x = display.right() - 1.0;
+    let max_y = display.bottom() - 1.0;
 
-    if x <= zone {
+    if x <= display.origin_x + zone {
         return Some(ScreenEdge::Left);
     }
-    if x >= (max_x - zone).max(0.0) {
+    if x >= (max_x - zone).max(display.origin_x) {
         return Some(ScreenEdge::Right);
     }
-    if y <= zone {
+    if y <= display.origin_y + zone {
         return Some(ScreenEdge::Up);
     }
-    if y >= (max_y - zone).max(0.0) {
+    if y >= (max_y - zone).max(display.origin_y) {
         return Some(ScreenEdge::Down);
     }
 
@@ -780,11 +782,11 @@ impl EdgeZoneTracker {
         self.disarmed_edge = edge;
     }
 
-    fn rearm_if_far(&mut self, x: f64, y: f64, width: u64, height: u64, zone_px: u32) {
+    fn rearm_if_far(&mut self, x: f64, y: f64, display: DisplayGeometry, zone_px: u32) {
         let Some(edge) = self.disarmed_edge else {
             return;
         };
-        if is_far_from_edge(x, y, width, height, edge, zone_px) {
+        if is_far_from_edge(x, y, display, edge, zone_px) {
             self.disarmed_edge = None;
         }
     }
@@ -813,22 +815,21 @@ fn edge_for_side(side: Side) -> ScreenEdge {
 fn is_far_from_edge(
     x: f64,
     y: f64,
-    width: u64,
-    height: u64,
+    display: DisplayGeometry,
     edge: ScreenEdge,
     zone_px: u32,
 ) -> bool {
     let rearm_distance = zone_px.saturating_mul(EDGE_REARM_DISTANCE_MULTIPLIER) as f64;
-    let max_x = width.saturating_sub(1) as f64;
-    let max_y = height.saturating_sub(1) as f64;
-    let rearm_x = rearm_distance.min((max_x - 1.0).max(0.0));
-    let rearm_y = rearm_distance.min((max_y - 1.0).max(0.0));
+    let max_x = display.right() - 1.0;
+    let max_y = display.bottom() - 1.0;
+    let rearm_x = rearm_distance.min((display.width - 2.0).max(0.0));
+    let rearm_y = rearm_distance.min((display.height - 2.0).max(0.0));
 
     match edge {
-        ScreenEdge::Left => x > rearm_x,
-        ScreenEdge::Right => x < (max_x - rearm_x).max(0.0),
-        ScreenEdge::Up => y > rearm_y,
-        ScreenEdge::Down => y < (max_y - rearm_y).max(0.0),
+        ScreenEdge::Left => x > display.origin_x + rearm_x,
+        ScreenEdge::Right => x < (max_x - rearm_x).max(display.origin_x),
+        ScreenEdge::Up => y > display.origin_y + rearm_y,
+        ScreenEdge::Down => y < (max_y - rearm_y).max(display.origin_y),
     }
 }
 
@@ -981,33 +982,99 @@ mod tests {
 
     #[test]
     fn host_edge_zone_detects_each_display_edge() {
-        let display = (1920, 1080);
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
         let zone = 12;
 
         assert_eq!(
-            detect_host_edge_zone_in_display(12.0, 500.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(12.0, 500.0, display, zone),
             Some(ScreenEdge::Left)
         );
         assert_eq!(
-            detect_host_edge_zone_in_display(1907.0, 500.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(1907.0, 500.0, display, zone),
             Some(ScreenEdge::Right)
         );
         assert_eq!(
-            detect_host_edge_zone_in_display(500.0, 12.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(500.0, 12.0, display, zone),
             Some(ScreenEdge::Up)
         );
         assert_eq!(
-            detect_host_edge_zone_in_display(500.0, 1067.0, display.0, display.1, zone),
+            detect_host_edge_zone_in_display(500.0, 1067.0, display, zone),
             Some(ScreenEdge::Down)
         );
-        assert_eq!(detect_host_edge_zone_in_display(0.0, 0.0, 0, 0, zone), None);
+        assert_eq!(
+            detect_host_edge_zone_in_display(
+                0.0,
+                0.0,
+                DisplayGeometry {
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                zone,
+            ),
+            None
+        );
     }
 
     #[test]
     fn host_edge_zone_ignores_pointer_outside_zone() {
         assert_eq!(
-            detect_host_edge_zone_in_display(100.0, 500.0, 1920, 1080, 12),
+            detect_host_edge_zone_in_display(
+                100.0,
+                500.0,
+                DisplayGeometry {
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                12,
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn host_edge_zone_uses_logical_retina_dimensions() {
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        assert_eq!(
+            detect_host_edge_zone_in_display(1511.0, 500.0, display, 12),
+            Some(ScreenEdge::Right)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(500.0, 981.0, display, 12),
+            Some(ScreenEdge::Down)
+        );
+    }
+
+    #[test]
+    fn host_edge_zone_respects_non_zero_display_origin() {
+        let display = DisplayGeometry {
+            origin_x: 100.0,
+            origin_y: 40.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        assert_eq!(
+            detect_host_edge_zone_in_display(1611.0, 500.0, display, 12),
+            Some(ScreenEdge::Right)
+        );
+        assert_eq!(
+            detect_host_edge_zone_in_display(500.0, 1021.0, display, 12),
+            Some(ScreenEdge::Down)
         );
     }
 
@@ -1036,6 +1103,18 @@ mod tests {
             start + Duration::from_millis(301),
             dwell
         ));
+    }
+
+    #[test]
+    fn host_edge_zone_requires_dwell_after_remote_reset() {
+        let mut tracker = EdgeZoneTracker::new();
+        let start = Instant::now();
+        let dwell = Duration::from_millis(150);
+
+        tracker.mark_triggered();
+        tracker.reset();
+        assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
+        assert!(tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
     }
 
     #[test]
@@ -1076,14 +1155,34 @@ mod tests {
         tracker.disarm(Some(ScreenEdge::Right));
         assert!(!tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
 
-        tracker.rearm_if_far(1894.0, 500.0, 1920, 1080, 12);
+        tracker.rearm_if_far(
+            1894.0,
+            500.0,
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+        );
         assert!(!tracker.enter_or_stay(
             ScreenEdge::Right,
             start + dwell + Duration::from_millis(1),
             dwell
         ));
 
-        tracker.rearm_if_far(25.0, 500.0, 1920, 1080, 12);
+        tracker.rearm_if_far(
+            25.0,
+            500.0,
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+        );
         assert!(!tracker.enter_or_stay(
             ScreenEdge::Right,
             start + dwell + Duration::from_millis(2),
@@ -1103,7 +1202,17 @@ mod tests {
         let dwell = Duration::from_millis(150);
 
         tracker.disarm(Some(ScreenEdge::Right));
-        tracker.rearm_if_far(25.0, 500.0, 1920, 1080, 12);
+        tracker.rearm_if_far(
+            25.0,
+            500.0,
+            DisplayGeometry {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            12,
+        );
 
         assert!(!tracker.enter_or_stay(ScreenEdge::Right, start, dwell));
         assert!(tracker.enter_or_stay(ScreenEdge::Right, start + dwell, dwell));
@@ -1111,70 +1220,61 @@ mod tests {
 
     #[test]
     fn edge_rearm_distance_has_explicit_boundaries_for_each_edge() {
-        let display = (1920, 1080);
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
         let zone = 12;
 
         assert!(!is_far_from_edge(
             24.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Left,
             zone
         ));
         assert!(is_far_from_edge(
             25.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Left,
             zone
         ));
         assert!(!is_far_from_edge(
             1895.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Right,
             zone
         ));
         assert!(is_far_from_edge(
             1894.0,
             500.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Right,
             zone
         ));
         assert!(!is_far_from_edge(
             500.0,
             24.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Up,
             zone
         ));
-        assert!(is_far_from_edge(
-            500.0,
-            25.0,
-            display.0,
-            display.1,
-            ScreenEdge::Up,
-            zone
-        ));
+        assert!(is_far_from_edge(500.0, 25.0, display, ScreenEdge::Up, zone));
         assert!(!is_far_from_edge(
             500.0,
             1055.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Down,
             zone
         ));
         assert!(is_far_from_edge(
             500.0,
             1054.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Down,
             zone
         ));
@@ -1182,38 +1282,39 @@ mod tests {
 
     #[test]
     fn edge_rearm_distance_remains_reachable_for_large_zones() {
-        let display = (1440, 900);
+        let display = DisplayGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
         let zone = 1000;
 
         assert!(is_far_from_edge(
             1439.0,
             450.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Left,
             zone
         ));
         assert!(is_far_from_edge(
             0.0,
             450.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Right,
             zone
         ));
         assert!(is_far_from_edge(
             720.0,
             899.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Up,
             zone
         ));
         assert!(is_far_from_edge(
             720.0,
             0.0,
-            display.0,
-            display.1,
+            display,
             ScreenEdge::Down,
             zone
         ));

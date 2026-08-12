@@ -3,12 +3,9 @@ use anyhow::Result;
 #[cfg(target_os = "macos")]
 mod imp {
     use anyhow::{Result, anyhow};
-    use core_graphics::{
-        display::CGDisplay,
-        event::CGEvent,
-        event_source::{CGEventSource, CGEventSourceStateID},
-        geometry::CGPoint,
-    };
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::{display::CGDisplay, geometry::CGPoint};
 
     pub(crate) fn set_pointer_dissociation(enabled: bool) -> Result<()> {
         CGDisplay::associate_mouse_and_mouse_cursor_position(!enabled).map_err(|err| {

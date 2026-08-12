@@ -251,12 +251,12 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
 
     if should_lock && !was_locked {
         match host_mouse::current_pointer_position() {
-            Ok((x, y)) => {
+            Ok(position) => {
                 let mut pinned = state
                     .pinned_pointer_pos
                     .lock()
                     .expect("pinned pointer mutex poisoned");
-                *pinned = Some((x, y));
+                *pinned = Some(position);
             }
             Err(err) => {
                 warn!("failed reading current pointer position: {err:#}");

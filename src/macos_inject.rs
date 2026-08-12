@@ -6,6 +6,7 @@ use crate::protocol::ModifierFlags;
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
+    use crate::display::{display_layout, pointer_location};
     use core_graphics::{
         event::{
             CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
@@ -13,6 +14,17 @@ mod imp {
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
+
+    pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
+        let EventType::MouseMove { x, y } = event else {
+            return Ok(*event);
+        };
+        let (fallback_x, fallback_y) = pointer_location()?;
+        let (x, y) = display_layout()?
+            .clamp_absolute_point(*x, *y, fallback_x, fallback_y)
+            .ok_or_else(|| anyhow!("macOS display layout is empty"))?;
+        Ok(EventType::MouseMove { x, y })
+    }
 
     pub(crate) fn inject_event(event: &EventType) -> Result<()> {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -29,7 +41,7 @@ mod imp {
             }
             EventType::ButtonPress(button) | EventType::ButtonRelease(button) => {
                 let (event_type, mouse_button) = mouse_button_event(*button, event)?;
-                let location = current_location()?;
+                let location = bounded_pointer_location()?;
                 let event = CGEvent::new_mouse_event(source, event_type, location, mouse_button)
                     .map_err(|_| anyhow!("failed to create macOS mouse event"))?;
                 event.post(CGEventTapLocation::HID);
@@ -58,6 +70,10 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn inject_prepared_event(event: &EventType) -> Result<()> {
+        inject_event(event)
     }
 
     pub(crate) fn cancel_input_composition() -> Result<()> {
@@ -113,6 +129,10 @@ mod imp {
         button: Option<Button>,
     ) -> Result<()> {
         let location = current_location()?;
+        let layout = display_layout()?;
+        let (target_x, target_y, actual_dx, actual_dy) = layout
+            .clamp_pointer_move(location.x, location.y, dx, dy)
+            .ok_or_else(|| anyhow!("macOS display layout is empty"))?;
         let event_type = match button {
             Some(Button::Left) => CGEventType::LeftMouseDragged,
             Some(Button::Right) => CGEventType::RightMouseDragged,
@@ -129,12 +149,12 @@ mod imp {
         let event = CGEvent::new_mouse_event(
             source,
             event_type,
-            CGPoint::new(location.x + f64::from(dx), location.y + f64::from(dy)),
+            CGPoint::new(target_x, target_y),
             mouse_button,
         )
         .map_err(|_| anyhow!("failed to create macOS drag event"))?;
-        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
-        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(actual_dx));
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(actual_dy));
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
@@ -145,6 +165,15 @@ mod imp {
         Ok(CGEvent::new(source)
             .map_err(|_| anyhow!("failed to read current macOS pointer location"))?
             .location())
+    }
+
+    fn bounded_pointer_location() -> Result<CGPoint> {
+        let location = current_location()?;
+        let layout = display_layout()?;
+        let (x, y) = layout
+            .clamp_absolute_point(location.x, location.y, location.x, location.y)
+            .ok_or_else(|| anyhow!("macOS display layout is empty"))?;
+        Ok(CGPoint::new(x, y))
     }
 
     fn flags_for_modifiers(modifiers: &ModifierFlags) -> core_graphics::event::CGEventFlags {
@@ -324,6 +353,14 @@ mod imp {
         ))
     }
 
+    pub(crate) fn inject_prepared_event(event: &EventType) -> Result<()> {
+        inject_event(event)
+    }
+
+    pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
+        Ok(event.clone())
+    }
+
     pub(crate) fn cancel_input_composition() -> Result<()> {
         Ok(())
     }
@@ -359,7 +396,16 @@ mod imp {
 }
 
 pub(crate) fn inject_event(event: &EventType) -> Result<()> {
-    imp::inject_event(event)
+    let prepared = imp::prepare_event_for_injection(event)?;
+    imp::inject_event(&prepared)
+}
+
+pub(crate) fn inject_prepared_event(event: &EventType) -> Result<()> {
+    imp::inject_prepared_event(event)
+}
+
+pub(crate) fn prepare_event_for_injection(event: &EventType) -> Result<EventType> {
+    imp::prepare_event_for_injection(event)
 }
 
 pub(crate) fn cancel_input_composition() -> Result<()> {
