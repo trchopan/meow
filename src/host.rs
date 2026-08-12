@@ -33,13 +33,14 @@ use crate::{
     macos_mouse_delta::run_macos_mouse_delta_capture,
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
-        ActiveTarget, CapturedEvent, CapturedInput, HostState, PeerMessage,
-        PendingClipboardRequest, RemotePeer, RemotePointerMode, RuntimeStats, ScreenEdge, Side,
+        ActiveTarget, CapturedEvent, CapturedInput, HostState, PeerMessage, PendingClipboardFile,
+        PendingClipboardOffer, PendingClipboardRequest, RemotePeer, RemotePointerMode,
+        RuntimeStats, ScreenEdge, Side,
     },
     presentation::print_host_ready,
     protocol::{
         ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
-        MAX_AUTH_MSG_SIZE, MAX_CLIPBOARD_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, ModifierFlags, WireEvent,
+        MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, MAX_FILE_MSG_SIZE, ModifierFlags, WireEvent,
         WireKey, read_framed_with_limit, write_framed,
     },
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
@@ -110,6 +111,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let target_epoch = Arc::new(AtomicU64::new(0));
     let next_clipboard_request = Arc::new(AtomicU64::new(1));
     let pending_clipboard_request = Arc::new(Mutex::new(None));
+    let pending_clipboard_file = Arc::new(Mutex::new(None));
+    let pending_clipboard_offer = Arc::new(Mutex::new(None));
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -130,6 +133,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         target_epoch: target_epoch.clone(),
         next_clipboard_request: next_clipboard_request.clone(),
         pending_clipboard_request: pending_clipboard_request.clone(),
+        pending_clipboard_file: pending_clipboard_file.clone(),
+        pending_clipboard_offer: pending_clipboard_offer.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -408,10 +413,11 @@ async fn run_client_feedback_loop(
     generation: u64,
     peer_name: &str,
 ) -> Result<()> {
+    let mut incoming_file: Option<crate::file_transfer::IncomingFile> = None;
     loop {
         let mut recv = connection.accept_uni().await?;
         let bytes = recv
-            .read_to_end(MAX_CLIPBOARD_MSG_SIZE.max(MAX_FEEDBACK_MSG_SIZE))
+            .read_to_end(MAX_FILE_MSG_SIZE.max(MAX_FEEDBACK_MSG_SIZE))
             .await?;
         let message: ClientToHostMessage = bincode::deserialize(&bytes)?;
         let is_current = {
@@ -475,6 +481,233 @@ async fn run_client_feedback_loop(
                         }
                     }
                 });
+            }
+            ClientToHostMessage::ClipboardFileOffer {
+                request_id,
+                name,
+                size,
+                digest,
+            } => {
+                let valid = state
+                    .pending_clipboard_request
+                    .lock()
+                    .expect("clipboard request mutex poisoned")
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        clipboard_response_matches(
+                            *pending,
+                            request_id,
+                            side,
+                            generation,
+                            state.target_epoch.load(Ordering::Acquire),
+                            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+                        )
+                    });
+                if !valid {
+                    incoming_file = None;
+                    continue;
+                }
+                *state
+                    .pending_clipboard_offer
+                    .lock()
+                    .expect("clipboard offer mutex poisoned") =
+                    Some(PendingClipboardOffer { request_id });
+                let dialog_name = name.clone();
+                let accepted = tokio::task::spawn_blocking(move || {
+                    crate::macos_dialog::confirm_file_transfer(&dialog_name, size).unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false);
+                let accepted = if accepted {
+                    match crate::file_transfer::IncomingFile::new(&name, size, digest) {
+                        Ok(file) => {
+                            incoming_file = Some(file);
+                            true
+                        }
+                        Err(err) => {
+                            warn!("failed to prepare clipboard file {request_id}: {err:#}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                let delivered = send_to_side(
+                    &state,
+                    side,
+                    HostToClientMessage::ClipboardFileDecision {
+                        request_id,
+                        accepted,
+                    },
+                    false,
+                )
+                .await;
+                if !delivered || !accepted {
+                    incoming_file = None;
+                    state
+                        .pending_clipboard_offer
+                        .lock()
+                        .expect("clipboard offer mutex poisoned")
+                        .take();
+                    state
+                        .pending_clipboard_request
+                        .lock()
+                        .expect("clipboard request mutex poisoned")
+                        .take();
+                }
+            }
+            ClientToHostMessage::ClipboardFileDecision {
+                request_id,
+                accepted,
+            } => {
+                let pending = state
+                    .pending_clipboard_file
+                    .lock()
+                    .expect("clipboard file mutex poisoned")
+                    .clone();
+                let Some(pending) = pending else { continue };
+                let valid = pending.request_id == request_id
+                    && pending.side == side
+                    && pending.generation == generation
+                    && pending.target_epoch == state.target_epoch.load(Ordering::Acquire)
+                    && ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)).to_side()
+                        == Some(side);
+                if !valid || !accepted {
+                    if valid {
+                        state
+                            .pending_clipboard_file
+                            .lock()
+                            .expect("clipboard file mutex poisoned")
+                            .take();
+                    }
+                    continue;
+                }
+                state
+                    .pending_clipboard_file
+                    .lock()
+                    .expect("clipboard file mutex poisoned")
+                    .take();
+                let file = pending.file;
+                let mut offset = 0;
+                let mut completed = true;
+                loop {
+                    if ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)).to_side()
+                        != Some(side)
+                        || state.target_epoch.load(Ordering::Acquire) != pending.target_epoch
+                    {
+                        completed = false;
+                        break;
+                    }
+                    let chunk = match clipboard::read_file_chunk(&file, offset) {
+                        Ok(chunk) if chunk.is_empty() => break,
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            warn!("failed to read clipboard file {request_id}: {err:#}");
+                            completed = false;
+                            break;
+                        }
+                    };
+                    let chunk_len = chunk.len() as u64;
+                    if !send_to_side(
+                        &state,
+                        side,
+                        HostToClientMessage::ClipboardFileData {
+                            request_id,
+                            offset,
+                            data: chunk,
+                        },
+                        false,
+                    )
+                    .await
+                    {
+                        completed = false;
+                        break;
+                    }
+                    offset += chunk_len;
+                }
+                if completed {
+                    let _ = send_to_side(
+                        &state,
+                        side,
+                        HostToClientMessage::ClipboardFileComplete {
+                            request_id,
+                            digest: file.digest,
+                        },
+                        false,
+                    )
+                    .await;
+                }
+                state
+                    .pending_clipboard_request
+                    .lock()
+                    .expect("clipboard request mutex poisoned")
+                    .take();
+            }
+            ClientToHostMessage::ClipboardFileData {
+                request_id,
+                offset,
+                data,
+            } => {
+                let valid = state
+                    .pending_clipboard_request
+                    .lock()
+                    .expect("clipboard request mutex poisoned")
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        clipboard_response_matches(
+                            *pending,
+                            request_id,
+                            side,
+                            generation,
+                            state.target_epoch.load(Ordering::Acquire),
+                            ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire)),
+                        )
+                    });
+                if !valid {
+                    incoming_file = None;
+                    continue;
+                }
+                if !state
+                    .pending_clipboard_offer
+                    .lock()
+                    .expect("clipboard offer mutex poisoned")
+                    .as_ref()
+                    .is_some_and(|offer| offer.request_id == request_id)
+                    || incoming_file
+                        .as_mut()
+                        .is_none_or(|file| file.write_chunk(offset, &data).is_err())
+                {
+                    warn!("rejecting clipboard file chunk {request_id}");
+                    continue;
+                }
+            }
+            ClientToHostMessage::ClipboardFileComplete { request_id, digest } => {
+                let valid = state
+                    .pending_clipboard_offer
+                    .lock()
+                    .expect("clipboard offer mutex poisoned")
+                    .as_ref()
+                    .is_some_and(|offer| offer.request_id == request_id);
+                if !valid {
+                    incoming_file = None;
+                    continue;
+                }
+                state
+                    .pending_clipboard_offer
+                    .lock()
+                    .expect("clipboard offer mutex poisoned")
+                    .take();
+                state
+                    .pending_clipboard_request
+                    .lock()
+                    .expect("clipboard request mutex poisoned")
+                    .take();
+                if let Some(file) = incoming_file.take() {
+                    match file.finish(digest) {
+                        Ok(path) => info!("received clipboard file at {}", path.display()),
+                        Err(err) => warn!("failed to save clipboard file {request_id}: {err:#}"),
+                    }
+                }
             }
         }
     }
@@ -682,6 +915,68 @@ async fn handle_clipboard_paste(state: &HostState, target: ActiveTarget) {
 
     if target.to_side().is_some() {
         let target_epoch = state.target_epoch.load(Ordering::Acquire);
+        let file = match tokio::task::spawn_blocking(clipboard::read_file).await {
+            Ok(Ok(file)) => file,
+            Ok(Err(err)) => {
+                warn!("failed to inspect host clipboard file: {err:#}");
+                return;
+            }
+            Err(err) => {
+                warn!("clipboard file inspection task failed: {err:#}");
+                return;
+            }
+        };
+        if let Some(file) = file {
+            let peer = {
+                let remotes = state.remotes.read().await;
+                remotes.get(&side).cloned()
+            };
+            let Some(peer) = peer else { return };
+            *state
+                .pending_clipboard_file
+                .lock()
+                .expect("clipboard file mutex poisoned") = Some(PendingClipboardFile {
+                request_id,
+                side,
+                generation: peer.generation,
+                target_epoch,
+                file: file.clone(),
+            });
+            *state
+                .pending_clipboard_request
+                .lock()
+                .expect("clipboard request mutex poisoned") = Some(PendingClipboardRequest {
+                request_id,
+                side,
+                generation: peer.generation,
+                target_epoch,
+            });
+            if !send_to_side(
+                state,
+                side,
+                HostToClientMessage::ClipboardFileOffer {
+                    request_id,
+                    name: file.name,
+                    size: file.size,
+                    digest: file.digest,
+                },
+                false,
+            )
+            .await
+            {
+                state
+                    .pending_clipboard_file
+                    .lock()
+                    .expect("clipboard file mutex poisoned")
+                    .take();
+                state
+                    .pending_clipboard_request
+                    .lock()
+                    .expect("clipboard request mutex poisoned")
+                    .take();
+            }
+            return;
+        }
         let text = match tokio::task::spawn_blocking(clipboard::read_text).await {
             Ok(Ok(text)) => text,
             Ok(Err(err)) => {
@@ -745,6 +1040,21 @@ fn clear_pending_clipboard_request(state: &HostState, side: Side, generation: u6
     if pending.is_some_and(|request| request.side == side && request.generation == generation) {
         pending.take();
     }
+    let mut file = state
+        .pending_clipboard_file
+        .lock()
+        .expect("clipboard file mutex poisoned");
+    if file
+        .as_ref()
+        .is_some_and(|request| request.side == side && request.generation == generation)
+    {
+        file.take();
+    }
+    state
+        .pending_clipboard_offer
+        .lock()
+        .expect("clipboard offer mutex poisoned")
+        .take();
 }
 
 async fn connected_clipboard_source(state: &HostState) -> Option<(Side, RemotePeer)> {
@@ -935,7 +1245,11 @@ fn assign_sequence(message: HostToClientMessage, seq: u64) -> HostToClientMessag
         }
         HostToClientMessage::ReleaseAll { .. } => HostToClientMessage::ReleaseAll { seq },
         message @ HostToClientMessage::ClipboardPaste { .. }
-        | message @ HostToClientMessage::ClipboardRequest { .. } => message,
+        | message @ HostToClientMessage::ClipboardRequest { .. }
+        | message @ HostToClientMessage::ClipboardFileOffer { .. }
+        | message @ HostToClientMessage::ClipboardFileDecision { .. }
+        | message @ HostToClientMessage::ClipboardFileData { .. }
+        | message @ HostToClientMessage::ClipboardFileComplete { .. } => message,
     }
 }
 
@@ -1313,6 +1627,8 @@ mod tests {
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(Mutex::new(None)),
+            pending_clipboard_file: Arc::new(Mutex::new(None)),
+            pending_clipboard_offer: Arc::new(Mutex::new(None)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

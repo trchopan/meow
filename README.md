@@ -240,15 +240,16 @@ Shortcut format is `modifier+modifier+key` (case-insensitive). Supported modifie
 
 ## Clipboard Paste
 
-Press `ctrl+alt+cmd+p` to transfer plain-text clipboard contents and paste them into the
-currently focused application. When a client is focused, the host clipboard is pasted on
-that client. When the host is focused, the clipboard is read from the most recently active
-client and pasted on the host.
+Press `ctrl+alt+cmd+p` to transfer clipboard contents to the currently focused machine. Plain
+text is pasted into the focused application. When a file is copied, meow shows a native
+confirmation dialog on the destination machine and, when approved, copies the file to
+`~/Downloads/meow/`.
 
 The shortcut can be customized with `clipboard_key` in `host_state.json`, using the same
-format as `detach_key`. Clipboard synchronization currently supports plain text and limits
-payloads to approximately 900 KiB. Clipboard requests are authorized by the existing attach
-secret, so only attach clients that trust the host should be connected.
+format as `detach_key`. Clipboard synchronization supports plain text up to approximately 900
+KiB and one file up to 100 MiB per request. Existing destination names are preserved by adding
+`-1`, `-2`, and so on before the extension. Clipboard requests are authorized by the existing
+attach secret, so only attach clients that trust the host should be connected.
 
 Use `meow reset-identity` (while daemon is stopped) to remove identity files and force a new host id on the next `meow host` run.
 

@@ -231,6 +231,16 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
             .lock()
             .expect("clipboard request mutex poisoned")
             .take();
+        state
+            .pending_clipboard_file
+            .lock()
+            .expect("clipboard file mutex poisoned")
+            .take();
+        state
+            .pending_clipboard_offer
+            .lock()
+            .expect("clipboard offer mutex poisoned")
+            .take();
     }
     if let Some(side) = target.to_side() {
         state
@@ -390,6 +400,8 @@ mod tests {
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(std::sync::Mutex::new(None)),
+            pending_clipboard_file: Arc::new(std::sync::Mutex::new(None)),
+            pending_clipboard_offer: Arc::new(std::sync::Mutex::new(None)),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

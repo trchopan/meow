@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ScreenEdge, Side};
 
-pub(crate) const ALPN: &[u8] = b"meow/remote-input/2";
+pub(crate) const ALPN: &[u8] = b"meow/remote-input/3";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
-pub(crate) const MAX_CLIPBOARD_MSG_SIZE: usize = 1024 * 1024;
+pub(crate) const FILE_CHUNK_SIZE: usize = 1024 * 1024;
+pub(crate) const MAX_FILE_MSG_SIZE: usize = FILE_CHUNK_SIZE + 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AuthRequest {
@@ -25,11 +26,44 @@ pub(crate) struct AuthResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum HostToClientMessage {
-    Event { seq: u64, event: WireEvent },
-    RelativeMotion { seq: u64, dx: i32, dy: i32 },
-    ReleaseAll { seq: u64 },
-    ClipboardPaste { request_id: u64, text: String },
-    ClipboardRequest { request_id: u64 },
+    Event {
+        seq: u64,
+        event: WireEvent,
+    },
+    RelativeMotion {
+        seq: u64,
+        dx: i32,
+        dy: i32,
+    },
+    ReleaseAll {
+        seq: u64,
+    },
+    ClipboardPaste {
+        request_id: u64,
+        text: String,
+    },
+    ClipboardRequest {
+        request_id: u64,
+    },
+    ClipboardFileOffer {
+        request_id: u64,
+        name: String,
+        size: u64,
+        digest: [u8; 32],
+    },
+    ClipboardFileDecision {
+        request_id: u64,
+        accepted: bool,
+    },
+    ClipboardFileData {
+        request_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    ClipboardFileComplete {
+        request_id: u64,
+        digest: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,9 +124,36 @@ pub(crate) enum ReplayFailureKind {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ClientToHostMessage {
-    ClientEdgeReached { edge: ScreenEdge },
-    ReplayFailure { kind: ReplayFailureKind, count: u64 },
-    ClipboardData { request_id: u64, text: String },
+    ClientEdgeReached {
+        edge: ScreenEdge,
+    },
+    ReplayFailure {
+        kind: ReplayFailureKind,
+        count: u64,
+    },
+    ClipboardData {
+        request_id: u64,
+        text: String,
+    },
+    ClipboardFileOffer {
+        request_id: u64,
+        name: String,
+        size: u64,
+        digest: [u8; 32],
+    },
+    ClipboardFileDecision {
+        request_id: u64,
+        accepted: bool,
+    },
+    ClipboardFileData {
+        request_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    ClipboardFileComplete {
+        request_id: u64,
+        digest: [u8; 32],
+    },
 }
 
 pub(crate) async fn send_client_feedback(
@@ -100,6 +161,9 @@ pub(crate) async fn send_client_feedback(
     message: &ClientToHostMessage,
 ) -> Result<()> {
     let bytes = bincode::serialize(message)?;
+    if bytes.len() > MAX_FILE_MSG_SIZE {
+        bail!("clipboard file message is too large");
+    }
     let mut send = connection.open_uni().await?;
     send.write_all(&bytes).await?;
     send.finish()?;
@@ -111,6 +175,9 @@ pub(crate) async fn write_framed<T: Serialize>(
     value: &T,
 ) -> Result<()> {
     let bytes = bincode::serialize(value)?;
+    if bytes.len() > MAX_FILE_MSG_SIZE {
+        bail!("framed message is too large");
+    }
     let len = bytes.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&bytes).await?;
@@ -120,7 +187,7 @@ pub(crate) async fn write_framed<T: Serialize>(
 pub(crate) async fn read_framed_with_clipboard_size<T: for<'de> Deserialize<'de>>(
     stream: &mut iroh::endpoint::RecvStream,
 ) -> Result<(T, usize)> {
-    read_framed_with_size_limit(stream, MAX_INPUT_MSG_SIZE.max(MAX_CLIPBOARD_MSG_SIZE)).await
+    read_framed_with_size_limit(stream, MAX_FILE_MSG_SIZE.max(MAX_INPUT_MSG_SIZE)).await
 }
 
 pub(crate) async fn read_framed_with_limit<T: for<'de> Deserialize<'de>>(
@@ -229,6 +296,32 @@ mod tests {
             round_trip,
             ClientToHostMessage::ClipboardData { request_id: 12, text } if text == "hello"
         ));
+
+        let file = HostToClientMessage::ClipboardFileData {
+            request_id: 13,
+            offset: 0,
+            data: vec![1, 2, 3],
+        };
+        let bytes = bincode::serialize(&file).expect("serialize file");
+        let round_trip: HostToClientMessage =
+            bincode::deserialize(&bytes).expect("deserialize file");
+        assert!(matches!(
+            round_trip,
+            HostToClientMessage::ClipboardFileData { request_id: 13, offset: 0, data }
+                if data == vec![1, 2, 3]
+        ));
+
+        let complete = ClientToHostMessage::ClipboardFileComplete {
+            request_id: 13,
+            digest: [7; 32],
+        };
+        let bytes = bincode::serialize(&complete).expect("serialize completion");
+        let round_trip: ClientToHostMessage =
+            bincode::deserialize(&bytes).expect("deserialize completion");
+        assert!(matches!(
+            round_trip,
+            ClientToHostMessage::ClipboardFileComplete { request_id: 13, digest } if digest == [7; 32]
+        ));
     }
 
     #[test]
@@ -247,6 +340,12 @@ mod tests {
             }
             ClientToHostMessage::ClipboardData { .. } => {
                 panic!("unexpected clipboard feedback")
+            }
+            ClientToHostMessage::ClipboardFileOffer { .. }
+            | ClientToHostMessage::ClipboardFileDecision { .. }
+            | ClientToHostMessage::ClipboardFileData { .. }
+            | ClientToHostMessage::ClipboardFileComplete { .. } => {
+                panic!("unexpected clipboard file feedback")
             }
         }
     }
