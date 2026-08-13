@@ -5,16 +5,6 @@ use anyhow::{Context, Result, bail};
 
 pub(crate) const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
-pub(crate) fn format_size(size: u64) -> String {
-    if size >= 1024 * 1024 {
-        format!("{:.1} MiB", size as f64 / (1024.0 * 1024.0))
-    } else if size >= 1024 {
-        format!("{:.1} KiB", size as f64 / 1024.0)
-    } else {
-        format!("{size} bytes")
-    }
-}
-
 pub(crate) fn sanitize_filename(name: &str) -> String {
     let name = Path::new(name)
         .file_name()
@@ -37,48 +27,31 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
     }
 }
 
-pub(crate) fn collision_path(directory: &Path, filename: &str) -> PathBuf {
-    let filename = sanitize_filename(filename);
-    let path = directory.join(&filename);
-    if !path.exists() {
-        return path;
-    }
-
-    let path = Path::new(&filename);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("meow-file");
-    let extension = path.extension().and_then(|value| value.to_str());
-    for index in 1.. {
-        let candidate = match extension {
-            Some(extension) => format!("{stem}-{index}.{extension}"),
-            None => format!("{stem}-{index}"),
-        };
-        let candidate = directory.join(candidate);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!()
-}
-
-pub(crate) struct DownloadTarget {
+pub(crate) struct ReceiveTarget {
     temporary_path: PathBuf,
-    directory: PathBuf,
-    filename: String,
+    destination: PathBuf,
 }
 
-impl DownloadTarget {
-    pub(crate) fn new(filename: &str) -> Result<Self> {
-        let home = dirs::home_dir().context("home directory is unavailable")?;
-        let directory = home.join("Downloads").join("meow");
-        std::fs::create_dir_all(&directory).context("failed to create ~/Downloads/meow")?;
-        let (temporary_path, _) = create_temporary_file(&directory, filename)?;
+impl ReceiveTarget {
+    pub(crate) fn new(destination: &Path) -> Result<Self> {
+        let destination = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(destination)
+        };
+        let directory = destination
+            .parent()
+            .context("destination has no parent directory")?;
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+        let filename = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("destination filename is not valid UTF-8")?;
+        let (temporary_path, _) = create_temporary_file(directory, filename)?;
         Ok(Self {
             temporary_path,
-            directory,
-            filename: sanitize_filename(filename),
+            destination,
         })
     }
 
@@ -87,21 +60,16 @@ impl DownloadTarget {
     }
 
     pub(crate) fn finish(self) -> Result<PathBuf> {
-        loop {
-            let destination = collision_path(&self.directory, &self.filename);
-            match std::fs::hard_link(&self.temporary_path, &destination) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&self.temporary_path);
-                    return Ok(destination);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err).context("failed to finalize transferred file"),
-            }
+        if self.destination.exists() {
+            bail!("destination already exists: {}", self.destination.display());
         }
+        std::fs::rename(&self.temporary_path, &self.destination)
+            .with_context(|| format!("failed to finalize {}", self.destination.display()))?;
+        Ok(self.destination.clone())
     }
 }
 
-impl Drop for DownloadTarget {
+impl Drop for ReceiveTarget {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.temporary_path);
     }
@@ -136,23 +104,5 @@ mod tests {
         assert_eq!(sanitize_filename("../../hello.txt"), "hello.txt");
         assert_eq!(sanitize_filename("bad\nname.txt"), "bad_name.txt");
         assert_eq!(sanitize_filename(".."), "meow-file");
-    }
-
-    #[test]
-    fn preserves_extension_when_renaming() {
-        let directory = tempfile_dir();
-        std::fs::write(directory.join("hello.txt"), b"existing").unwrap();
-        assert_eq!(
-            collision_path(&directory, "hello.txt"),
-            directory.join("hello-1.txt")
-        );
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    fn tempfile_dir() -> PathBuf {
-        let directory = std::env::temp_dir().join(format!("meow-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
     }
 }

@@ -15,7 +15,6 @@ mod host_mouse;
 mod input;
 mod input_overlay;
 mod ipc;
-mod macos_dialog;
 mod macos_inject;
 mod macos_keyboard;
 mod macos_mouse_delta;
@@ -25,6 +24,7 @@ mod presentation;
 mod probe;
 mod protocol;
 mod state;
+mod transfer;
 
 use attach::{run_attach, run_test_inject};
 use cli::{Cli, Command};
@@ -35,6 +35,7 @@ use ipc::{IpcCommand, send_ipc, send_switch};
 use model::ActiveTarget;
 use probe::run_probe_pointer_lock;
 use state::{reset_identity, rotate_secret};
+use transfer::receive_file;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,5 +65,24 @@ async fn main() -> Result<()> {
         Command::PointerMode(args) => send_ipc(IpcCommand::PointerMode { mode: args.mode }).await,
         Command::Status => send_ipc(IpcCommand::Status).await,
         Command::Stop => send_ipc(IpcCommand::Stop).await,
+        Command::Receive(args) => {
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(iroh::SecretKey::generate())
+                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .bind()
+                .await?;
+            let blob_runtime = blob::BlobRuntime::start(endpoint.clone(), "receiver").await?;
+            let router = iroh::protocol::Router::builder(endpoint.clone())
+                .accept(iroh_blobs::ALPN, blob_runtime.protocol())
+                .spawn();
+            let result =
+                receive_file(&blob_runtime, &args.reference, args.destination.as_deref()).await;
+            let _ = blob_runtime.shutdown().await;
+            let _ = router.shutdown().await;
+            endpoint.close().await;
+            let path = result?;
+            println!("received file at {}", path.display());
+            Ok(())
+        }
     }
 }

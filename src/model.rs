@@ -162,6 +162,7 @@ pub(crate) enum CapturedEvent {
     MouseMoveRelative { dx: i32, dy: i32 },
     HostEdgeReached { edge: ScreenEdge },
     ClipboardPaste,
+    CopyFileCommand,
 }
 
 #[derive(Clone)]
@@ -194,7 +195,6 @@ pub(crate) struct HostState {
     pub(crate) target_epoch: Arc<AtomicU64>,
     pub(crate) next_clipboard_request: Arc<AtomicU64>,
     pub(crate) pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
-    pub(crate) pending_clipboard_file: Arc<Mutex<Option<PendingClipboardFile>>>,
     pub(crate) runtime_stats: Arc<RuntimeStats>,
     pub(crate) shutdown_requested: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
@@ -202,14 +202,6 @@ pub(crate) struct HostState {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingClipboardRequest {
-    pub(crate) request_id: u64,
-    pub(crate) side: Side,
-    pub(crate) generation: u64,
-    pub(crate) target_epoch: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PendingClipboardFile {
     pub(crate) request_id: u64,
     pub(crate) side: Side,
     pub(crate) generation: u64,

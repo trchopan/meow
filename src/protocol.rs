@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ScreenEdge, Side};
 
-pub(crate) const ALPN: &[u8] = b"meow/remote-input/3";
+pub(crate) const ALPN: &[u8] = b"meow/remote-input/4";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
@@ -26,36 +26,11 @@ pub(crate) struct AuthResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum HostToClientMessage {
-    Event {
-        seq: u64,
-        event: WireEvent,
-    },
-    RelativeMotion {
-        seq: u64,
-        dx: i32,
-        dy: i32,
-    },
-    ReleaseAll {
-        seq: u64,
-    },
-    ClipboardPaste {
-        request_id: u64,
-        text: String,
-    },
-    ClipboardRequest {
-        request_id: u64,
-    },
-    ClipboardFileOffer {
-        request_id: u64,
-        name: String,
-        size: u64,
-        blob_endpoint_id: String,
-        blob: String,
-    },
-    ClipboardFileDecision {
-        request_id: u64,
-        accepted: bool,
-    },
+    Event { seq: u64, event: WireEvent },
+    RelativeMotion { seq: u64, dx: i32, dy: i32 },
+    ReleaseAll { seq: u64 },
+    ClipboardPaste { request_id: u64, text: String },
+    ClipboardRequest { request_id: u64 },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,28 +91,9 @@ pub(crate) enum ReplayFailureKind {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ClientToHostMessage {
-    ClientEdgeReached {
-        edge: ScreenEdge,
-    },
-    ReplayFailure {
-        kind: ReplayFailureKind,
-        count: u64,
-    },
-    ClipboardData {
-        request_id: u64,
-        text: String,
-    },
-    ClipboardFileOffer {
-        request_id: u64,
-        name: String,
-        size: u64,
-        blob_endpoint_id: String,
-        blob: String,
-    },
-    ClipboardFileDecision {
-        request_id: u64,
-        accepted: bool,
-    },
+    ClientEdgeReached { edge: ScreenEdge },
+    ReplayFailure { kind: ReplayFailureKind, count: u64 },
+    ClipboardData { request_id: u64, text: String },
 }
 
 pub(crate) async fn send_client_feedback(
@@ -298,10 +254,6 @@ mod tests {
             }
             ClientToHostMessage::ClipboardData { .. } => {
                 panic!("unexpected clipboard feedback")
-            }
-            ClientToHostMessage::ClipboardFileOffer { .. }
-            | ClientToHostMessage::ClipboardFileDecision { .. } => {
-                panic!("unexpected clipboard file feedback")
             }
         }
     }

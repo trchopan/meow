@@ -10,9 +10,9 @@ use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 
 use crate::input::{
-    default_clipboard_key, default_detach_key, default_down_key, default_left_key,
-    default_right_key, default_up_key, parse_clipboard_chord, parse_detach_chord,
-    parse_directional_chord,
+    default_copy_file_key, default_detach_key, default_down_key, default_left_key,
+    default_paste_key, default_right_key, default_up_key, parse_copy_file_chord,
+    parse_detach_chord, parse_directional_chord, parse_paste_chord,
 };
 use crate::model::RemotePointerMode;
 use crate::presentation::{print_identity_reset_complete, print_rotate_secret_complete};
@@ -29,7 +29,10 @@ pub(crate) struct PersistedHostState {
     pub(crate) detach_key: String,
     #[serde(default = "default_remote_pointer_mode")]
     pub(crate) remote_pointer_mode: RemotePointerMode,
-    pub(crate) clipboard_key: String,
+    #[serde(alias = "clipboard_key")]
+    pub(crate) paste_key: String,
+    #[serde(default = "default_copy_file_key")]
+    pub(crate) copy_file_key: String,
     pub(crate) up_key: String,
     pub(crate) down_key: String,
     pub(crate) left_key: String,
@@ -151,10 +154,10 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
         }
         validate_shortcut_conflicts(&state)?;
         let changed = repaired;
-        parse_clipboard_chord(&state.clipboard_key).with_context(|| {
+        parse_paste_chord(&state.paste_key).with_context(|| {
             format!(
-                "invalid clipboard_key {:?} in {}",
-                state.clipboard_key,
+                "invalid paste_key {:?} in {}",
+                state.paste_key,
                 state_path.display()
             )
         })?;
@@ -170,7 +173,8 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
         attach_secret: random_secret(),
         detach_key: default_detach_key(),
         remote_pointer_mode: default_remote_pointer_mode(),
-        clipboard_key: default_clipboard_key(),
+        paste_key: default_paste_key(),
+        copy_file_key: default_copy_file_key(),
         up_key: default_up_key(),
         down_key: default_down_key(),
         left_key: default_left_key(),
@@ -183,9 +187,10 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
 fn validate_shortcut_conflicts(state: &PersistedHostState) -> Result<()> {
     let shortcuts = [
         ("detach_key", parse_detach_chord(&state.detach_key)?),
+        ("paste_key", parse_paste_chord(&state.paste_key)?),
         (
-            "clipboard_key",
-            parse_clipboard_chord(&state.clipboard_key)?,
+            "copy_file_key",
+            parse_copy_file_chord(&state.copy_file_key)?,
         ),
         (
             "up_key",
@@ -323,8 +328,12 @@ fn repair_host_state_for_endpoint(
         changed = true;
     }
 
-    if state.clipboard_key.trim().is_empty() {
-        state.clipboard_key = default_clipboard_key();
+    if state.paste_key.trim().is_empty() {
+        state.paste_key = default_paste_key();
+        changed = true;
+    }
+    if state.copy_file_key.trim().is_empty() {
+        state.copy_file_key = default_copy_file_key();
         changed = true;
     }
 
@@ -360,7 +369,8 @@ mod tests {
             attach_secret: "   ".to_string(),
             detach_key: " ".to_string(),
             remote_pointer_mode: RemotePointerMode::Confine,
-            clipboard_key: " ".to_string(),
+            paste_key: " ".to_string(),
+            copy_file_key: " ".to_string(),
             up_key: " ".to_string(),
             down_key: " ".to_string(),
             left_key: " ".to_string(),
@@ -372,7 +382,8 @@ mod tests {
         assert!(changed);
         assert!(!repaired.attach_secret.trim().is_empty());
         assert_eq!(repaired.detach_key, default_detach_key());
-        assert_eq!(repaired.clipboard_key, default_clipboard_key());
+        assert_eq!(repaired.paste_key, default_paste_key());
+        assert_eq!(repaired.copy_file_key, default_copy_file_key());
         assert_eq!(repaired.up_key, default_up_key());
         assert_eq!(repaired.down_key, default_down_key());
         assert_eq!(repaired.left_key, default_left_key());
@@ -389,7 +400,8 @@ mod tests {
             attach_secret: "secret".to_string(),
             detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
-            clipboard_key: default_clipboard_key(),
+            paste_key: default_paste_key(),
+            copy_file_key: default_copy_file_key(),
             up_key: default_up_key(),
             down_key: default_down_key(),
             left_key: default_left_key(),
@@ -411,7 +423,8 @@ mod tests {
             attach_secret: "already-good".to_string(),
             detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
-            clipboard_key: default_clipboard_key(),
+            paste_key: default_paste_key(),
+            copy_file_key: default_copy_file_key(),
             up_key: default_up_key(),
             down_key: default_down_key(),
             left_key: default_left_key(),
@@ -425,7 +438,8 @@ mod tests {
         assert_eq!(repaired.attach_secret, "already-good");
         assert_eq!(repaired.detach_key, default_detach_key());
         assert_eq!(repaired.remote_pointer_mode, default_remote_pointer_mode());
-        assert_eq!(repaired.clipboard_key, default_clipboard_key());
+        assert_eq!(repaired.paste_key, default_paste_key());
+        assert_eq!(repaired.copy_file_key, default_copy_file_key());
         assert_eq!(repaired.up_key, default_up_key());
         assert_eq!(repaired.down_key, default_down_key());
         assert_eq!(repaired.left_key, default_left_key());
@@ -441,7 +455,8 @@ mod tests {
             attach_secret: "secret".to_string(),
             detach_key: "ctrl+alt+cmd+l".to_string(),
             remote_pointer_mode: default_remote_pointer_mode(),
-            clipboard_key: "ctrl+alt+cmd+p".to_string(),
+            paste_key: "ctrl+alt+cmd+p".to_string(),
+            copy_file_key: "ctrl+alt+cmd+y".to_string(),
             up_key: "ctrl+alt+cmd+up".to_string(),
             down_key: "ctrl+alt+cmd+down".to_string(),
             left_key: "ctrl+alt+cmd+right".to_string(),
@@ -461,7 +476,8 @@ mod tests {
             attach_secret: "secret".to_string(),
             detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
-            clipboard_key: default_clipboard_key(),
+            paste_key: default_paste_key(),
+            copy_file_key: default_copy_file_key(),
             up_key: default_up_key(),
             down_key: default_down_key(),
             left_key: default_left_key(),

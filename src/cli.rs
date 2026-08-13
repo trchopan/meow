@@ -44,6 +44,13 @@ pub(crate) enum Command {
     PointerMode(PointerModeArgs),
     Status,
     Stop,
+    Receive(ReceiveArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ReceiveArgs {
+    pub(crate) reference: String,
+    pub(crate) destination: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]

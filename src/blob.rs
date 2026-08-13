@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::{BlobsProtocol, HashAndFormat, store::fs::FsStore};
+use iroh_blobs::{BlobsProtocol, HashAndFormat, store::fs::FsStore, ticket::BlobTicket};
 
 pub(crate) struct BlobRuntime {
     endpoint: Option<Endpoint>,
@@ -38,13 +38,6 @@ impl BlobRuntime {
         )
     }
 
-    pub(crate) fn endpoint_id(&self) -> Result<EndpointId> {
-        self.endpoint
-            .as_ref()
-            .map(Endpoint::id)
-            .context("blob runtime is disabled")
-    }
-
     pub(crate) async fn add_path(&self, path: &Path) -> Result<String> {
         let tag = self
             .store
@@ -69,6 +62,29 @@ impl BlobRuntime {
         downloader.download(content, vec![provider]).await?;
         store.export(content.hash, destination).await?;
         Ok(())
+    }
+
+    pub(crate) async fn download_ticket(
+        &self,
+        ticket: &BlobTicket,
+        destination: PathBuf,
+    ) -> Result<()> {
+        self.download_to(
+            &ticket.addr().id.to_string(),
+            &ticket.hash_and_format().to_string(),
+            destination,
+        )
+        .await
+    }
+
+    pub(crate) fn ticket_for(&self, content: &str) -> Result<BlobTicket> {
+        let content = HashAndFormat::from_str(content).context("invalid blob content id")?;
+        let endpoint = self.endpoint.as_ref().context("blob runtime is disabled")?;
+        Ok(BlobTicket::new(
+            endpoint.addr(),
+            content.hash,
+            content.format,
+        ))
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {

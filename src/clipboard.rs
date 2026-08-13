@@ -8,7 +8,6 @@ const MAX_CLIPBOARD_TEXT_BYTES: usize = 900 * 1024;
 pub(crate) struct ClipboardFile {
     pub(crate) path: std::path::PathBuf,
     pub(crate) name: String,
-    pub(crate) size: u64,
 }
 
 pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
@@ -62,11 +61,7 @@ pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
             .and_then(|name| name.to_str())
             .unwrap_or("meow-file")
             .to_string();
-        Ok(Some(ClipboardFile {
-            path,
-            name,
-            size: metadata.len(),
-        }))
+        Ok(Some(ClipboardFile { path, name }))
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -343,111 +343,22 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     continue;
                 }
                 let feedback_connection = connection.clone();
-                let feedback_blob_runtime = blob_runtime.clone();
                 tokio::spawn(async move {
-                    match tokio::task::spawn_blocking(clipboard::read_file).await {
-                        Ok(Ok(Some(file))) => {
-                            let blob = match feedback_blob_runtime.add_path(&file.path).await {
-                                Ok(blob) => blob,
-                                Err(err) => {
-                                    warn!("failed to index clipboard file {request_id}: {err:#}");
-                                    return;
-                                }
-                            };
-                            let blob_endpoint_id = match feedback_blob_runtime.endpoint_id() {
-                                Ok(id) => id.to_string(),
-                                Err(err) => {
-                                    warn!("blob endpoint unavailable: {err:#}");
-                                    return;
-                                }
-                            };
-                            let message = ClientToHostMessage::ClipboardFileOffer {
-                                request_id,
-                                name: file.name,
-                                size: file.size,
-                                blob_endpoint_id,
-                                blob,
-                            };
+                    match tokio::task::spawn_blocking(clipboard::read_text).await {
+                        Ok(Ok(text)) => {
+                            let message = ClientToHostMessage::ClipboardData { request_id, text };
                             if let Err(err) =
                                 send_client_feedback(&feedback_connection, &message).await
                             {
-                                warn!("failed sending clipboard file offer {request_id}: {err:#}");
+                                warn!("failed sending clipboard response {request_id}: {err:#}");
                             }
                         }
-                        Ok(Ok(None)) => match tokio::task::spawn_blocking(clipboard::read_text)
-                            .await
-                        {
-                            Ok(Ok(text)) => {
-                                let message =
-                                    ClientToHostMessage::ClipboardData { request_id, text };
-                                if let Err(err) =
-                                    send_client_feedback(&feedback_connection, &message).await
-                                {
-                                    warn!(
-                                        "failed sending clipboard response {request_id}: {err:#}"
-                                    );
-                                }
-                            }
-                            Ok(Err(err)) => {
-                                warn!("failed to read client clipboard {request_id}: {err:#}")
-                            }
-                            Err(err) => warn!("clipboard read task failed {request_id}: {err:#}"),
-                        },
                         Ok(Err(err)) => {
                             warn!("failed to read client clipboard {request_id}: {err:#}")
                         }
-                        Err(err) => warn!("clipboard file read task failed {request_id}: {err:#}"),
+                        Err(err) => warn!("clipboard read task failed {request_id}: {err:#}"),
                     }
                 });
-            }
-            HostToClientMessage::ClipboardFileOffer {
-                request_id,
-                name,
-                size,
-                blob_endpoint_id,
-                blob,
-            } => {
-                if args.no_inject {
-                    continue;
-                }
-                let dialog_name = name.clone();
-                let mut accepted = tokio::task::spawn_blocking(move || {
-                    crate::macos_dialog::confirm_file_transfer(&dialog_name, size).unwrap_or(false)
-                })
-                .await
-                .unwrap_or(false);
-                let target = if accepted {
-                    match crate::file_transfer::DownloadTarget::new(&name) {
-                        Ok(target) => Some(target),
-                        Err(err) => {
-                            warn!("failed to prepare clipboard file {request_id}: {err:#}");
-                            accepted = false;
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let message = ClientToHostMessage::ClipboardFileDecision {
-                    request_id,
-                    accepted,
-                };
-                if let Err(err) = send_client_feedback(&connection, &message).await {
-                    warn!("failed sending clipboard file decision {request_id}: {err:#}");
-                } else if let Some(target) = target {
-                    let path = target.path().to_path_buf();
-                    match blob_runtime
-                        .download_to(&blob_endpoint_id, &blob, path)
-                        .await
-                        .and_then(|_| target.finish())
-                    {
-                        Ok(path) => info!("received clipboard file at {}", path.display()),
-                        Err(err) => warn!("failed to save clipboard file {request_id}: {err:#}"),
-                    }
-                }
-            }
-            HostToClientMessage::ClipboardFileDecision { .. } => {
-                continue;
             }
         }
     };

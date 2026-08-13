@@ -23,7 +23,8 @@ use crate::{
 };
 
 pub(crate) const DEFAULT_DETACH_KEY: &str = "ctrl+alt+cmd+u";
-pub(crate) const DEFAULT_CLIPBOARD_KEY: &str = "ctrl+alt+cmd+p";
+pub(crate) const DEFAULT_PASTE_KEY: &str = "ctrl+alt+cmd+p";
+pub(crate) const DEFAULT_COPY_FILE_KEY: &str = "ctrl+alt+cmd+y";
 pub(crate) const DEFAULT_UP_KEY: &str = "ctrl+alt+cmd+k";
 pub(crate) const DEFAULT_DOWN_KEY: &str = "ctrl+alt+cmd+j";
 pub(crate) const DEFAULT_LEFT_KEY: &str = "ctrl+alt+cmd+h";
@@ -70,7 +71,8 @@ pub(crate) fn run_input_grab(
     pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
     directional_switch_tx: mpsc::UnboundedSender<ActiveTarget>,
     detach_chord: DetachChord,
-    clipboard_chord: DetachChord,
+    paste_chord: DetachChord,
+    copy_file_chord: DetachChord,
     up_chord: DetachChord,
     down_chord: DetachChord,
     left_chord: DetachChord,
@@ -243,14 +245,12 @@ pub(crate) fn run_input_grab(
         }
 
         if cfg!(target_os = "macos") {
-            let clipboard_modifiers_match = (!clipboard_chord.ctrl || is_ctrl_down)
-                && (!clipboard_chord.alt || is_alt_down)
-                && (!clipboard_chord.meta || is_meta_down)
-                && (!clipboard_chord.shift || is_shift_down);
+            let clipboard_modifiers_match = (!paste_chord.ctrl || is_ctrl_down)
+                && (!paste_chord.alt || is_alt_down)
+                && (!paste_chord.meta || is_meta_down)
+                && (!paste_chord.shift || is_shift_down);
             match event.event_type {
-                EventType::KeyPress(key)
-                    if key == clipboard_chord.key && clipboard_modifiers_match =>
-                {
+                EventType::KeyPress(key) if key == paste_chord.key && clipboard_modifiers_match => {
                     callback_clipboard_key_active.store(true, Ordering::Relaxed);
                     try_send_captured_input(
                         &tx,
@@ -263,13 +263,31 @@ pub(crate) fn run_input_grab(
                     return None;
                 }
                 EventType::KeyRelease(key)
-                    if key == clipboard_chord.key
+                    if key == paste_chord.key
                         && callback_clipboard_key_active.load(Ordering::Relaxed) =>
                 {
                     callback_clipboard_key_active.store(false, Ordering::Relaxed);
                     return None;
                 }
                 _ => {}
+            }
+
+            let copy_file_modifiers_match = (!copy_file_chord.ctrl || is_ctrl_down)
+                && (!copy_file_chord.alt || is_alt_down)
+                && (!copy_file_chord.meta || is_meta_down)
+                && (!copy_file_chord.shift || is_shift_down);
+            if matches!(event.event_type, EventType::KeyPress(key) if key == copy_file_chord.key)
+                && copy_file_modifiers_match
+            {
+                try_send_captured_input(
+                    &tx,
+                    &send_ctx,
+                    CapturedInput {
+                        target,
+                        event: CapturedEvent::CopyFileCommand,
+                    },
+                );
+                return None;
             }
         }
 
@@ -565,8 +583,12 @@ pub(crate) fn parse_detach_chord(chord: &str) -> Result<DetachChord> {
     parse_chord(chord, "detach_key", DEFAULT_DETACH_KEY)
 }
 
-pub(crate) fn parse_clipboard_chord(chord: &str) -> Result<DetachChord> {
-    parse_chord(chord, "clipboard_key", DEFAULT_CLIPBOARD_KEY)
+pub(crate) fn parse_paste_chord(chord: &str) -> Result<DetachChord> {
+    parse_chord(chord, "paste_key", DEFAULT_PASTE_KEY)
+}
+
+pub(crate) fn parse_copy_file_chord(chord: &str) -> Result<DetachChord> {
+    parse_chord(chord, "copy_file_key", DEFAULT_COPY_FILE_KEY)
 }
 
 pub(crate) fn parse_directional_chord(
@@ -690,8 +712,12 @@ pub(crate) fn default_detach_key() -> String {
     DEFAULT_DETACH_KEY.to_string()
 }
 
-pub(crate) fn default_clipboard_key() -> String {
-    DEFAULT_CLIPBOARD_KEY.to_string()
+pub(crate) fn default_paste_key() -> String {
+    DEFAULT_PASTE_KEY.to_string()
+}
+
+pub(crate) fn default_copy_file_key() -> String {
+    DEFAULT_COPY_FILE_KEY.to_string()
 }
 
 pub(crate) fn default_up_key() -> String {
@@ -856,11 +882,18 @@ mod tests {
     }
 
     #[test]
-    fn default_clipboard_chord_is_ctrl_alt_cmd_p() {
-        let chord = parse_clipboard_chord(&default_clipboard_key()).expect("valid clipboard chord");
+    fn default_paste_chord_is_ctrl_alt_cmd_p() {
+        let chord = parse_paste_chord(&default_paste_key()).expect("valid paste chord");
         assert_eq!(chord.key, Key::KeyP);
         assert!(chord.ctrl && chord.alt && chord.meta);
         assert!(!chord.shift);
+    }
+
+    #[test]
+    fn default_copy_file_chord_is_ctrl_alt_cmd_y() {
+        let chord = parse_copy_file_chord(&default_copy_file_key()).expect("valid copy chord");
+        assert_eq!(chord.key, Key::KeyY);
+        assert!(chord.ctrl && chord.alt && chord.meta);
     }
 
     #[test]
