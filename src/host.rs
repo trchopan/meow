@@ -66,11 +66,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let host_secret_key = load_or_create_host_secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(host_secret_key)
-        .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), crate::transfer::TRANSFER_ALPN.to_vec()])
         .bind()
         .await
         .context("failed to create iroh endpoint")?;
-    let blob_runtime = crate::blob::BlobRuntime::start(endpoint.clone(), "host").await?;
 
     let endpoint_id = endpoint.id();
     let state_path = host_state_path()?;
@@ -110,6 +109,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let target_epoch = Arc::new(AtomicU64::new(0));
     let next_clipboard_request = Arc::new(AtomicU64::new(1));
     let pending_clipboard_request = Arc::new(Mutex::new(None));
+    let transfer_registry = Arc::new(Mutex::new(HashMap::new()));
+    let blob_runtime =
+        crate::blob::BlobRuntime::start(endpoint.clone(), "host", Some(transfer_registry.clone()))
+            .await?;
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -131,6 +134,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         target_epoch: target_epoch.clone(),
         next_clipboard_request: next_clipboard_request.clone(),
         pending_clipboard_request: pending_clipboard_request.clone(),
+        transfer_registry: transfer_registry.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -225,7 +229,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 secret: secret.clone(),
             },
         )
-        .accept(iroh_blobs::ALPN, blob_runtime.protocol())
+        .accept(
+            crate::transfer::TRANSFER_ALPN,
+            blob_runtime.transfer_protocol(transfer_registry.clone())?,
+        )
         .spawn();
     endpoint.online().await;
 
@@ -788,13 +795,46 @@ async fn handle_copy_file_command(state: &HostState) {
             return;
         }
     };
-    let reference = match crate::transfer::create_reference(&ticket, &file.name) {
-        Ok(reference) => reference,
+    let size = match std::fs::metadata(&file.path) {
+        Ok(metadata) => metadata.len(),
         Err(err) => {
-            warn!("failed to create transfer reference: {err:#}");
+            warn!("failed to stat clipboard file: {err:#}");
             return;
         }
     };
+    let digest = match crate::transfer::digest_path(&file.path) {
+        Ok(digest) => digest,
+        Err(err) => {
+            warn!("failed to digest clipboard file: {err:#}");
+            return;
+        }
+    };
+    let (reference, capability) =
+        match crate::transfer::create_reference(&ticket, &file.name, size, digest) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("failed to create transfer reference: {err:#}");
+                return;
+            }
+        };
+    let expires_at = crate::transfer::reference_expiry().unwrap_or(0);
+    crate::transfer::retain_grant(
+        &mut state
+            .transfer_registry
+            .lock()
+            .expect("transfer registry poisoned"),
+        capability,
+        crate::transfer::TransferGrant {
+            hash: ticket.hash(),
+            size,
+            digest,
+            expires_at,
+            attempts: 0,
+            in_flight: false,
+            retry_until: 0,
+        },
+    );
+
     let command = match crate::transfer::receive_command(&reference) {
         Ok(command) => command,
         Err(err) => {
@@ -1390,6 +1430,7 @@ mod tests {
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(Mutex::new(None)),
+            transfer_registry: Arc::new(Mutex::new(HashMap::new())),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

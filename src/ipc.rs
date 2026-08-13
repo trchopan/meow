@@ -391,6 +391,7 @@ mod tests {
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(std::sync::Mutex::new(None)),
+            transfer_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

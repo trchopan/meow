@@ -18,6 +18,9 @@ use crate::protocol::HostToClientMessage;
 
 pub(crate) static TARGET_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
 
+pub(crate) type TransferRegistry =
+    Arc<Mutex<std::collections::HashMap<String, crate::transfer::TransferGrant>>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Side {
@@ -195,6 +198,7 @@ pub(crate) struct HostState {
     pub(crate) target_epoch: Arc<AtomicU64>,
     pub(crate) next_clipboard_request: Arc<AtomicU64>,
     pub(crate) pending_clipboard_request: Arc<Mutex<Option<PendingClipboardRequest>>>,
+    pub(crate) transfer_registry: TransferRegistry,
     pub(crate) runtime_stats: Arc<RuntimeStats>,
     pub(crate) shutdown_requested: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,

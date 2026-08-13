@@ -68,17 +68,11 @@ async fn main() -> Result<()> {
         Command::Receive(args) => {
             let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                 .secret_key(iroh::SecretKey::generate())
-                .alpns(vec![iroh_blobs::ALPN.to_vec()])
+                .alpns(vec![crate::transfer::TRANSFER_ALPN.to_vec()])
                 .bind()
                 .await?;
-            let blob_runtime = blob::BlobRuntime::start(endpoint.clone(), "receiver").await?;
-            let router = iroh::protocol::Router::builder(endpoint.clone())
-                .accept(iroh_blobs::ALPN, blob_runtime.protocol())
-                .spawn();
             let result =
-                receive_file(&blob_runtime, &args.reference, args.destination.as_deref()).await;
-            let _ = blob_runtime.shutdown().await;
-            let _ = router.shutdown().await;
+                receive_file(&endpoint, &args.reference, args.destination.as_deref()).await;
             endpoint.close().await;
             let path = result?;
             println!("received file at {}", path.display());

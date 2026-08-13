@@ -275,6 +275,13 @@ can be customized with `copy_file_key`; the `p` shortcut can be customized with 
 Existing state files using `clipboard_key` are accepted as a legacy alias for `paste_key`.
 Clipboard text supports approximately 900 KiB and files are limited to 100 MiB.
 
+Transfer references are bearer capabilities. They are short-lived and are not logged by meow. A
+transfer may be retried up to three times within a two-minute retry window after an interrupted
+attempt, but is revoked immediately after successful destination finalization. The source host
+validates the capability, expiry, blob hash, and size over a dedicated authenticated iroh protocol.
+Keep the reference private because clipboard managers and other local applications may be able to
+read it. Published transfer blobs are garbage-collected after their active capability expires.
+
 Use `meow reset-identity` (while daemon is stopped) to remove identity files and force a new host id on the next `meow host` run.
 
 Use `meow rotate-secret` (while daemon is stopped) to keep the same host id and generate a new attach secret.

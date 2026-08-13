@@ -60,11 +60,14 @@ impl ReceiveTarget {
     }
 
     pub(crate) fn finish(self) -> Result<PathBuf> {
-        if self.destination.exists() {
-            bail!("destination already exists: {}", self.destination.display());
+        match std::fs::hard_link(&self.temporary_path, &self.destination) {
+            Ok(()) => std::fs::remove_file(&self.temporary_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("destination already exists: {}", self.destination.display())
+            }
+            Err(err) => Err(err),
         }
-        std::fs::rename(&self.temporary_path, &self.destination)
-            .with_context(|| format!("failed to finalize {}", self.destination.display()))?;
+        .with_context(|| format!("failed to finalize {}", self.destination.display()))?;
         Ok(self.destination.clone())
     }
 }
@@ -76,17 +79,20 @@ impl Drop for ReceiveTarget {
 }
 
 fn create_temporary_file(directory: &Path, filename: &str) -> Result<(PathBuf, File)> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     for index in 0..1000 {
         let path = directory.join(format!(
             ".{}.part-{}-{index}",
             sanitize_filename(filename),
             std::process::id()
         ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err).context("failed to create temporary file"),
@@ -104,5 +110,19 @@ mod tests {
         assert_eq!(sanitize_filename("../../hello.txt"), "hello.txt");
         assert_eq!(sanitize_filename("bad\nname.txt"), "bad_name.txt");
         assert_eq!(sanitize_filename(".."), "meow-file");
+    }
+
+    #[test]
+    fn refuses_existing_destination_without_replacing_it() {
+        let directory = std::env::temp_dir().join(format!("meow-transfer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("file.txt");
+        std::fs::write(&destination, b"original").unwrap();
+        let target = ReceiveTarget::new(&destination).unwrap();
+        std::fs::write(target.path(), b"replacement").unwrap();
+        assert!(target.finish().is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

@@ -42,13 +42,9 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         }
         result = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::generate())
-            .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec()])
             .bind() => result.context("failed to create iroh endpoint"),
     }?;
-    let blob_runtime = crate::blob::BlobRuntime::start(endpoint.clone(), "client").await?;
-    let blob_router = iroh::protocol::Router::builder(endpoint.clone())
-        .accept(iroh_blobs::ALPN, blob_runtime.protocol())
-        .spawn();
     endpoint.online().await;
 
     let connection = tokio::select! {
@@ -375,12 +371,6 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     }
 
     replay_failures.flush(&connection).await;
-    if let Err(err) = blob_runtime.shutdown().await {
-        warn!("blob store shutdown failed: {err:#}");
-    }
-    if let Err(err) = blob_router.shutdown().await {
-        warn!("blob router shutdown failed: {err:#}");
-    }
 
     if let Some(probe) = probe.as_mut() {
         probe.note_held_counts(&input_state);

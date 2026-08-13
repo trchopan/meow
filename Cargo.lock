@@ -2345,6 +2345,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "blake3",
  "clap",
  "cocoa 0.25.0",
  "core-foundation 0.9.4",
