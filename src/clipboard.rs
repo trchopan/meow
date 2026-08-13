@@ -34,7 +34,20 @@ pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
         let Some(path) = file_url_to_path(url) else {
             return Ok(None);
         };
-        let metadata = std::fs::metadata(&path)?;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
         if !metadata.is_file() {
             return Ok(None);
         }
@@ -89,6 +102,30 @@ fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
     let path = String::from_utf8(bytes).ok()?;
     let path = std::path::PathBuf::from(path);
     path.is_absolute().then_some(path)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_file_urls() {
+        assert_eq!(
+            file_url_to_path("file:///Users/me/My%20File.txt"),
+            Some(std::path::PathBuf::from("/Users/me/My File.txt"))
+        );
+        assert_eq!(
+            file_url_to_path("file://localhost/Users/me/file.txt"),
+            Some(std::path::PathBuf::from("/Users/me/file.txt"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_file_urls_and_invalid_paths() {
+        assert_eq!(file_url_to_path("https://example.com/file.txt"), None);
+        assert_eq!(file_url_to_path("file://relative/file.txt"), None);
+        assert_eq!(file_url_to_path("file:///tmp/bad%zz"), None);
+    }
 }
 
 pub(crate) fn read_text() -> Result<String> {
