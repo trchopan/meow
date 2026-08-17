@@ -1,6 +1,159 @@
 use anyhow::{Result, bail};
 
+use crate::file_transfer::MAX_FILE_SIZE;
+
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 900 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClipboardFile {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) name: String,
+}
+
+pub(crate) fn read_file() -> Result<Option<ClipboardFile>> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/pbpaste")
+            .args(["-Prefer", "public.file-url"])
+            .output()?;
+        if !output.status.success() || output.stdout.is_empty() {
+            return Ok(None);
+        }
+        let output_text = String::from_utf8_lossy(&output.stdout);
+        let urls = output_text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        if urls.len() > 1 {
+            bail!("clipboard contains multiple files; only one file is supported");
+        }
+        let Some(url) = urls.first() else {
+            return Ok(None);
+        };
+        let Some(path) = resolve_file_url(url) else {
+            return Ok(None);
+        };
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        if metadata.len() > MAX_FILE_SIZE {
+            bail!(
+                "clipboard file exceeds the {} MiB limit",
+                MAX_FILE_SIZE / (1024 * 1024)
+            );
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("meow-file")
+            .to_string();
+        Ok(Some(ClipboardFile { path, name }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
+    let value = url.strip_prefix("file://")?;
+    let path = if let Some(path) = value.strip_prefix("localhost") {
+        path
+    } else if value.starts_with('/') {
+        value
+    } else {
+        return None;
+    };
+    let mut bytes = Vec::with_capacity(path.len());
+    let chars = path.as_bytes();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == b'%' && index + 2 < chars.len() {
+            let high = (chars[index + 1] as char).to_digit(16)?;
+            let low = (chars[index + 2] as char).to_digit(16)?;
+            bytes.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            bytes.push(chars[index]);
+            index += 1;
+        }
+    }
+    let path = String::from_utf8(bytes).ok()?;
+    let path = std::path::PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_file_url(url: &str) -> Option<std::path::PathBuf> {
+    use std::ffi::CStr;
+
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSAutoreleasePool, NSString};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let _pool = NSAutoreleasePool::new(nil);
+        let value = NSString::alloc(nil).init_str(url);
+        let url_object: id = msg_send![class!(NSURL), URLWithString: value];
+        if url_object == nil {
+            return file_url_to_path(url);
+        }
+        let path: id = msg_send![url_object, path];
+        if path == nil {
+            return file_url_to_path(url);
+        }
+        let bytes: *const std::ffi::c_char = msg_send![path, UTF8String];
+        if bytes.is_null() {
+            return file_url_to_path(url);
+        }
+        CStr::from_ptr(bytes)
+            .to_str()
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| file_url_to_path(url))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_file_urls() {
+        assert_eq!(
+            file_url_to_path("file:///Users/me/My%20File.txt"),
+            Some(std::path::PathBuf::from("/Users/me/My File.txt"))
+        );
+        assert_eq!(
+            file_url_to_path("file://localhost/Users/me/file.txt"),
+            Some(std::path::PathBuf::from("/Users/me/file.txt"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_file_urls_and_invalid_paths() {
+        assert_eq!(file_url_to_path("https://example.com/file.txt"), None);
+        assert_eq!(file_url_to_path("file://relative/file.txt"), None);
+        assert_eq!(file_url_to_path("file:///tmp/bad%zz"), None);
+    }
+}
 
 pub(crate) fn read_text() -> Result<String> {
     #[cfg(target_os = "macos")]

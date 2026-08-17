@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ScreenEdge, Side};
 
-pub(crate) const ALPN: &[u8] = b"meow/remote-input/2";
+pub(crate) const ALPN: &[u8] = b"meow/remote-input/4";
 pub(crate) const MAX_AUTH_MSG_SIZE: usize = 16 * 1024;
 pub(crate) const MAX_INPUT_MSG_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_MSG_SIZE: usize = 4 * 1024;
-pub(crate) const MAX_CLIPBOARD_MSG_SIZE: usize = 1024 * 1024;
+pub(crate) const FILE_CHUNK_SIZE: usize = 1024 * 1024;
+pub(crate) const MAX_FILE_MSG_SIZE: usize = FILE_CHUNK_SIZE + 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AuthRequest {
@@ -100,6 +101,9 @@ pub(crate) async fn send_client_feedback(
     message: &ClientToHostMessage,
 ) -> Result<()> {
     let bytes = bincode::serialize(message)?;
+    if bytes.len() > MAX_FILE_MSG_SIZE {
+        bail!("clipboard file message is too large");
+    }
     let mut send = connection.open_uni().await?;
     send.write_all(&bytes).await?;
     send.finish()?;
@@ -111,6 +115,9 @@ pub(crate) async fn write_framed<T: Serialize>(
     value: &T,
 ) -> Result<()> {
     let bytes = bincode::serialize(value)?;
+    if bytes.len() > MAX_FILE_MSG_SIZE {
+        bail!("framed message is too large");
+    }
     let len = bytes.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&bytes).await?;
@@ -120,7 +127,7 @@ pub(crate) async fn write_framed<T: Serialize>(
 pub(crate) async fn read_framed_with_clipboard_size<T: for<'de> Deserialize<'de>>(
     stream: &mut iroh::endpoint::RecvStream,
 ) -> Result<(T, usize)> {
-    read_framed_with_size_limit(stream, MAX_INPUT_MSG_SIZE.max(MAX_CLIPBOARD_MSG_SIZE)).await
+    read_framed_with_size_limit(stream, MAX_FILE_MSG_SIZE.max(MAX_INPUT_MSG_SIZE)).await
 }
 
 pub(crate) async fn read_framed_with_limit<T: for<'de> Deserialize<'de>>(

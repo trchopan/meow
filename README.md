@@ -227,7 +227,8 @@ Example `host_state.json`:
   "endpoint_id": "...",
   "attach_secret": "...",
   "detach_key": "ctrl+alt+cmd+u",
-  "clipboard_key": "ctrl+alt+cmd+p",
+  "paste_key": "ctrl+alt+cmd+p",
+  "copy_file_key": "ctrl+alt+cmd+y",
   "up_key": "ctrl+alt+cmd+k",
   "down_key": "ctrl+alt+cmd+j",
   "left_key": "ctrl+alt+cmd+h",
@@ -238,17 +239,48 @@ Example `host_state.json`:
 
 Shortcut format is `modifier+modifier+key` (case-insensitive). Supported modifiers: `ctrl`, `alt`, `cmd` (or `meta`, `super`, `win`), `shift`. Supported keys: `a-z`, `0-9`, `space`, `tab`, `enter`, `escape`, `up`, `down`, `left`, `right`.
 
-## Clipboard Paste
+## Clipboard Paste And File Commands
 
-Press `ctrl+alt+cmd+p` to transfer plain-text clipboard contents and paste them into the
-currently focused application. When a client is focused, the host clipboard is pasted on
-that client. When the host is focused, the clipboard is read from the most recently active
-client and pasted on the host.
+Press `ctrl+alt+cmd+p` to transfer clipboard text to the currently focused machine. This is also
+how a generated file receive command is pasted into a target terminal.
 
-The shortcut can be customized with `clipboard_key` in `host_state.json`, using the same
-format as `detach_key`. Clipboard synchronization currently supports plain text and limits
-payloads to approximately 900 KiB. Clipboard requests are authorized by the existing attach
-secret, so only attach clients that trust the host should be connected.
+On the host, copy one file to the local macOS clipboard and press `ctrl+alt+cmd+y`. Meow publishes
+the file through iroh-blobs and replaces the host clipboard with:
+
+```sh
+meow receive 'meow1-...'
+```
+
+Use `ctrl+alt+cmd+p` while targeting a remote machine to paste that command into its focused
+application, then run it in the terminal. The source host must remain online until the command
+finishes.
+
+With no destination, the file is saved in the receiver's current directory using the sanitized
+source filename:
+
+```sh
+meow receive '<reference>'
+```
+
+An optional destination can be a directory or an explicit file path:
+
+```sh
+meow receive '<reference>' ~/Downloads
+meow receive '<reference>' ~/Documents/report.pdf
+```
+
+Existing destination files are not overwritten. The file is downloaded through a temporary file
+and finalized after iroh verifies its content. References expire after 24 hours. The `y` shortcut
+can be customized with `copy_file_key`; the `p` shortcut can be customized with `paste_key`.
+Existing state files using `clipboard_key` are accepted as a legacy alias for `paste_key`.
+Clipboard text supports approximately 900 KiB and files are limited to 100 MiB.
+
+Transfer references are bearer capabilities. They are short-lived and are not logged by meow. A
+transfer may be retried up to three times within a two-minute retry window after an interrupted
+attempt, but is revoked immediately after successful destination finalization. The source host
+validates the capability, expiry, blob hash, and size over a dedicated authenticated iroh protocol.
+Keep the reference private because clipboard managers and other local applications may be able to
+read it. Published transfer blobs are garbage-collected after their active capability expires.
 
 Use `meow reset-identity` (while daemon is stopped) to remove identity files and force a new host id on the next `meow host` run.
 

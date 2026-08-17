@@ -10,7 +10,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint,
-    endpoint::{Incoming, presets},
+    endpoint::{Connection, presets},
+    protocol::{ProtocolHandler, Router},
 };
 use rdev::{EventType, Key};
 use tokio::sync::mpsc;
@@ -22,8 +23,8 @@ use crate::{
     cli::HostArgs,
     clipboard,
     input::{
-        normalize_non_motion_event, parse_clipboard_chord, parse_detach_chord,
-        parse_directional_chord, run_input_grab,
+        normalize_non_motion_event, parse_copy_file_chord, parse_detach_chord,
+        parse_directional_chord, parse_paste_chord, run_input_grab,
     },
     ipc::{
         IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
@@ -39,7 +40,7 @@ use crate::{
     presentation::print_host_ready,
     protocol::{
         ALPN, AuthRequest, AuthResponse, ClientToHostMessage, HostToClientMessage, KeyAction,
-        MAX_AUTH_MSG_SIZE, MAX_CLIPBOARD_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, ModifierFlags, WireEvent,
+        MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, MAX_FILE_MSG_SIZE, ModifierFlags, WireEvent,
         WireKey, read_framed_with_limit, write_framed,
     },
     state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
@@ -63,10 +64,9 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     cleanup_stale_socket().await?;
 
     let host_secret_key = load_or_create_host_secret_key()?;
-
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(host_secret_key)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), crate::transfer::TRANSFER_ALPN.to_vec()])
         .bind()
         .await
         .context("failed to create iroh endpoint")?;
@@ -82,14 +82,13 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
             state_path.display()
         )
     })?;
-    let clipboard_chord =
-        parse_clipboard_chord(&persisted_state.clipboard_key).with_context(|| {
-            format!(
-                "invalid clipboard_key {:?} in {}",
-                persisted_state.clipboard_key,
-                state_path.display()
-            )
-        })?;
+    let paste_chord = parse_paste_chord(&persisted_state.paste_key).with_context(|| {
+        format!(
+            "invalid paste_key {:?} in {}",
+            persisted_state.paste_key,
+            state_path.display()
+        )
+    })?;
     let up_chord = parse_directional_chord(&persisted_state.up_key, "up_key", "ctrl+alt+cmd+k")?;
     let down_chord =
         parse_directional_chord(&persisted_state.down_key, "down_key", "ctrl+alt+cmd+j")?;
@@ -110,6 +109,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let target_epoch = Arc::new(AtomicU64::new(0));
     let next_clipboard_request = Arc::new(AtomicU64::new(1));
     let pending_clipboard_request = Arc::new(Mutex::new(None));
+    let transfer_registry = Arc::new(Mutex::new(HashMap::new()));
+    let blob_runtime =
+        crate::blob::BlobRuntime::start(endpoint.clone(), "host", Some(transfer_registry.clone()))
+            .await?;
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -117,6 +120,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     print_host_ready(&endpoint_id.to_string(), &secret);
 
     let state = HostState {
+        blob_runtime: blob_runtime.clone(),
         endpoint_id,
         active_target: active_target.clone(),
         remote_pointer_mode: remote_pointer_mode.clone(),
@@ -130,6 +134,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         target_epoch: target_epoch.clone(),
         next_clipboard_request: next_clipboard_request.clone(),
         pending_clipboard_request: pending_clipboard_request.clone(),
+        transfer_registry: transfer_registry.clone(),
         runtime_stats: runtime_stats.clone(),
         shutdown_requested: shutdown_requested.clone(),
         shutdown_notify: shutdown_notify.clone(),
@@ -152,7 +157,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let input_pending_release_sides = pending_release_sides.clone();
         let input_pending_clipboard_request = pending_clipboard_request.clone();
         let input_detach_chord = detach_chord.clone();
-        let input_clipboard_chord = clipboard_chord.clone();
+        let input_paste_chord = paste_chord.clone();
+        let input_copy_file_chord = parse_copy_file_chord(&persisted_state.copy_file_key)?;
         let input_runtime_stats = runtime_stats.clone();
         let input_edge_config =
             crate::input::HostEdgeConfig::new(args.edge_zone_px, args.edge_dwell_ms);
@@ -169,7 +175,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 input_pending_clipboard_request,
                 directional_switch_tx,
                 input_detach_chord,
-                input_clipboard_chord,
+                input_paste_chord,
+                input_copy_file_chord,
                 up_chord,
                 down_chord,
                 left_chord,
@@ -214,13 +221,25 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         }
     });
 
+    let router = Router::builder(endpoint.clone())
+        .accept(
+            ALPN,
+            HostProtocol {
+                state: state.clone(),
+                secret: secret.clone(),
+            },
+        )
+        .accept(
+            crate::transfer::TRANSFER_ALPN,
+            blob_runtime.transfer_protocol(transfer_registry.clone())?,
+        )
+        .spawn();
+    endpoint.online().await;
+
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    loop {
-        if state.shutdown_requested.load(Ordering::Relaxed) {
-            break;
-        }
-        let incoming = tokio::select! {
+    if !state.shutdown_requested.load(Ordering::Relaxed) {
+        tokio::select! {
             signal = &mut ctrl_c => {
                 match signal {
                     Ok(()) => info!("Ctrl+C received, shutting down host"),
@@ -228,28 +247,9 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 }
                 state.shutdown_requested.store(true, Ordering::Relaxed);
                 state.shutdown_notify.notify_waiters();
-                break;
             }
-            _ = state.shutdown_notify.notified() => {
-                break;
-            }
-            incoming = endpoint.accept() => incoming,
-        };
-
-        let Some(incoming) = incoming else {
-            warn!("host endpoint closed, shutting down");
-            state.shutdown_requested.store(true, Ordering::Relaxed);
-            state.shutdown_notify.notify_waiters();
-            break;
-        };
-
-        let state = state.clone();
-        let secret = secret.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_incoming(incoming, state, &secret).await {
-                warn!("incoming peer rejected/failed: {err:#}");
-            }
-        });
+            _ = state.shutdown_notify.notified() => {}
+        }
     }
 
     let forward_completed = forward_task.await.is_ok();
@@ -258,12 +258,37 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         release_all_remote_inputs(&state).await;
     }
     ensure_pointer_restored();
+    if let Err(err) = blob_runtime.shutdown().await {
+        warn!("blob store shutdown failed: {err:#}");
+    }
+    router.shutdown().await?;
     let _ = std::fs::remove_file(crate::state::socket_path()?);
     Ok(())
 }
 
-async fn handle_incoming(incoming: Incoming, state: HostState, secret: &str) -> Result<()> {
-    let connection = incoming.accept()?.await?;
+struct HostProtocol {
+    state: HostState,
+    secret: String,
+}
+
+impl std::fmt::Debug for HostProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostProtocol")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for HostProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        if let Err(err) = handle_incoming(connection, self.state.clone(), &self.secret).await {
+            warn!("incoming peer rejected/failed: {err:#}");
+        }
+        Ok(())
+    }
+}
+
+async fn handle_incoming(connection: Connection, state: HostState, secret: &str) -> Result<()> {
     let remote_id = connection.remote_id();
     let (mut send, mut recv) = connection.accept_bi().await?;
 
@@ -411,7 +436,7 @@ async fn run_client_feedback_loop(
     loop {
         let mut recv = connection.accept_uni().await?;
         let bytes = recv
-            .read_to_end(MAX_CLIPBOARD_MSG_SIZE.max(MAX_FEEDBACK_MSG_SIZE))
+            .read_to_end(MAX_FILE_MSG_SIZE.max(MAX_FEEDBACK_MSG_SIZE))
             .await?;
         let message: ClientToHostMessage = bincode::deserialize(&bytes)?;
         let is_current = {
@@ -610,6 +635,9 @@ async fn run_forward_loop(
                     CapturedEvent::ClipboardPaste => {
                         handle_clipboard_paste(&state, captured.target).await;
                     }
+                    CapturedEvent::CopyFileCommand => {
+                        handle_copy_file_command(&state).await;
+                    }
                     CapturedEvent::Raw(event) => {
                         let Some(side) = captured.target.to_side() else {
                             continue;
@@ -737,6 +765,93 @@ async fn handle_clipboard_paste(state: &HostState, target: ActiveTarget) {
     }
 }
 
+async fn handle_copy_file_command(state: &HostState) {
+    let file = match tokio::task::spawn_blocking(clipboard::read_file).await {
+        Ok(Ok(Some(file))) => file,
+        Ok(Ok(None)) => {
+            warn!("copy file requested but the local clipboard has no file");
+            return;
+        }
+        Ok(Err(err)) => {
+            warn!("failed to inspect host clipboard file: {err:#}");
+            return;
+        }
+        Err(err) => {
+            warn!("clipboard file inspection task failed: {err:#}");
+            return;
+        }
+    };
+    let blob = match state.blob_runtime.add_path(&file.path).await {
+        Ok(blob) => blob,
+        Err(err) => {
+            warn!("failed to index clipboard file: {err:#}");
+            return;
+        }
+    };
+    let ticket = match state.blob_runtime.ticket_for(&blob) {
+        Ok(ticket) => ticket,
+        Err(err) => {
+            warn!("failed to create blob ticket: {err:#}");
+            return;
+        }
+    };
+    let size = match std::fs::metadata(&file.path) {
+        Ok(metadata) => metadata.len(),
+        Err(err) => {
+            warn!("failed to stat clipboard file: {err:#}");
+            return;
+        }
+    };
+    let digest = match crate::transfer::digest_path(&file.path) {
+        Ok(digest) => digest,
+        Err(err) => {
+            warn!("failed to digest clipboard file: {err:#}");
+            return;
+        }
+    };
+    let (reference, capability) =
+        match crate::transfer::create_reference(&ticket, &file.name, size, digest) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("failed to create transfer reference: {err:#}");
+                return;
+            }
+        };
+    let expires_at = crate::transfer::reference_expiry().unwrap_or(0);
+    crate::transfer::retain_grant(
+        &mut state
+            .transfer_registry
+            .lock()
+            .expect("transfer registry poisoned"),
+        capability,
+        crate::transfer::TransferGrant {
+            hash: ticket.hash(),
+            size,
+            digest,
+            expires_at,
+            attempts: 0,
+            in_flight: false,
+            retry_until: 0,
+        },
+    );
+
+    let command = match crate::transfer::receive_command(&reference) {
+        Ok(command) => command,
+        Err(err) => {
+            warn!("failed to create receive command: {err:#}");
+            return;
+        }
+    };
+    match tokio::task::spawn_blocking(move || clipboard::write_text(&command)).await {
+        Ok(Ok(())) => info!(
+            "copied receive command for {} to local clipboard",
+            file.name
+        ),
+        Ok(Err(err)) => warn!("failed to copy receive command to clipboard: {err:#}"),
+        Err(err) => warn!("clipboard write task failed: {err:#}"),
+    }
+}
+
 fn clear_pending_clipboard_request(state: &HostState, side: Side, generation: u64) {
     let mut pending = state
         .pending_clipboard_request
@@ -825,7 +940,8 @@ fn side_requiring_ordered_flush(captured: &CapturedInput) -> Option<Side> {
         | CapturedEvent::MouseWheel { .. } => captured.target.to_side(),
         CapturedEvent::MouseMoveRelative { .. }
         | CapturedEvent::HostEdgeReached { .. }
-        | CapturedEvent::ClipboardPaste => None,
+        | CapturedEvent::ClipboardPaste
+        | CapturedEvent::CopyFileCommand => None,
     }
 }
 
@@ -1291,6 +1407,7 @@ mod tests {
 
     fn test_forward_state(side: Side, input_tx: mpsc::Sender<PeerMessage>) -> HostState {
         HostState {
+            blob_runtime: crate::blob::BlobRuntime::disabled(),
             endpoint_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
@@ -1313,6 +1430,7 @@ mod tests {
             target_epoch: Arc::new(AtomicU64::new(0)),
             next_clipboard_request: Arc::new(AtomicU64::new(1)),
             pending_clipboard_request: Arc::new(Mutex::new(None)),
+            transfer_registry: Arc::new(Mutex::new(HashMap::new())),
             runtime_stats: Arc::new(RuntimeStats::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),

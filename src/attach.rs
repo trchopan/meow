@@ -45,6 +45,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             .alpns(vec![ALPN.to_vec()])
             .bind() => result.context("failed to create iroh endpoint"),
     }?;
+    endpoint.online().await;
 
     let connection = tokio::select! {
         signal = &mut ctrl_c => {

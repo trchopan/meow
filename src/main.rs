@@ -4,10 +4,12 @@ use anyhow::Result;
 use clap::Parser;
 
 mod attach;
+mod blob;
 mod cli;
 mod clipboard;
 mod dev;
 mod display;
+mod file_transfer;
 mod host;
 mod host_mouse;
 mod input;
@@ -22,6 +24,7 @@ mod presentation;
 mod probe;
 mod protocol;
 mod state;
+mod transfer;
 
 use attach::{run_attach, run_test_inject};
 use cli::{Cli, Command};
@@ -32,6 +35,7 @@ use ipc::{IpcCommand, send_ipc, send_switch};
 use model::ActiveTarget;
 use probe::run_probe_pointer_lock;
 use state::{reset_identity, rotate_secret};
+use transfer::receive_file;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,5 +65,18 @@ async fn main() -> Result<()> {
         Command::PointerMode(args) => send_ipc(IpcCommand::PointerMode { mode: args.mode }).await,
         Command::Status => send_ipc(IpcCommand::Status).await,
         Command::Stop => send_ipc(IpcCommand::Stop).await,
+        Command::Receive(args) => {
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(iroh::SecretKey::generate())
+                .alpns(vec![crate::transfer::TRANSFER_ALPN.to_vec()])
+                .bind()
+                .await?;
+            let result =
+                receive_file(&endpoint, &args.reference, args.destination.as_deref()).await;
+            endpoint.close().await;
+            let path = result?;
+            println!("received file at {}", path.display());
+            Ok(())
+        }
     }
 }
