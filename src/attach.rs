@@ -24,6 +24,7 @@ use crate::{
         MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, WireKey, read_framed_with_clipboard_size,
         read_framed_with_limit, send_client_feedback, write_framed,
     },
+    state::{ClientAttachLock, load_or_create_client_identity},
 };
 
 const EDGE_TOLERANCE_PX: i32 = 2;
@@ -34,6 +35,8 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let host_id = EndpointId::from_str(&args.host_id).context("invalid host endpoint id")?;
+    let _attach_lock = ClientAttachLock::acquire(&host_id.to_string(), args.side)?;
+    let client_id = load_or_create_client_identity()?;
     let endpoint = tokio::select! {
         signal = &mut ctrl_c => {
             signal.context("failed waiting for Ctrl+C")?;
@@ -67,6 +70,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     let auth = AuthRequest {
         secret: args.secret,
         side: args.side,
+        client_id,
         name: format!("remote-{}", Uuid::new_v4().simple()),
     };
     tokio::select! {

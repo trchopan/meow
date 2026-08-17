@@ -314,16 +314,58 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
         bail!("host is shutting down");
     }
 
-    write_framed(
+    let (input_tx, mut input_rx) = mpsc::channel::<PeerMessage>(peer_writer_channel_capacity());
+    let (duplicate, generation) = {
+        let mut remotes = state.remotes.write().await;
+        if !insert_remote_if_vacant(
+            &mut remotes,
+            auth.side,
+            RemotePeer {
+                input_tx: input_tx.clone(),
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                remote_id,
+                generation: state.next_remote_generation.fetch_add(1, Ordering::Relaxed),
+                name: auth.name.clone(),
+            },
+        ) {
+            (true, 0)
+        } else {
+            let generation = remotes
+                .get(&auth.side)
+                .expect("inserted remote must exist")
+                .generation;
+            (false, generation)
+        }
+    };
+    if duplicate {
+        let response = AuthResponse {
+            ok: false,
+            message: format!("side {:?} is already attached", auth.side),
+        };
+        write_framed(&mut send, &response).await?;
+        bail!(
+            "duplicate attach rejected for {:?} client_id={}",
+            auth.side,
+            auth.client_id
+        );
+    }
+
+    if let Err(err) = write_framed(
         &mut send,
         &AuthResponse {
             ok: true,
             message: format!("attached as {:?}", auth.side),
         },
     )
-    .await?;
+    .await
+    {
+        let mut remotes = state.remotes.write().await;
+        if is_current_remote(remotes.get(&auth.side), remote_id, generation) {
+            remotes.remove(&auth.side);
+        }
+        return Err(err);
+    }
 
-    let (input_tx, mut input_rx) = mpsc::channel::<PeerMessage>(peer_writer_channel_capacity());
     tokio::spawn(async move {
         while let Some(message) = input_rx.recv().await {
             let written = write_framed(&mut send, &message.message).await.is_ok();
@@ -337,38 +379,9 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
         }
     });
 
-    let generation = state.next_remote_generation.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut remotes = state.remotes.write().await;
-        let previous = remotes.insert(
-            auth.side,
-            RemotePeer {
-                input_tx,
-                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                remote_id,
-                generation,
-                name: auth.name.clone(),
-            },
-        );
-        if let Some(previous) = previous {
-            clear_pending_clipboard_request(&state, auth.side, previous.generation);
-            let seq = previous.next_seq.fetch_add(1, Ordering::Relaxed);
-            if !send_release_request(&previous, HostToClientMessage::ReleaseAll { seq }).await {
-                warn!(
-                    "failed delivering release-all to replaced remote {:?}",
-                    auth.side
-                );
-            }
-            info!(
-                "replaced existing remote on {:?}: old={} new={}",
-                auth.side, previous.remote_id, remote_id
-            );
-        }
-    }
-
     info!(
-        "remote attached: {:?} ({remote_id}) name={}",
-        auth.side, auth.name
+        "remote attached: {:?} ({remote_id}) client_id={} name={}",
+        auth.side, auth.client_id, auth.name
     );
 
     let feedback_state = state.clone();
@@ -414,6 +427,20 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
     });
 
     Ok(())
+}
+
+fn insert_remote_if_vacant(
+    remotes: &mut HashMap<Side, RemotePeer>,
+    side: Side,
+    remote: RemotePeer,
+) -> bool {
+    match remotes.entry(side) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(remote);
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(_) => false,
+    }
 }
 
 fn is_current_remote(
@@ -1453,6 +1480,44 @@ mod tests {
         assert!(is_current_remote(Some(&current), current_id, 2));
         assert!(!is_current_remote(Some(&current), current_id, 1));
         assert!(!is_current_remote(Some(&current), stale_id, 2));
+    }
+
+    #[test]
+    fn side_reservation_rejects_duplicate_without_replacing_current_remote() {
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let first_id = iroh::SecretKey::generate().public();
+        let second_id = iroh::SecretKey::generate().public();
+        let mut remotes = HashMap::new();
+
+        assert!(insert_remote_if_vacant(
+            &mut remotes,
+            Side::Right,
+            RemotePeer {
+                input_tx: first_tx,
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                remote_id: first_id,
+                generation: 1,
+                name: "first-peer".to_string(),
+            },
+        ));
+        assert!(!insert_remote_if_vacant(
+            &mut remotes,
+            Side::Right,
+            RemotePeer {
+                input_tx: second_tx,
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                remote_id: second_id,
+                generation: 2,
+                name: "second-peer".to_string(),
+            },
+        ));
+
+        let current = remotes
+            .get(&Side::Right)
+            .expect("right remote should remain");
+        assert_eq!(current.remote_id, first_id);
+        assert_eq!(current.generation, 1);
     }
 
     #[test]
