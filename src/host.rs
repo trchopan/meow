@@ -1656,7 +1656,6 @@ mod tests {
         client.close().await;
     }
 
-    #[test]
     fn host_facing_edge_matches_layout() {
         assert!(is_host_facing_edge(Side::Right, ScreenEdge::Left));
         assert!(is_host_facing_edge(Side::Left, ScreenEdge::Right));
