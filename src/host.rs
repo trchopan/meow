@@ -318,28 +318,43 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
     }
 
     let (input_tx, mut input_rx) = mpsc::channel::<PeerMessage>(peer_writer_channel_capacity());
-    let (duplicate, generation) = {
+    let (stale_generation, duplicate, generation) = {
         let mut remotes = state.remotes.write().await;
+        let stale_generation = remove_closed_remote_if(&mut remotes, auth.side).map(|remote| {
+            clear_pending_clipboard_request(&state, auth.side, remote.generation);
+            info!(
+                "pruned closed remote: {:?} ({}) name={}",
+                auth.side, remote.remote_id, remote.name
+            );
+            remote.generation
+        });
         if !insert_remote_if_vacant(
             &mut remotes,
             auth.side,
             RemotePeer {
                 input_tx: input_tx.clone(),
                 next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection: Some(connection.clone()),
                 remote_id,
                 generation: state.next_remote_generation.fetch_add(1, Ordering::Relaxed),
                 name: auth.name.clone(),
             },
         ) {
-            (true, 0)
+            (stale_generation, true, 0)
         } else {
             let generation = remotes
                 .get(&auth.side)
                 .expect("inserted remote must exist")
                 .generation;
-            (false, generation)
+            (stale_generation, false, generation)
         }
     };
+    if stale_generation.is_some()
+        && ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)).to_side()
+            == Some(auth.side)
+    {
+        apply_target_change(&state, ActiveTarget::Local, "closed remote pruned");
+    }
     if duplicate {
         let response = AuthResponse {
             ok: false,
@@ -446,6 +461,30 @@ fn insert_remote_if_vacant(
             true
         }
         std::collections::hash_map::Entry::Occupied(_) => false,
+    }
+}
+
+fn remove_closed_remote_if(
+    remotes: &mut HashMap<Side, RemotePeer>,
+    side: Side,
+) -> Option<RemotePeer> {
+    remove_remote_if(remotes, side, |remote| {
+        remote
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.close_reason().is_some())
+    })
+}
+
+fn remove_remote_if(
+    remotes: &mut HashMap<Side, RemotePeer>,
+    side: Side,
+    should_remove: impl FnOnce(&RemotePeer) -> bool,
+) -> Option<RemotePeer> {
+    if remotes.get(&side).is_some_and(should_remove) {
+        remotes.remove(&side)
+    } else {
+        None
     }
 }
 
@@ -1452,6 +1491,7 @@ mod tests {
                 RemotePeer {
                     input_tx,
                     next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    connection: None,
                     remote_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
                     generation: 1,
                     name: "test-peer".to_string(),
@@ -1478,6 +1518,7 @@ mod tests {
         let current = RemotePeer {
             input_tx,
             next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            connection: None,
             remote_id: current_id,
             generation: 2,
             name: "current-peer".to_string(),
@@ -1502,6 +1543,7 @@ mod tests {
             RemotePeer {
                 input_tx: first_tx,
                 next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection: None,
                 remote_id: first_id,
                 generation: 1,
                 name: "first-peer".to_string(),
@@ -1513,6 +1555,7 @@ mod tests {
             RemotePeer {
                 input_tx: second_tx,
                 next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection: None,
                 remote_id: second_id,
                 generation: 2,
                 name: "second-peer".to_string(),
@@ -1524,6 +1567,93 @@ mod tests {
             .expect("right remote should remain");
         assert_eq!(current.remote_id, first_id);
         assert_eq!(current.generation, 1);
+    }
+
+    #[test]
+    fn stale_remote_can_be_pruned_before_reconnect_reservation() {
+        let (stale_tx, _stale_rx) = mpsc::channel(1);
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        let stale_id = iroh::SecretKey::generate().public();
+        let new_id = iroh::SecretKey::generate().public();
+        let mut remotes = HashMap::new();
+        remotes.insert(
+            Side::Right,
+            RemotePeer {
+                input_tx: stale_tx,
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection: None,
+                remote_id: stale_id,
+                generation: 1,
+                name: "stale-peer".to_string(),
+            },
+        );
+
+        let removed = remove_remote_if(&mut remotes, Side::Right, |_| true)
+            .expect("closed remote should be removed");
+        assert_eq!(removed.remote_id, stale_id);
+        assert!(insert_remote_if_vacant(
+            &mut remotes,
+            Side::Right,
+            RemotePeer {
+                input_tx: new_tx,
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection: None,
+                remote_id: new_id,
+                generation: 2,
+                name: "new-peer".to_string(),
+            },
+        ));
+        assert_eq!(remotes.get(&Side::Right).unwrap().remote_id, new_id);
+    }
+
+    #[tokio::test]
+    async fn closed_connection_is_recognized_as_stale() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind server endpoint");
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind client endpoint");
+        let server_addr = server.addr();
+        let accept_task = tokio::spawn(async move {
+            server
+                .accept()
+                .await
+                .expect("accept incoming")
+                .await
+                .expect("complete incoming handshake")
+        });
+
+        let client_connection = client
+            .connect(server_addr, ALPN)
+            .await
+            .expect("connect to server");
+        let server_connection = accept_task.await.expect("join accept task");
+        client_connection.close(0u32.into(), b"test close");
+        tokio::time::timeout(Duration::from_secs(2), server_connection.closed())
+            .await
+            .expect("server should observe connection close");
+
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let mut remotes = HashMap::from([(
+            Side::Right,
+            RemotePeer {
+                input_tx,
+                next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                connection: Some(server_connection),
+                remote_id: iroh::SecretKey::generate().public(),
+                generation: 1,
+                name: "closed-peer".to_string(),
+            },
+        )]);
+
+        assert!(remove_closed_remote_if(&mut remotes, Side::Right).is_some());
+        assert!(remotes.is_empty());
+        client.close().await;
     }
 
     #[test]
