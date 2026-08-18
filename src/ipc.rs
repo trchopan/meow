@@ -501,6 +501,7 @@ mod tests {
             RemotePeer {
                 input_tx,
                 next_seq: Arc::new(AtomicU64::new(1)),
+                connection: None,
                 remote_id: EndpointId::from(SecretKey::generate().public()),
                 generation: 1,
                 name: "test-peer".to_string(),
