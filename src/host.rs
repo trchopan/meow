@@ -306,11 +306,14 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
             ok: false,
             message: "invalid secret".to_string(),
         };
-        write_framed(&mut send, &res).await?;
+        let result = write_framed(&mut send, &res).await;
+        connection.close(1u32.into(), b"invalid attach secret");
+        result?;
         bail!("invalid secret from {remote_id}")
     }
 
     if state.shutdown_requested.load(Ordering::Acquire) {
+        connection.close(1u32.into(), b"host is shutting down");
         bail!("host is shutting down");
     }
 
@@ -342,7 +345,9 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
             ok: false,
             message: format!("side {:?} is already attached", auth.side),
         };
-        write_framed(&mut send, &response).await?;
+        let result = write_framed(&mut send, &response).await;
+        connection.close(1u32.into(), b"side already attached");
+        result?;
         bail!(
             "duplicate attach rejected for {:?} client_id={}",
             auth.side,
@@ -359,6 +364,7 @@ async fn handle_incoming(connection: Connection, state: HostState, secret: &str)
     )
     .await
     {
+        connection.close(1u32.into(), b"auth response failed");
         let mut remotes = state.remotes.write().await;
         if is_current_remote(remotes.get(&auth.side), remote_id, generation) {
             remotes.remove(&auth.side);

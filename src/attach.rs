@@ -63,6 +63,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         signal = &mut ctrl_c => {
             signal.context("failed waiting for Ctrl+C")?;
             info!("Ctrl+C received while opening host stream");
+            connection.close(0u32.into(), b"client attach interrupted");
             return Ok(());
         }
         result = connection.open_bi() => result,
@@ -77,6 +78,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         signal = &mut ctrl_c => {
             signal.context("failed waiting for Ctrl+C")?;
             info!("Ctrl+C received while authenticating with host");
+            connection.close(0u32.into(), b"client attach interrupted");
             return Ok(());
         }
         result = write_framed(&mut send, &auth) => result,
@@ -86,6 +88,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         signal = &mut ctrl_c => {
             signal.context("failed waiting for Ctrl+C")?;
             info!("Ctrl+C received while waiting for host authentication");
+            connection.close(0u32.into(), b"client attach interrupted");
             return Ok(());
         }
         result = tokio::time::timeout(
@@ -94,6 +97,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         ) => result.context("timed out waiting for auth response")??,
     };
     if !response.ok {
+        connection.close(1u32.into(), b"host denied attach");
         bail!("host denied attach: {}", response.message);
     }
 
@@ -375,6 +379,7 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
     }
 
     replay_failures.flush(&connection).await;
+    connection.close(0u32.into(), b"client attach stopped");
 
     if let Some(probe) = probe.as_mut() {
         probe.note_held_counts(&input_state);
