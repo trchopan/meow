@@ -1569,7 +1569,6 @@ mod tests {
         assert_eq!(current.generation, 1);
     }
 
-    #[test]
     fn stale_remote_can_be_pruned_before_reconnect_reservation() {
         let (stale_tx, _stale_rx) = mpsc::channel(1);
         let (new_tx, _new_rx) = mpsc::channel(1);
