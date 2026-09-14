@@ -43,6 +43,10 @@ pub(crate) fn print_status_response(message: &str, status: Option<&StatusPayload
             status.capture_tap_user_disabled,
             status.recovery_events,
         );
+        println!(
+            "pointer: lock_active={} tap_healthy={} tap_stopped={}",
+            status.pointer_lock_active, status.pointer_tap_healthy, status.capture_tap_stopped,
+        );
     }
 }
 
