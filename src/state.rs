@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 
@@ -14,7 +14,7 @@ use crate::input::{
     default_paste_key, default_right_key, default_up_key, parse_copy_file_chord,
     parse_detach_chord, parse_directional_chord, parse_paste_chord,
 };
-use crate::model::RemotePointerMode;
+use crate::model::{RemotePointerMode, Side};
 use crate::presentation::{print_identity_reset_complete, print_rotate_secret_complete};
 
 fn default_remote_pointer_mode() -> RemotePointerMode {
@@ -53,6 +53,107 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
     let dir = app_data_dir()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("meow.sock"))
+}
+
+pub(crate) fn client_identity_path() -> Result<PathBuf> {
+    Ok(app_data_dir()?.join("client.id"))
+}
+
+pub(crate) fn load_or_create_client_identity() -> Result<String> {
+    let path = client_identity_path()?;
+    let app_dir = app_data_dir()?;
+    fs::create_dir_all(&app_dir)
+        .with_context(|| format!("failed to create {}", app_dir.display()))?;
+    load_or_create_client_identity_at(&path, &app_dir.join("client.id.lock"))
+}
+
+fn load_or_create_client_identity_at(path: &Path, lock_path: &Path) -> Result<String> {
+    let _identity_lock = AdvisoryFileLock::acquire(lock_path)?;
+    if path.exists() {
+        let identity = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let identity = identity.trim();
+        if !identity.is_empty() {
+            return Ok(identity.to_string());
+        }
+    }
+
+    let identity = uuid::Uuid::new_v4().simple().to_string();
+    write_file_atomic(path, identity.as_bytes())?;
+    Ok(identity)
+}
+
+struct AdvisoryFileLock {
+    file: fs::File,
+}
+
+impl AdvisoryFileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::WouldBlock {
+                    bail!("advisory lock is already held: {}", path.display());
+                }
+                return Err(err).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            bail!("client attach locking is unsupported on this platform");
+        }
+
+        Ok(Self { file })
+    }
+}
+
+impl Drop for AdvisoryFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+pub(crate) struct ClientAttachLock {
+    _lock: AdvisoryFileLock,
+}
+
+impl ClientAttachLock {
+    pub(crate) fn acquire(host_id: &str, side: Side) -> Result<Self> {
+        let app_dir = app_data_dir()?;
+        fs::create_dir_all(&app_dir)
+            .with_context(|| format!("failed to create {}", app_dir.display()))?;
+        let path = app_dir.join(format!("attach-{}-{}.lock", host_id, side_name(side)));
+        Ok(Self {
+            _lock: AdvisoryFileLock::acquire(&path)
+                .with_context(|| format!("already attached to this host as {side:?}"))?,
+        })
+    }
+}
+
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Left => "left",
+        Side::Right => "right",
+        Side::Up => "up",
+        Side::Down => "down",
+    }
 }
 
 pub(crate) fn host_key_path() -> Result<PathBuf> {
@@ -502,5 +603,39 @@ mod tests {
             "remote_pointer_mode": "edge_to_edge"
         });
         assert!(serde_json::from_value::<PersistedHostState>(raw).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advisory_lock_allows_only_one_owner() {
+        let path = std::env::temp_dir().join(format!(
+            "meow-test-client-lock-{}.lock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let first = AdvisoryFileLock::acquire(&path).expect("first lock should succeed");
+        assert!(AdvisoryFileLock::acquire(&path).is_err());
+        drop(first);
+        let second = AdvisoryFileLock::acquire(&path).expect("lock should be released");
+        drop(second);
+        fs::remove_file(path).expect("remove test lock");
+    }
+
+    #[test]
+    fn client_identity_is_stable_across_loads() {
+        let base = std::env::temp_dir().join(format!(
+            "meow-test-client-identity-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create identity test directory");
+        let identity_path = base.join("client.id");
+        let lock_path = base.join("client.id.lock");
+
+        let first = load_or_create_client_identity_at(&identity_path, &lock_path)
+            .expect("create client identity");
+        let second = load_or_create_client_identity_at(&identity_path, &lock_path)
+            .expect("load client identity");
+        assert_eq!(first, second);
+
+        fs::remove_dir_all(base).expect("remove identity test directory");
     }
 }

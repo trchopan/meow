@@ -172,6 +172,7 @@ pub(crate) enum CapturedEvent {
 pub(crate) struct RemotePeer {
     pub(crate) input_tx: mpsc::Sender<PeerMessage>,
     pub(crate) next_seq: Arc<AtomicU64>,
+    pub(crate) connection: Option<iroh::endpoint::Connection>,
     pub(crate) remote_id: EndpointId,
     pub(crate) generation: u64,
     pub(crate) name: String,

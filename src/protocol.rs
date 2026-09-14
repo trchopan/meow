@@ -15,6 +15,7 @@ pub(crate) const MAX_FILE_MSG_SIZE: usize = FILE_CHUNK_SIZE + 1024;
 pub(crate) struct AuthRequest {
     pub(crate) secret: String,
     pub(crate) side: Side,
+    pub(crate) client_id: String,
     pub(crate) name: String,
 }
 

@@ -2354,6 +2354,7 @@ dependencies = [
  "enigo",
  "iroh",
  "iroh-blobs",
+ "libc",
  "objc",
  "rand 0.8.7",
  "rdev",
