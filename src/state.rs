@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,6 +40,19 @@ pub(crate) struct PersistedHostState {
     pub(crate) right_key: String,
 }
 
+pub(crate) struct HostCredentials {
+    pub(crate) endpoint_id: EndpointId,
+    pub(crate) attach_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ClientProfile {
+    pub(crate) schema_version: u8,
+    pub(crate) host_id: String,
+    pub(crate) secret: String,
+    pub(crate) side: Side,
+}
+
 pub(crate) fn app_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("MEOW_STATE_DIR")
         && !path.is_empty()
@@ -57,6 +71,50 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
 
 pub(crate) fn client_identity_path() -> Result<PathBuf> {
     Ok(app_data_dir()?.join("client.id"))
+}
+
+pub(crate) fn client_profile_path() -> Result<PathBuf> {
+    Ok(app_data_dir()?.join("client_profile.json"))
+}
+
+pub(crate) fn client_socket_path(host_id: &str, side: Side) -> Result<PathBuf> {
+    let endpoint_id = EndpointId::from_str(host_id).context("invalid host endpoint id")?;
+    let state_dir = app_data_dir()?;
+    let candidate = state_dir.join(format!(
+        "c{}-{}.sock",
+        client_path_key(&endpoint_id),
+        side_name(side)
+    ));
+    if candidate.to_string_lossy().len() < 90 {
+        return Ok(candidate);
+    }
+
+    let fallback_key = blake3::hash(
+        format!(
+            "{}:{}:{}",
+            state_dir.display(),
+            endpoint_id,
+            side_name(side)
+        )
+        .as_bytes(),
+    )
+    .to_hex();
+    Ok(std::env::temp_dir().join(format!("meow-c-{}.sock", &fallback_key[..16])))
+}
+
+pub(crate) fn client_status_path(host_id: &str, side: Side) -> Result<PathBuf> {
+    let endpoint_id = EndpointId::from_str(host_id).context("invalid host endpoint id")?;
+    Ok(app_data_dir()?.join(format!(
+        "c{}-{}.json",
+        client_path_key(&endpoint_id),
+        side_name(side)
+    )))
+}
+
+fn client_path_key(endpoint_id: &EndpointId) -> String {
+    let canonical = endpoint_id.to_string();
+    let digest = blake3::hash(canonical.as_bytes()).to_hex();
+    digest[..32].to_string()
 }
 
 pub(crate) fn load_or_create_client_identity() -> Result<String> {
@@ -113,11 +171,82 @@ impl AdvisoryFileLock {
         #[cfg(not(unix))]
         {
             let _ = path;
-            bail!("client attach locking is unsupported on this platform");
+            bail!("advisory locking is unsupported on this platform");
         }
 
         Ok(Self { file })
     }
+}
+
+pub(crate) struct HostRuntimeLock {
+    _lock: AdvisoryFileLock,
+}
+
+impl HostRuntimeLock {
+    pub(crate) fn acquire() -> Result<Self> {
+        let path = if synthetic_runtime_enabled() {
+            app_data_dir()?.join("host-runtime.lock")
+        } else {
+            global_runtime_lock_path()?
+        };
+        ensure_lock_parent(&path)?;
+        Ok(Self {
+            _lock: AdvisoryFileLock::acquire(&path)
+                .context("another Meow host runtime is already active")?,
+        })
+    }
+}
+
+fn synthetic_runtime_enabled() -> bool {
+    ["MEOW_DEV_SMOKE", "MEOW_BENCH_FLUSH"]
+        .into_iter()
+        .any(|name| {
+            std::env::var(name)
+                .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+        })
+}
+
+pub(crate) struct MenuAppLock {
+    _lock: AdvisoryFileLock,
+}
+
+impl MenuAppLock {
+    pub(crate) fn acquire() -> Result<Self> {
+        let path = global_menu_lock_path()?;
+        ensure_lock_parent(&path)?;
+        Ok(Self {
+            _lock: AdvisoryFileLock::acquire(&path)
+                .context("another Meow menu bar app is already running")?,
+        })
+    }
+}
+
+fn global_runtime_lock_path() -> Result<PathBuf> {
+    Ok(default_app_data_dir()?.join("host-runtime.lock"))
+}
+
+fn global_menu_lock_path() -> Result<PathBuf> {
+    Ok(default_app_data_dir()?.join("menu-app.lock"))
+}
+
+fn default_app_data_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
+    Ok(home.join(".local").join("share").join("meow"))
+}
+
+fn ensure_lock_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("missing lock parent for {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 impl Drop for AdvisoryFileLock {
@@ -139,7 +268,8 @@ impl ClientAttachLock {
         let app_dir = app_data_dir()?;
         fs::create_dir_all(&app_dir)
             .with_context(|| format!("failed to create {}", app_dir.display()))?;
-        let path = app_dir.join(format!("attach-{}-{}.lock", host_id, side_name(side)));
+        let key = blake3::hash(format!("{host_id}:{}", side_name(side)).as_bytes()).to_hex();
+        let path = app_dir.join(format!("attach-{}-{}.lock", &key[..32], side_name(side)));
         Ok(Self {
             _lock: AdvisoryFileLock::acquire(&path)
                 .with_context(|| format!("already attached to this host as {side:?}"))?,
@@ -164,7 +294,124 @@ pub(crate) fn host_state_path() -> Result<PathBuf> {
     Ok(app_data_dir()?.join("host_state.json"))
 }
 
+pub(crate) fn load_existing_host_credentials() -> Result<Option<HostCredentials>> {
+    load_existing_host_credentials_from_paths(&host_key_path()?, &host_state_path()?)
+}
+
+fn load_existing_host_credentials_from_paths(
+    key_path: &Path,
+    state_path: &Path,
+) -> Result<Option<HostCredentials>> {
+    let key_exists = key_path.exists();
+    let state_exists = state_path.exists();
+
+    if !key_exists && !state_exists {
+        return Ok(None);
+    }
+    if !key_exists || !state_exists {
+        bail!("host credentials are incomplete; host.key and host_state.json must exist together");
+    }
+
+    let secret_key = read_host_secret_key(key_path)?;
+    let endpoint_id = EndpointId::from(secret_key.public());
+    let bytes =
+        fs::read(state_path).with_context(|| format!("failed to read {}", state_path.display()))?;
+    let state: PersistedHostState = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+    if state.endpoint_id != endpoint_id.to_string() {
+        bail!(
+            "host identity mismatch between {} and {}",
+            key_path.display(),
+            state_path.display()
+        );
+    }
+    if state.attach_secret.trim().is_empty() {
+        bail!("host attach secret is empty in {}", state_path.display());
+    }
+
+    Ok(Some(HostCredentials {
+        endpoint_id,
+        attach_secret: state.attach_secret,
+    }))
+}
+
+pub(crate) fn load_client_profile() -> Result<Option<ClientProfile>> {
+    let path = client_profile_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(load_client_profile_at(&path)?))
+}
+
+pub(crate) fn load_client_profile_at(path: &Path) -> Result<ClientProfile> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let profile: ClientProfile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    validate_client_profile(&profile)?;
+    Ok(profile)
+}
+
+pub(crate) fn write_client_profile(profile: &ClientProfile) -> Result<()> {
+    validate_client_profile(profile)?;
+    let path = client_profile_path()?;
+    let bytes = serde_json::to_vec_pretty(profile)?;
+    write_file_atomic(&path, &bytes)
+}
+
+pub(crate) fn validate_client_profile(profile: &ClientProfile) -> Result<EndpointId> {
+    if profile.schema_version != 1 {
+        bail!(
+            "unsupported client profile schema version {}",
+            profile.schema_version
+        );
+    }
+    if profile.host_id.trim().is_empty() {
+        bail!("client profile host ID is empty");
+    }
+    let endpoint_id =
+        EndpointId::from_str(&profile.host_id).context("invalid client profile host ID")?;
+    if profile.secret.trim().is_empty() {
+        bail!("client profile secret is empty");
+    }
+    Ok(endpoint_id)
+}
+
+pub(crate) fn parse_invitation(input: &str) -> Result<ClientProfile> {
+    let parts = input.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 6 || parts[0] != "meow" || parts[1] != "attach" || parts[4] != "--side" {
+        bail!("expected: meow attach <host-id> <secret> --side <left|right|up|down>");
+    }
+
+    let side = match parts[5] {
+        "left" => Side::Left,
+        "right" => Side::Right,
+        "up" => Side::Up,
+        "down" => Side::Down,
+        _ => bail!("invalid invitation side"),
+    };
+    let profile = ClientProfile {
+        schema_version: 1,
+        host_id: parts[2].to_string(),
+        secret: parts[3].to_string(),
+        side,
+    };
+    validate_client_profile(&profile)?;
+    Ok(profile)
+}
+
+pub(crate) fn format_attach_command(
+    endpoint_id: EndpointId,
+    attach_secret: &str,
+    side: Side,
+) -> String {
+    format!(
+        "meow attach {endpoint_id} {attach_secret} --side {}",
+        side_name(side)
+    )
+}
+
 pub(crate) async fn reset_identity() -> Result<()> {
+    let _runtime_lock = HostRuntimeLock::acquire()?;
     if crate::ipc::is_daemon_running().await {
         bail!("host daemon is running, stop it first with `meow stop`");
     }
@@ -186,6 +433,7 @@ pub(crate) async fn reset_identity() -> Result<()> {
 }
 
 pub(crate) async fn rotate_secret() -> Result<()> {
+    let _runtime_lock = HostRuntimeLock::acquire()?;
     if crate::ipc::is_daemon_running().await {
         bail!("host daemon is running, stop it first with `meow stop`");
     }
@@ -209,19 +457,22 @@ pub(crate) fn load_or_create_host_secret_key() -> Result<SecretKey> {
         .with_context(|| format!("failed to create {}", app_dir.display()))?;
 
     if key_path.exists() {
-        let bytes = fs::read(&key_path)
-            .with_context(|| format!("failed to read {}", key_path.display()))?;
-        if bytes.len() != 32 {
-            bail!("invalid host key length in {}", key_path.display());
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&bytes);
-        return Ok(SecretKey::from_bytes(&key_bytes));
+        return read_host_secret_key(&key_path);
     }
 
     let secret = SecretKey::generate();
     write_secret_key_file(&key_path, &secret.to_bytes())?;
     Ok(secret)
+}
+
+fn read_host_secret_key(path: &Path) -> Result<SecretKey> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() != 32 {
+        bail!("invalid host key length in {}", path.display());
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&bytes);
+    Ok(SecretKey::from_bytes(&key_bytes))
 }
 
 fn write_secret_key_file(path: &Path, key: &[u8; 32]) -> Result<()> {
@@ -235,7 +486,14 @@ pub(crate) fn load_or_create_host_state(endpoint_id: EndpointId) -> Result<Persi
             .with_context(|| format!("failed to read {}", state_path.display()))?;
         let state: PersistedHostState = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", state_path.display()))?;
-        let (state, repaired) = repair_host_state_for_endpoint(state, endpoint_id);
+        if state.endpoint_id != endpoint_id.to_string() {
+            bail!(
+                "host identity mismatch between {} and {}",
+                host_key_path()?.display(),
+                state_path.display()
+            );
+        }
+        let (state, repaired) = repair_host_state(state);
         parse_detach_chord(&state.detach_key).with_context(|| {
             format!(
                 "invalid detach_key {:?} in {}",
@@ -332,11 +590,17 @@ pub(crate) fn write_host_state_file(path: &Path, state: &PersistedHostState) -> 
     write_file_atomic(path, &bytes)
 }
 
-fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("missing parent directory for {}", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect {}", parent.display()))?;
+    }
 
     let temp_path = unique_temp_path(path);
 
@@ -407,20 +671,11 @@ pub(crate) fn random_secret() -> String {
         .collect()
 }
 
-fn repair_host_state_for_endpoint(
-    mut state: PersistedHostState,
-    endpoint_id: EndpointId,
-) -> (PersistedHostState, bool) {
+fn repair_host_state(mut state: PersistedHostState) -> (PersistedHostState, bool) {
     let mut changed = false;
 
     if state.attach_secret.trim().is_empty() {
         state.attach_secret = random_secret();
-        changed = true;
-    }
-
-    let endpoint_id_str = endpoint_id.to_string();
-    if state.endpoint_id != endpoint_id_str {
-        state.endpoint_id = endpoint_id_str;
         changed = true;
     }
 
@@ -478,7 +733,7 @@ mod tests {
             right_key: " ".to_string(),
         };
 
-        let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
+        let (repaired, changed) = repair_host_state(state);
 
         assert!(changed);
         assert!(!repaired.attach_secret.trim().is_empty());
@@ -493,11 +748,11 @@ mod tests {
     }
 
     #[test]
-    fn repair_updates_endpoint_id_when_mismatched() {
+    fn repair_keeps_endpoint_id_when_valid() {
         let endpoint_id = sample_endpoint_id();
         let state = PersistedHostState {
             schema_version: 1,
-            endpoint_id: "old-endpoint".to_string(),
+            endpoint_id: endpoint_id.to_string(),
             attach_secret: "secret".to_string(),
             detach_key: default_detach_key(),
             remote_pointer_mode: default_remote_pointer_mode(),
@@ -509,9 +764,9 @@ mod tests {
             right_key: default_right_key(),
         };
 
-        let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
+        let (repaired, changed) = repair_host_state(state);
 
-        assert!(changed);
+        assert!(!changed);
         assert_eq!(repaired.endpoint_id, endpoint_id.to_string());
     }
 
@@ -532,7 +787,7 @@ mod tests {
             right_key: default_right_key(),
         };
 
-        let (repaired, changed) = repair_host_state_for_endpoint(state, endpoint_id);
+        let (repaired, changed) = repair_host_state(state);
 
         assert!(!changed);
         assert_eq!(repaired.endpoint_id, endpoint_id.to_string());
@@ -637,5 +892,57 @@ mod tests {
         assert_eq!(first, second);
 
         fs::remove_dir_all(base).expect("remove identity test directory");
+    }
+
+    #[test]
+    fn invitation_parser_accepts_only_canonical_attach_commands() {
+        let endpoint_id = sample_endpoint_id();
+        let profile = parse_invitation(&format!("meow attach {endpoint_id} secret --side right"))
+            .expect("canonical invitation should parse");
+        assert_eq!(profile.host_id, endpoint_id.to_string());
+        assert_eq!(profile.side, Side::Right);
+
+        assert!(parse_invitation("meow attach id secret --side right; whoami").is_err());
+        assert!(parse_invitation("sh -c 'meow attach id secret --side right'").is_err());
+    }
+
+    #[test]
+    fn invitation_round_trip_formats_explicit_side() {
+        let endpoint_id = sample_endpoint_id();
+        let command = format_attach_command(endpoint_id, "secret", Side::Left);
+        let profile = parse_invitation(&command).expect("formatted invitation should parse");
+        assert_eq!(profile.side, Side::Left);
+        assert_eq!(profile.secret, "secret");
+    }
+
+    #[test]
+    fn read_only_credentials_reject_endpoint_mismatch() {
+        let key = SecretKey::generate();
+        let other_endpoint = sample_endpoint_id();
+        let state = PersistedHostState {
+            schema_version: 1,
+            endpoint_id: other_endpoint.to_string(),
+            attach_secret: "secret".to_string(),
+            detach_key: default_detach_key(),
+            remote_pointer_mode: default_remote_pointer_mode(),
+            paste_key: default_paste_key(),
+            copy_file_key: default_copy_file_key(),
+            up_key: default_up_key(),
+            down_key: default_down_key(),
+            left_key: default_left_key(),
+            right_key: default_right_key(),
+        };
+        let base = std::env::temp_dir().join(format!(
+            "meow-credentials-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create credentials directory");
+        let key_path = base.join("host.key");
+        let state_path = base.join("host_state.json");
+        fs::write(&key_path, key.to_bytes()).expect("write host key");
+        write_host_state_file(&state_path, &state).expect("write host state");
+
+        assert!(load_existing_host_credentials_from_paths(&key_path, &state_path).is_err());
+        fs::remove_dir_all(base).expect("remove credentials directory");
     }
 }

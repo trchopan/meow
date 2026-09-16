@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     cli::AttachArgs,
+    client_ipc::{ClientControl, ClientLifecycleState},
     clipboard,
     display::{
         DisplayGeometry, DisplayLayout, display_layout, main_display_geometry, pointer_location,
@@ -24,23 +26,90 @@ use crate::{
         MAX_AUTH_MSG_SIZE, ReplayFailureKind, WireEvent, WireKey, read_framed_with_clipboard_size,
         read_framed_with_limit, send_client_feedback, write_framed,
     },
-    state::{ClientAttachLock, load_or_create_client_identity},
+    state::{ClientAttachLock, load_client_profile_at, load_or_create_client_identity},
 };
 
 const EDGE_TOLERANCE_PX: i32 = 2;
 const EDGE_PUSH_THRESHOLD_PX: i32 = 16;
 const EDGE_PUSH_RESET_TIMEOUT: Duration = Duration::from_millis(250);
 
+pub(crate) async fn run_attach_profile(path: PathBuf) -> Result<()> {
+    run_attach_profile_with_options(path, AttachRunOptions::cli()).await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttachRunOptions {
+    pub(crate) print_connected: bool,
+    pub(crate) handle_ctrl_c: bool,
+}
+
+impl AttachRunOptions {
+    pub(crate) const fn cli() -> Self {
+        Self {
+            print_connected: true,
+            handle_ctrl_c: true,
+        }
+    }
+
+    pub(crate) const fn menu() -> Self {
+        Self {
+            print_connected: false,
+            handle_ctrl_c: false,
+        }
+    }
+}
+
+pub(crate) async fn run_attach_profile_in_process(path: PathBuf) -> Result<()> {
+    run_attach_profile_with_options(path, AttachRunOptions::menu()).await
+}
+
+async fn run_attach_profile_with_options(path: PathBuf, options: AttachRunOptions) -> Result<()> {
+    let profile = load_client_profile_at(&path)
+        .with_context(|| format!("failed to load client profile {}", path.display()))?;
+    run_attach_with_options(
+        AttachArgs {
+            host_id: profile.host_id,
+            secret: profile.secret,
+            side: profile.side,
+            probe_received: false,
+            probe_duration_secs: 0,
+            no_inject: false,
+            probe_summary_only: false,
+            test_drop_sequence: None,
+            input_overlay: false,
+            input_overlay_position: crate::cli::OverlayPosition::TopRight,
+            input_overlay_idle_ms: 1500,
+        },
+        options,
+    )
+    .await
+}
+
 pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
-    let ctrl_c = tokio::signal::ctrl_c();
+    run_attach_with_options(args, AttachRunOptions::cli()).await
+}
+
+async fn run_attach_with_options(args: AttachArgs, options: AttachRunOptions) -> Result<()> {
+    let ctrl_c = async {
+        if options.handle_ctrl_c {
+            tokio::signal::ctrl_c().await
+        } else {
+            std::future::pending::<std::io::Result<()>>().await
+        }
+    };
     tokio::pin!(ctrl_c);
     let host_id = EndpointId::from_str(&args.host_id).context("invalid host endpoint id")?;
     let _attach_lock = ClientAttachLock::acquire(&host_id.to_string(), args.side)?;
     let client_id = load_or_create_client_identity()?;
+    let control = ClientControl::start(host_id.to_string(), args.side).await?;
     let endpoint = tokio::select! {
         signal = &mut ctrl_c => {
             signal.context("failed waiting for Ctrl+C")?;
             info!("Ctrl+C received before client attach started");
+            return Ok(());
+        }
+        _ = control.stop_requested() => {
+            info!("client stop requested before attach started");
             return Ok(());
         }
         result = Endpoint::builder(presets::N0)
@@ -48,7 +117,24 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             .alpns(vec![ALPN.to_vec()])
             .bind() => result.context("failed to create iroh endpoint"),
     }?;
-    endpoint.online().await;
+    tokio::select! {
+        signal = &mut ctrl_c => {
+            signal.context("failed waiting for Ctrl+C")?;
+            info!("Ctrl+C received while bringing client endpoint online");
+            return Ok(());
+        }
+        _ = control.stop_requested() => {
+            info!("client stop requested while bringing endpoint online");
+            return Ok(());
+        }
+        _ = endpoint.online() => {}
+    }
+    control
+        .set_state(
+            ClientLifecycleState::WaitingForHost,
+            "waiting for host connection",
+        )
+        .await;
 
     let connection = tokio::select! {
         signal = &mut ctrl_c => {
@@ -56,14 +142,29 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             info!("Ctrl+C received while connecting to host");
             return Ok(());
         }
+        _ = control.stop_requested() => {
+            info!("client stop requested while connecting to host");
+            return Ok(());
+        }
         result = endpoint.connect(host_id, ALPN) => result.context("failed to connect to host"),
     }?;
+
+    control
+        .set_state(
+            ClientLifecycleState::Authenticating,
+            "authenticating with host",
+        )
+        .await;
 
     let (mut send, mut recv) = tokio::select! {
         signal = &mut ctrl_c => {
             signal.context("failed waiting for Ctrl+C")?;
             info!("Ctrl+C received while opening host stream");
             connection.close(0u32.into(), b"client attach interrupted");
+            return Ok(());
+        }
+        _ = control.stop_requested() => {
+            connection.close(0u32.into(), b"client attach stopped");
             return Ok(());
         }
         result = connection.open_bi() => result,
@@ -81,6 +182,10 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             connection.close(0u32.into(), b"client attach interrupted");
             return Ok(());
         }
+        _ = control.stop_requested() => {
+            connection.close(0u32.into(), b"client attach stopped");
+            return Ok(());
+        }
         result = write_framed(&mut send, &auth) => result,
     }?;
 
@@ -91,17 +196,36 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
             connection.close(0u32.into(), b"client attach interrupted");
             return Ok(());
         }
+        _ = control.stop_requested() => {
+            connection.close(0u32.into(), b"client attach stopped");
+            return Ok(());
+        }
         result = tokio::time::timeout(
             Duration::from_secs(5),
             read_framed_with_limit(&mut recv, MAX_AUTH_MSG_SIZE),
         ) => result.context("timed out waiting for auth response")??,
     };
     if !response.ok {
+        let failure_state = if response.message.contains("invalid secret") {
+            ClientLifecycleState::WrongSecret
+        } else if response.message.contains("already attached") {
+            ClientLifecycleState::SideAlreadyInUse
+        } else {
+            ClientLifecycleState::Failed
+        };
+        control
+            .set_state(failure_state, response.message.clone())
+            .await;
         connection.close(1u32.into(), b"host denied attach");
         bail!("host denied attach: {}", response.message);
     }
 
-    println!("Attached to host as {:?}", args.side);
+    control
+        .set_state(ClientLifecycleState::Connected, "client is connected")
+        .await;
+    if options.print_connected {
+        println!("Attached to host as {:?}", args.side);
+    }
     info!("client attach complete, waiting for forwarded events");
 
     let mut enigo = Enigo::new();
@@ -146,6 +270,11 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
                     }
                     Err(err) => break Err(err.into()),
                 }
+            }
+            _ = control.stop_requested() => {
+                info!("client stop requested, shutting down client attach");
+                interrupted = true;
+                break Ok(());
             }
             frame = read_framed_with_clipboard_size(&mut recv) => frame,
         } {
@@ -386,13 +515,31 @@ pub(crate) async fn run_attach(args: AttachArgs) -> Result<()> {
         if probe_completed {
             probe.print_summary();
             println!("probe complete");
+            control
+                .set_state(ClientLifecycleState::Stopped, "client attach stopped")
+                .await;
+            drop(control);
             return Ok(());
         }
         if interrupted {
+            control
+                .set_state(ClientLifecycleState::Stopped, "client attach interrupted")
+                .await;
+            drop(control);
             bail!("probe interrupted");
         }
     }
 
+    if interrupted && run_result.is_ok() {
+        control
+            .set_state(ClientLifecycleState::Stopped, "client attach stopped")
+            .await;
+    } else if let Err(err) = &run_result {
+        control
+            .set_state(ClientLifecycleState::Failed, err.to_string())
+            .await;
+    }
+    drop(control);
     run_result
 }
 

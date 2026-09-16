@@ -8,6 +8,8 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+#[cfg(target_os = "macos")]
+use core_foundation::runloop::CFRunLoop;
 use rdev::{EventType, Key, grab};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -32,6 +34,55 @@ pub(crate) const DEFAULT_RIGHT_KEY: &str = "ctrl+alt+cmd+l";
 pub(crate) const DEFAULT_EDGE_ZONE_PX: u32 = 12;
 pub(crate) const DEFAULT_EDGE_DWELL_MS: u64 = 150;
 const EDGE_REARM_DISTANCE_MULTIPLIER: u32 = 2;
+
+#[derive(Clone)]
+pub(crate) struct InputGrabControl {
+    stop_requested: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    run_loop: Arc<Mutex<Option<CFRunLoop>>>,
+}
+
+impl InputGrabControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            run_loop: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        if let Some(run_loop) = self
+            .run_loop
+            .lock()
+            .expect("input run loop mutex poisoned")
+            .as_ref()
+            .cloned()
+        {
+            run_loop.stop();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_run_loop(&self, run_loop: CFRunLoop) {
+        *self.run_loop.lock().expect("input run loop mutex poisoned") = Some(run_loop);
+        if self.stop_requested.load(Ordering::Acquire) {
+            self.run_loop
+                .lock()
+                .expect("input run loop mutex poisoned")
+                .as_ref()
+                .expect("input run loop was just installed")
+                .stop();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn clear_run_loop(&self) {
+        *self.run_loop.lock().expect("input run loop mutex poisoned") = None;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetachChord {
@@ -78,6 +129,7 @@ pub(crate) fn run_input_grab(
     left_chord: DetachChord,
     right_chord: DetachChord,
     edge_config: HostEdgeConfig,
+    control: InputGrabControl,
 ) -> Result<()> {
     let send_ctx = CaptureSendContext {
         runtime_stats: runtime_stats.clone(),
@@ -429,7 +481,11 @@ pub(crate) fn run_input_grab(
         }
     };
 
+    #[cfg(target_os = "macos")]
+    control.set_run_loop(CFRunLoop::get_current());
     let result = grab(callback).map_err(|e| anyhow!("input grab failed: {e:?}"));
+    #[cfg(target_os = "macos")]
+    control.clear_run_loop();
     stop_edge_timer.store(true, Ordering::Relaxed);
     let _ = edge_timer.join();
     result

@@ -15,7 +15,7 @@ pub(crate) enum OverlayPosition {
 
 #[derive(Parser, Debug)]
 #[command(name = "meow", version, about = "Control nearby machines with iroh")]
-pub(crate) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -24,6 +24,10 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Host(HostArgs),
     Attach(AttachArgs),
+    #[command(name = "attach-profile", hide = true)]
+    AttachProfile(AttachProfileArgs),
+    #[command(name = "check-permissions", hide = true)]
+    CheckPermissions(PermissionArgs),
     #[command(hide = true)]
     DevSmoke(DevSmokeArgs),
     #[command(hide = true)]
@@ -119,6 +123,17 @@ pub(crate) struct AttachArgs {
     pub(crate) input_overlay_position: OverlayPosition,
     #[arg(long, default_value_t = 1500)]
     pub(crate) input_overlay_idle_ms: u64,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct AttachProfileArgs {
+    pub(crate) profile: std::path::PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct PermissionArgs {
+    #[arg(value_parser = ["host", "client"])]
+    pub(crate) role: String,
 }
 
 #[derive(Debug, clap::Args)]

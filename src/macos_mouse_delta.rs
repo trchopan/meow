@@ -4,6 +4,8 @@ use std::sync::{
 };
 
 use anyhow::Result;
+#[cfg(target_os = "macos")]
+use core_foundation::runloop::CFRunLoop;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -19,6 +21,61 @@ fn should_capture_motion(target: ActiveTarget, pointer_lock_active: bool) -> boo
 
 const MAX_USER_DISABLE_RETRIES: u8 = 3;
 
+#[derive(Clone)]
+pub(crate) struct MouseDeltaControl {
+    stop_requested: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    run_loop: Arc<Mutex<Option<CFRunLoop>>>,
+}
+
+impl MouseDeltaControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            run_loop: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        if let Some(run_loop) = self
+            .run_loop
+            .lock()
+            .expect("mouse delta run loop mutex poisoned")
+            .as_ref()
+            .cloned()
+        {
+            run_loop.stop();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_run_loop(&self, run_loop: CFRunLoop) {
+        *self
+            .run_loop
+            .lock()
+            .expect("mouse delta run loop mutex poisoned") = Some(run_loop);
+        if self.stop_requested.load(Ordering::Acquire) {
+            self.run_loop
+                .lock()
+                .expect("mouse delta run loop mutex poisoned")
+                .as_ref()
+                .expect("mouse delta run loop was just installed")
+                .stop();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn clear_run_loop(&self) {
+        *self
+            .run_loop
+            .lock()
+            .expect("mouse delta run loop mutex poisoned") = None;
+    }
+}
+
 fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
     port_ready
         .then_some(attempt)
@@ -29,6 +86,7 @@ fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_macos_mouse_delta_capture(
+    control: MouseDeltaControl,
     tx: mpsc::Sender<CapturedInput>,
     runtime_stats: Arc<RuntimeStats>,
     active_target: Arc<AtomicU8>,
@@ -182,6 +240,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     );
 
     let run_loop = CFRunLoop::get_current();
+    control.set_run_loop(run_loop.clone());
     let loop_source = tap
         .mach_port
         .create_runloop_source(0)
@@ -192,6 +251,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     tap.enable();
     pointer_tap_healthy.store(true, Ordering::Release);
     CFRunLoop::run_current();
+    control.clear_run_loop();
     pointer_tap_healthy.store(false, Ordering::Release);
     runtime_stats
         .capture_tap_stopped
@@ -202,6 +262,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_macos_mouse_delta_capture(
+    _control: MouseDeltaControl,
     _tx: mpsc::Sender<CapturedInput>,
     _runtime_stats: Arc<RuntimeStats>,
     _active_target: Arc<AtomicU8>,

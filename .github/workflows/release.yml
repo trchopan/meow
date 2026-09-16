@@ -29,18 +29,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --target "${{ matrix.target }}"
+        run: cargo build --release --target "${{ matrix.target }}" --bins
 
       - name: Package artifact
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
+          release_version="${version#v}"
           artifact="meow-${version}-${{ matrix.target }}"
           package_dir="dist/${artifact}"
           mkdir -p "${package_dir}"
           cp "target/${{ matrix.target }}/release/meow" "${package_dir}/meow"
           cp README.md LICENSE "${package_dir}/"
           tar -C dist -czf "dist/${artifact}.tar.gz" "${artifact}"
+
+          app="dist/Meow.app"
+          mkdir -p "${app}/Contents/MacOS"
+          cp "target/${{ matrix.target }}/release/meow-menubar" "${app}/Contents/MacOS/meow-menubar"
+          sed "s/@VERSION@/${release_version}/g" resources/macos/Info.plist > "${app}/Contents/Info.plist"
+          tar -C dist -czf "dist/Meow-${version}-${{ matrix.target }}.app.tar.gz" "Meow.app"
+          rm -rf "${app}"
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4

@@ -187,6 +187,7 @@ pub(crate) struct PeerMessage {
 pub(crate) struct HostState {
     pub(crate) blob_runtime: Arc<crate::blob::BlobRuntime>,
     pub(crate) endpoint_id: EndpointId,
+    pub(crate) runtime_id: String,
     pub(crate) active_target: Arc<AtomicU8>,
     pub(crate) remote_pointer_mode: Arc<AtomicU8>,
     pub(crate) pointer_lock_active: Arc<AtomicBool>,

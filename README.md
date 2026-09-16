@@ -38,6 +38,37 @@ Unsigned binaries may be quarantined by macOS. If needed:
 xattr -dr com.apple.quarantine ~/.local/bin/meow
 ```
 
+### Menu Bar App
+
+Releases also include `Meow-vX.Y.Z-<target>.app.tar.gz`. Extract the app and launch
+`Meow.app` to manage the host daemon and one saved client profile from the menu bar.
+The app is menu-bar-only and does not add a Dock icon. Host and client runtimes run
+inside the app process, so the app does not require `meow` to be on `PATH`.
+
+The menu bar app and the terminal CLI share one host runtime on a Mac. Starting
+`meow host` from either frontend adopts the already-running host instead of
+starting a second input-capture process. The same client host/side combination
+also has one attachment owner, so starting it from both the app and CLI is
+rejected safely.
+
+The first launch can configure the Host role, Client role, or both. Client invitations
+are stored in `~/.local/share/meow/client_profile.json` with protected file permissions.
+The menu never displays the client secret, but copying an invitation can expose it to
+clipboard managers and other local applications.
+
+Grant Accessibility and, for Host mode, Input Monitoring to `Meow.app` in System
+Settings. The menu provides `Open System Settings` and `Check Permissions` actions
+and reports the permission target when permissions are missing. The initial app bundle
+is unsigned; remove quarantine from the extracted app if Gatekeeper blocks it:
+
+```sh
+xattr -dr com.apple.quarantine Meow.app
+```
+
+Quitting the menu bar app gracefully stops the host and saved client attachment. Use
+the explicit Stop Host and Stop Client actions when input forwarding should end
+without quitting the app.
+
 ## Development Status
 
 `meow` is currently in the **development** stage.
@@ -218,6 +249,13 @@ MEOW_STATE_DIR=/tmp/meow-dev meow host
 - `host.key`: persistent host private key (keeps host endpoint id stable).
 - `host_state.json`: persisted metadata, including attach secret and detach key chord.
 - `meow.sock`: local Unix socket used for host daemon control.
+- `host-runtime.lock`: process-lifetime lock preventing competing host runtimes.
+- `menu-app.lock`: process-lifetime lock preventing duplicate menu bar apps.
+
+The runtime lock is intentionally independent of `MEOW_STATE_DIR`, so a second
+host cannot bypass protection by selecting a different development state path.
+Synthetic development smoke tests use isolated state and do not enable real input
+capture.
 
 Example `host_state.json`:
 
@@ -321,6 +359,33 @@ cargo run -- dev-smoke --duration-secs 5 --side right
 ```
 
 This runs a host + attach probe on the same machine with a temporary isolated state directory.
+
+Build and install the local menu bar app from source:
+
+```sh
+make app-check
+make install-app
+make launch-app
+```
+
+The app is installed at `~/Applications/Meow.app`. Host and client runtimes run inside
+the menu bar app process. The optional CLI install target is available for diagnostics:
+
+```sh
+make install-cli
+```
+
+To test on two Macs, clone the repository on both machines and run `make check`,
+`make install-app`, and `make launch-app` on each. On the host Mac, choose `Set Up Host`,
+grant Accessibility and Input Monitoring to `Meow.app`, start the host, and copy an
+invitation for the desired side. On the client Mac, choose `Set Up Client`, paste the
+invitation, grant Accessibility to `Meow.app`, and start the client. Verify the
+connected status, pointer and keyboard forwarding, explicit stop/reconnect behavior, and
+cleanup after stopping both roles.
+
+`make uninstall-app` removes only the installed app; Meow state and credentials remain under
+`~/.local/share/meow/`. The local app is unsigned. If macOS quarantines it, remove quarantine
+from the installed app with `xattr -dr com.apple.quarantine ~/Applications/Meow.app`.
 
 ## Developer Diagnostics
 

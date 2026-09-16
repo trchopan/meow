@@ -2,6 +2,7 @@
 name = "meow"
 version = "0.2.0"
 edition = "2024"
+default-run = "meow"
 
 [dependencies]
 anyhow = "1.0"
@@ -27,3 +28,4 @@ uuid = { version = "1.10", features = ["v4"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"
 objc = "0.2"
+tray-icon = "0.25.1"

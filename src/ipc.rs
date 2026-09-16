@@ -1,4 +1,4 @@
-use std::{sync::atomic::Ordering, thread, time::Duration};
+use std::{io::ErrorKind, path::PathBuf, sync::atomic::Ordering, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,13 @@ pub(crate) struct IpcResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StatusPayload {
     pub(crate) endpoint_id: String,
+    #[serde(default)]
+    pub(crate) runtime_id: String,
     pub(crate) active: ActiveTarget,
     pub(crate) pointer_mode: RemotePointerMode,
     pub(crate) attached: Vec<Side>,
+    #[serde(default)]
+    pub(crate) attached_peers: Vec<AttachedPeerStatus>,
     pub(crate) captured_events: u64,
     pub(crate) normalized_events: u64,
     pub(crate) replay_failures: u64,
@@ -51,22 +55,22 @@ pub(crate) struct StatusPayload {
     pub(crate) capture_tap_stopped: u64,
 }
 
+const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AttachedPeerStatus {
+    pub(crate) side: Side,
+    pub(crate) endpoint_id: String,
+    pub(crate) name: String,
+}
+
 pub(crate) async fn send_switch(target: ActiveTarget) -> Result<()> {
     send_ipc(IpcCommand::Switch { target }).await
 }
 
 pub(crate) async fn send_ipc(command: IpcCommand) -> Result<()> {
-    let socket = socket_path()?;
-    let mut stream = UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("host daemon is not running ({})", socket.display()))?;
-    let bytes = serde_json::to_vec(&command)?;
-    stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
-
-    let mut response_bytes = Vec::new();
-    stream.read_to_end(&mut response_bytes).await?;
-    let response: IpcResponse = serde_json::from_slice(&response_bytes)?;
+    let response = request_ipc(command).await?;
 
     if response.ok {
         print_status_response(&response.message, response.status.as_ref());
@@ -76,12 +80,65 @@ pub(crate) async fn send_ipc(command: IpcCommand) -> Result<()> {
     }
 }
 
-pub(crate) async fn run_control_socket(state: HostState) -> Result<()> {
+pub(crate) async fn request_ipc(command: IpcCommand) -> Result<IpcResponse> {
     let socket = socket_path()?;
+    let mut stream = tokio::time::timeout(IPC_TIMEOUT, UnixStream::connect(&socket))
+        .await
+        .with_context(|| format!("timed out connecting to host daemon ({})", socket.display()))?
+        .with_context(|| format!("host daemon is not running ({})", socket.display()))?;
+    let bytes = serde_json::to_vec(&command)?;
+    tokio::time::timeout(IPC_TIMEOUT, stream.write_all(&bytes))
+        .await
+        .context("timed out writing host control request")??;
+    tokio::time::timeout(IPC_TIMEOUT, stream.shutdown())
+        .await
+        .context("timed out closing host control request")??;
+
+    let response_bytes = read_ipc_message(&mut stream).await?;
+    let response: IpcResponse = serde_json::from_slice(&response_bytes)?;
+
+    Ok(response)
+}
+
+pub(crate) async fn bind_control_socket() -> Result<(UnixListener, PathBuf)> {
+    let socket = socket_path()?;
+    if socket.exists() {
+        match tokio::time::timeout(IPC_TIMEOUT, UnixStream::connect(&socket)).await {
+            Ok(Ok(_)) => bail!(
+                "host control socket is already in use ({})",
+                socket.display()
+            ),
+            Ok(Err(err)) if stale_socket_error(&err) => {
+                std::fs::remove_file(&socket).with_context(|| {
+                    format!("failed to remove stale socket {}", socket.display())
+                })?;
+            }
+            Ok(Err(err)) => {
+                bail!(
+                    "host control socket is unavailable and cannot be proven stale ({}): {err}",
+                    socket.display()
+                );
+            }
+            Err(_) => {
+                bail!(
+                    "host control socket did not respond and cannot be proven stale ({})",
+                    socket.display()
+                );
+            }
+        }
+    }
+
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind {}", socket.display()))?;
     info!("control socket ready: {}", socket.display());
+    Ok((listener, socket))
+}
 
+pub(crate) async fn run_control_socket(
+    listener: UnixListener,
+    socket: PathBuf,
+    state: HostState,
+) -> Result<()> {
     loop {
         let maybe_stream = tokio::select! {
             _ = state.shutdown_notify.notified() => {
@@ -105,8 +162,7 @@ pub(crate) async fn run_control_socket(state: HostState) -> Result<()> {
 }
 
 async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Result<()> {
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).await?;
+    let bytes = read_ipc_message(stream).await?;
     let command: IpcCommand = serde_json::from_slice(&bytes)?;
 
     let response = match command {
@@ -128,14 +184,40 @@ async fn handle_control_request(stream: &mut UnixStream, state: HostState) -> Re
                 status: None,
             };
             let payload = serde_json::to_vec(&response)?;
-            stream.write_all(&payload).await?;
+            tokio::time::timeout(IPC_TIMEOUT, stream.write_all(&payload))
+                .await
+                .context("timed out writing host stop response")??;
             return Ok(());
         }
     };
 
     let payload = serde_json::to_vec(&response)?;
-    stream.write_all(&payload).await?;
+    tokio::time::timeout(IPC_TIMEOUT, stream.write_all(&payload))
+        .await
+        .context("timed out writing host control response")??;
     Ok(())
+}
+
+async fn read_ipc_message(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    let result = tokio::time::timeout(IPC_TIMEOUT, async {
+        let mut bytes = Vec::new();
+        let mut limited = stream.take((MAX_IPC_MESSAGE_SIZE + 1) as u64);
+        limited.read_to_end(&mut bytes).await?;
+        Ok::<_, std::io::Error>(bytes)
+    })
+    .await
+    .context("timed out reading host control request")??;
+    if result.len() > MAX_IPC_MESSAGE_SIZE {
+        bail!("host control message is too large");
+    }
+    Ok(result)
+}
+
+fn stale_socket_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+    )
 }
 
 #[cfg(not(test))]
@@ -427,15 +509,32 @@ fn schedule_pointer_lock_recovery(state: &HostState, expected_target: ActiveTarg
 }
 
 async fn status_payload(state: &HostState) -> StatusPayload {
-    let attached = {
+    let (attached, attached_peers) = {
         let remotes = state.remotes.read().await;
-        remotes.keys().copied().collect::<Vec<_>>()
+        let mut peers = remotes
+            .iter()
+            .map(|(side, remote)| AttachedPeerStatus {
+                side: *side,
+                endpoint_id: remote.remote_id.to_string(),
+                name: remote.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|peer| match peer.side {
+            Side::Left => 0,
+            Side::Right => 1,
+            Side::Up => 2,
+            Side::Down => 3,
+        });
+        let attached = peers.iter().map(|peer| peer.side).collect::<Vec<_>>();
+        (attached, peers)
     };
     StatusPayload {
         endpoint_id: state.endpoint_id.to_string(),
+        runtime_id: state.runtime_id.clone(),
         active: ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed)),
         pointer_mode: RemotePointerMode::from_u8(state.remote_pointer_mode.load(Ordering::Relaxed)),
         attached,
+        attached_peers,
         captured_events: state.runtime_stats.captured_events.load(Ordering::Relaxed),
         normalized_events: state
             .runtime_stats
@@ -473,18 +572,9 @@ async fn status_payload(state: &HostState) -> StatusPayload {
 }
 
 pub(crate) async fn is_daemon_running() -> bool {
-    let Ok(path) = socket_path() else {
-        return false;
-    };
-    UnixStream::connect(path).await.is_ok()
-}
-
-pub(crate) async fn cleanup_stale_socket() -> Result<()> {
-    let path = socket_path()?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
+    request_ipc(IpcCommand::Status)
+        .await
+        .is_ok_and(|response| response.ok && response.status.is_some())
 }
 
 #[cfg(test)]
@@ -503,6 +593,7 @@ mod tests {
         HostState {
             blob_runtime: crate::blob::BlobRuntime::disabled(),
             endpoint_id: EndpointId::from(SecretKey::generate().public()),
+            runtime_id: "test-runtime".to_string(),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
@@ -683,9 +774,15 @@ mod tests {
     fn status_payload_round_trip_includes_runtime_counters() {
         let payload = StatusPayload {
             endpoint_id: "endpoint".to_string(),
+            runtime_id: "runtime".to_string(),
             active: ActiveTarget::Right,
             pointer_mode: RemotePointerMode::Confine,
             attached: vec![Side::Right],
+            attached_peers: vec![AttachedPeerStatus {
+                side: Side::Right,
+                endpoint_id: "peer-endpoint".to_string(),
+                name: "peer".to_string(),
+            }],
             captured_events: 1,
             normalized_events: 2,
             replay_failures: 3,
@@ -707,9 +804,27 @@ mod tests {
         assert_eq!(decoded.captured_queue_full_non_mouse_dropped, 7);
         assert_eq!(decoded.writer_queue_full_dropped, 5);
         assert_eq!(decoded.writer_queue_full_forced_local, 3);
+        assert_eq!(decoded.attached_peers.len(), 1);
+        assert_eq!(decoded.runtime_id, "runtime");
         assert_eq!(decoded.capture_tap_user_disabled, 4);
         assert!(decoded.pointer_lock_active);
         assert!(decoded.pointer_tap_healthy);
         assert_eq!(decoded.capture_tap_stopped, 2);
+    }
+
+    #[test]
+    fn stale_socket_cleanup_only_accepts_proven_connection_failures() {
+        assert!(stale_socket_error(&std::io::Error::from(
+            ErrorKind::ConnectionRefused,
+        )));
+        assert!(stale_socket_error(&std::io::Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(!stale_socket_error(&std::io::Error::from(
+            ErrorKind::TimedOut
+        )));
+        assert!(!stale_socket_error(&std::io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
     }
 }

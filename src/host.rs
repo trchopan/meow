@@ -23,15 +23,15 @@ use crate::{
     cli::HostArgs,
     clipboard,
     input::{
-        normalize_non_motion_event, parse_copy_file_chord, parse_detach_chord,
+        InputGrabControl, normalize_non_motion_event, parse_copy_file_chord, parse_detach_chord,
         parse_directional_chord, parse_paste_chord, run_input_grab,
     },
     ipc::{
-        IpcCommand, apply_target_change, cleanup_stale_socket, ensure_pointer_restored,
+        IpcCommand, apply_target_change, bind_control_socket, ensure_pointer_restored,
         run_control_socket, send_ipc, switch_target_if_attached,
     },
     macos_keyboard::LayoutTranslator,
-    macos_mouse_delta::run_macos_mouse_delta_capture,
+    macos_mouse_delta::{MouseDeltaControl, run_macos_mouse_delta_capture},
     macos_permissions::ensure_host_permissions_on_startup,
     model::{
         ActiveTarget, CapturedEvent, CapturedInput, HostState, PeerMessage,
@@ -43,17 +43,55 @@ use crate::{
         MAX_AUTH_MSG_SIZE, MAX_FEEDBACK_MSG_SIZE, MAX_FILE_MSG_SIZE, ModifierFlags, WireEvent,
         WireKey, read_framed_with_limit, write_framed,
     },
-    state::{host_state_path, load_or_create_host_secret_key, load_or_create_host_state},
+    state::{
+        HostRuntimeLock, host_state_path, load_or_create_host_secret_key, load_or_create_host_state,
+    },
 };
 
 const MAX_REPLAY_FAILURE_REPORT_COUNT: u64 = 1_000_000;
 
 pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
-    if !skip_permissions_for_synthetic_mode() {
-        ensure_host_permissions_on_startup()?;
-    } else {
-        info!("running host in synthetic input mode");
+    run_host_with_options(args, HostRunOptions::cli()).await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostRunOptions {
+    pub(crate) print_ready: bool,
+    pub(crate) handle_ctrl_c: bool,
+}
+
+impl HostRunOptions {
+    pub(crate) const fn cli() -> Self {
+        Self {
+            print_ready: true,
+            handle_ctrl_c: true,
+        }
     }
+
+    pub(crate) const fn menu() -> Self {
+        Self {
+            print_ready: false,
+            handle_ctrl_c: false,
+        }
+    }
+}
+
+pub(crate) async fn run_host_in_process(args: HostArgs) -> Result<()> {
+    run_host_with_options(args, HostRunOptions::menu()).await
+}
+
+async fn run_host_with_options(args: HostArgs, options: HostRunOptions) -> Result<()> {
+    let _runtime_lock = match HostRuntimeLock::acquire() {
+        Ok(lock) => lock,
+        Err(lock_err) => {
+            if crate::ipc::is_daemon_running().await {
+                println!("meow host daemon already running");
+                send_ipc(IpcCommand::Status).await?;
+                return Ok(());
+            }
+            return Err(lock_err);
+        }
+    };
 
     if crate::ipc::is_daemon_running().await {
         println!("meow host daemon already running");
@@ -61,7 +99,11 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         return Ok(());
     }
 
-    cleanup_stale_socket().await?;
+    if !skip_permissions_for_synthetic_mode() {
+        ensure_host_permissions_on_startup()?;
+    } else {
+        info!("running host in synthetic input mode");
+    }
 
     let host_secret_key = load_or_create_host_secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -75,6 +117,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let state_path = host_state_path()?;
     let persisted_state = load_or_create_host_state(endpoint_id)?;
     let secret = persisted_state.attach_secret;
+    let input_copy_file_chord = parse_copy_file_chord(&persisted_state.copy_file_key)?;
     let detach_chord = parse_detach_chord(&persisted_state.detach_key).with_context(|| {
         format!(
             "invalid detach_key {:?} in {}",
@@ -120,12 +163,12 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let runtime_stats = Arc::new(RuntimeStats::default());
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-
-    print_host_ready(&endpoint_id.to_string(), &secret);
+    let runtime_id = uuid::Uuid::new_v4().simple().to_string();
 
     let state = HostState {
         blob_runtime: blob_runtime.clone(),
         endpoint_id,
+        runtime_id,
         active_target: active_target.clone(),
         remote_pointer_mode: remote_pointer_mode.clone(),
         pointer_lock_active: pointer_lock_active.clone(),
@@ -148,8 +191,27 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         shutdown_notify: shutdown_notify.clone(),
     };
 
+    let router = Router::builder(endpoint.clone())
+        .accept(
+            ALPN,
+            HostProtocol {
+                state: state.clone(),
+                secret: secret.clone(),
+            },
+        )
+        .accept(
+            crate::transfer::TRANSFER_ALPN,
+            blob_runtime.transfer_protocol(transfer_registry.clone())?,
+        )
+        .spawn();
+    let (control_listener, control_socket) = bind_control_socket().await?;
+
     let (input_tx, input_rx) = mpsc::channel::<CapturedInput>(captured_input_channel_capacity());
     let (directional_switch_tx, directional_switch_rx) = mpsc::unbounded_channel();
+    let input_control = InputGrabControl::new();
+    let mouse_delta_control = MouseDeltaControl::new();
+    let mut input_thread = None;
+    let mut mouse_delta_thread = None;
     if bench_flush_enabled() {
         tokio::spawn(run_bench_synthetic_input(input_tx.clone(), state.clone()));
     } else if dev_smoke_enabled() {
@@ -166,11 +228,11 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let input_pending_clipboard_request = pending_clipboard_request.clone();
         let input_detach_chord = detach_chord.clone();
         let input_paste_chord = paste_chord.clone();
-        let input_copy_file_chord = parse_copy_file_chord(&persisted_state.copy_file_key)?;
         let input_runtime_stats = runtime_stats.clone();
         let input_edge_config =
             crate::input::HostEdgeConfig::new(args.edge_zone_px, args.edge_dwell_ms);
-        std::thread::spawn(move || {
+        let input_control_thread = input_control.clone();
+        input_thread = Some(std::thread::spawn(move || {
             if let Err(err) = run_input_grab(
                 input_tx,
                 input_runtime_stats,
@@ -190,10 +252,11 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                 left_chord,
                 right_chord,
                 input_edge_config,
+                input_control_thread,
             ) {
                 error!("input grab stopped: {err:#}");
             }
-        });
+        }));
 
         let mouse_delta_active_target = active_target.clone();
         let mouse_delta_pointer_lock_active = pointer_lock_active.clone();
@@ -203,10 +266,12 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let mouse_delta_runtime_stats = runtime_stats.clone();
         let mouse_delta_pointer_tap_healthy = pointer_tap_healthy.clone();
         let mouse_delta_shutdown_requested = shutdown_requested.clone();
-        std::thread::spawn(move || {
+        let mouse_delta_control_thread = mouse_delta_control.clone();
+        mouse_delta_thread = Some(std::thread::spawn(move || {
             #[cfg(target_os = "macos")]
             loop {
                 let result = run_macos_mouse_delta_capture(
+                    mouse_delta_control_thread.clone(),
                     mouse_delta_tx.clone(),
                     mouse_delta_runtime_stats.clone(),
                     mouse_delta_active_target.clone(),
@@ -231,6 +296,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
             #[cfg(not(target_os = "macos"))]
             {
                 if let Err(err) = run_macos_mouse_delta_capture(
+                    mouse_delta_control_thread,
                     mouse_delta_tx,
                     mouse_delta_runtime_stats,
                     mouse_delta_active_target,
@@ -243,7 +309,7 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
                     error!("macOS mouse delta capture stopped: {err:#}");
                 }
             }
-        });
+        }));
     }
 
     let forward_task = tokio::spawn(run_forward_loop(
@@ -253,28 +319,24 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     ));
 
     let control_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(err) = run_control_socket(control_state).await {
+    let control_task = tokio::spawn(async move {
+        if let Err(err) = run_control_socket(control_listener, control_socket, control_state).await
+        {
             error!("control socket failed: {err:#}");
         }
     });
-
-    let router = Router::builder(endpoint.clone())
-        .accept(
-            ALPN,
-            HostProtocol {
-                state: state.clone(),
-                secret: secret.clone(),
-            },
-        )
-        .accept(
-            crate::transfer::TRANSFER_ALPN,
-            blob_runtime.transfer_protocol(transfer_registry.clone())?,
-        )
-        .spawn();
     endpoint.online().await;
+    if options.print_ready {
+        print_host_ready(&endpoint_id.to_string(), &secret);
+    }
 
-    let ctrl_c = tokio::signal::ctrl_c();
+    let ctrl_c = async {
+        if options.handle_ctrl_c {
+            tokio::signal::ctrl_c().await
+        } else {
+            std::future::pending::<std::io::Result<()>>().await
+        }
+    };
     tokio::pin!(ctrl_c);
     if !state.shutdown_requested.load(Ordering::Relaxed) {
         tokio::select! {
@@ -290,6 +352,8 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         }
     }
 
+    input_control.stop();
+    mouse_delta_control.stop();
     let forward_completed = forward_task.await.is_ok();
     apply_target_change(&state, ActiveTarget::Local, "daemon shutdown");
     if !forward_completed {
@@ -300,7 +364,13 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         warn!("blob store shutdown failed: {err:#}");
     }
     router.shutdown().await?;
-    let _ = std::fs::remove_file(crate::state::socket_path()?);
+    let _ = control_task.await;
+    if let Some(thread) = input_thread {
+        let _ = thread.join();
+    }
+    if let Some(thread) = mouse_delta_thread {
+        let _ = thread.join();
+    }
     Ok(())
 }
 
@@ -1519,6 +1589,7 @@ mod tests {
         HostState {
             blob_runtime: crate::blob::BlobRuntime::disabled(),
             endpoint_id: iroh::EndpointId::from(iroh::SecretKey::generate().public()),
+            runtime_id: "test-runtime".to_string(),
             active_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
             remote_pointer_mode: Arc::new(AtomicU8::new(RemotePointerMode::EdgeToEdge.to_u8())),
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
