@@ -1152,7 +1152,14 @@ mod ui {
     }
 
     unsafe fn object_string(object: id) -> String {
-        let bytes: *const std::ffi::c_char = msg_send![object, UTF8String];
+        if object == nil {
+            return String::new();
+        }
+        let value: id = msg_send![object, stringValue];
+        if value == nil {
+            return String::new();
+        }
+        let bytes: *const std::ffi::c_char = msg_send![value, UTF8String];
         if bytes.is_null() {
             String::new()
         } else {
