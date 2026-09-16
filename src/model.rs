@@ -192,6 +192,10 @@ pub(crate) struct HostState {
     pub(crate) pointer_lock_active: Arc<AtomicBool>,
     pub(crate) pointer_hidden: Arc<AtomicBool>,
     pub(crate) pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    pub(crate) pointer_lock_recovery_running: Arc<AtomicBool>,
+    pub(crate) pointer_lock_recovery_target: Arc<AtomicU8>,
+    pub(crate) pointer_lock_recovery_generation: Arc<AtomicU64>,
+    pub(crate) pointer_tap_healthy: Arc<AtomicBool>,
     pub(crate) remotes: Arc<RwLock<HashMap<Side, RemotePeer>>>,
     pub(crate) next_remote_generation: Arc<AtomicU64>,
     pub(crate) pending_release_sides: Arc<AtomicU8>,
@@ -224,4 +228,5 @@ pub(crate) struct RuntimeStats {
     pub(crate) captured_queue_full_non_mouse_dropped: AtomicU64,
     pub(crate) writer_queue_full_dropped: AtomicU64,
     pub(crate) writer_queue_full_forced_local: AtomicU64,
+    pub(crate) capture_tap_stopped: AtomicU64,
 }

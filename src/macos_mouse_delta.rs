@@ -27,6 +27,7 @@ fn next_user_disable_attempt(attempt: u8, port_ready: bool) -> Option<u8> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_macos_mouse_delta_capture(
     tx: mpsc::Sender<CapturedInput>,
     runtime_stats: Arc<RuntimeStats>,
@@ -35,6 +36,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     pointer_hidden: Arc<AtomicBool>,
     pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     pending_release_sides: Arc<AtomicU8>,
+    pointer_tap_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
     use anyhow::anyhow;
     use core_foundation::base::TCFType;
@@ -55,6 +57,8 @@ pub(crate) fn run_macos_mouse_delta_capture(
     let callback_tap_port = tap_port.clone();
     let user_disable_retries = Arc::new(AtomicU8::new(0));
     let callback_user_disable_retries = user_disable_retries.clone();
+    let callback_pointer_tap_healthy = pointer_tap_healthy.clone();
+    let callback_runtime_stats = runtime_stats.clone();
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -67,13 +71,14 @@ pub(crate) fn run_macos_mouse_delta_capture(
             CGEventType::OtherMouseDragged,
         ],
         move |_proxy, event_type, event: &CGEvent| {
+            let _transition_guard = TARGET_TRANSITION_LOCK
+                .lock()
+                .expect("target transition mutex poisoned");
             if matches!(
                 event_type,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
-                let _transition_guard = TARGET_TRANSITION_LOCK
-                    .lock()
-                    .expect("target transition mutex poisoned");
+                callback_pointer_tap_healthy.store(false, Ordering::Release);
                 let port = callback_tap_port.load(Ordering::Relaxed);
                 if matches!(event_type, CGEventType::TapDisabledByTimeout) {
                     if !port.is_null() {
@@ -97,7 +102,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                     } else {
                         warn!("macOS mouse CGEventTap was disabled by user input before its port was ready");
                     }
-                    runtime_stats
+                    callback_runtime_stats
                         .capture_tap_user_disabled
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -107,7 +112,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                     pending_release_sides.fetch_or(side.release_bit(), Ordering::AcqRel);
                 }
                 pointer_lock_active.store(false, Ordering::Relaxed);
-                runtime_stats
+                callback_runtime_stats
                     .recovery_events
                     .fetch_add(1, Ordering::Relaxed);
                 if let Err(err) = host_mouse::set_pointer_dissociation(false) {
@@ -124,6 +129,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                     .expect("pinned pointer mutex poisoned") = None;
                 return Some(event.clone());
             }
+            callback_pointer_tap_healthy.store(true, Ordering::Release);
             let target = ActiveTarget::from_u8(active_target.load(Ordering::Relaxed));
             if !should_capture_motion(target, pointer_lock_active.load(Ordering::Relaxed)) {
                 return Some(event.clone());
@@ -143,7 +149,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
                 }) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
-                        runtime_stats
+                        callback_runtime_stats
                             .captured_queue_full_mouse_dropped
                             .fetch_add(1, Ordering::Relaxed);
                     }
@@ -184,11 +190,17 @@ pub(crate) fn run_macos_mouse_delta_capture(
         run_loop.add_source(&loop_source, kCFRunLoopCommonModes);
     }
     tap.enable();
+    pointer_tap_healthy.store(true, Ordering::Release);
     CFRunLoop::run_current();
+    pointer_tap_healthy.store(false, Ordering::Release);
+    runtime_stats
+        .capture_tap_stopped
+        .fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_macos_mouse_delta_capture(
     _tx: mpsc::Sender<CapturedInput>,
     _runtime_stats: Arc<RuntimeStats>,
@@ -197,6 +209,7 @@ pub(crate) fn run_macos_mouse_delta_capture(
     _pointer_hidden: Arc<AtomicBool>,
     _pinned_pointer_pos: Arc<Mutex<Option<(f64, f64)>>>,
     _pending_release_sides: Arc<AtomicU8>,
+    _pointer_tap_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
     Ok(())
 }

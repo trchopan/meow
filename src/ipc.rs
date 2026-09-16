@@ -1,6 +1,6 @@
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, thread, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -46,6 +46,9 @@ pub(crate) struct StatusPayload {
     pub(crate) captured_queue_full_non_mouse_dropped: u64,
     pub(crate) writer_queue_full_dropped: u64,
     pub(crate) writer_queue_full_forced_local: u64,
+    pub(crate) pointer_lock_active: bool,
+    pub(crate) pointer_tap_healthy: bool,
+    pub(crate) capture_tap_stopped: u64,
 }
 
 pub(crate) async fn send_switch(target: ActiveTarget) -> Result<()> {
@@ -223,6 +226,12 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     if state.shutdown_requested.load(Ordering::Acquire) && target != ActiveTarget::Local {
         return;
     }
+    state
+        .pointer_lock_recovery_target
+        .store(target.to_u8(), Ordering::Release);
+    state
+        .pointer_lock_recovery_generation
+        .fetch_add(1, Ordering::AcqRel);
     let previous_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Relaxed));
     if previous_target != target {
         state.target_epoch.fetch_add(1, Ordering::AcqRel);
@@ -249,32 +258,29 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
     let should_lock = target.to_side().is_some();
     let was_locked = state.pointer_lock_active.load(Ordering::Relaxed);
 
-    if should_lock && !was_locked {
-        match host_mouse::current_pointer_position() {
-            Ok(position) => {
-                let mut pinned = state
-                    .pinned_pointer_pos
-                    .lock()
-                    .expect("pinned pointer mutex poisoned");
-                *pinned = Some(position);
-            }
-            Err(err) => {
-                warn!("failed reading current pointer position: {err:#}");
-            }
-        }
-    }
-
     let lock_active = if should_lock {
-        if !was_locked {
+        if let Err(err) = ensure_pointer_pinned(state) {
+            warn!("failed to pin pointer before remote switch: {err:#}");
+            false
+        } else {
             match host_mouse::set_pointer_dissociation(true) {
-                Ok(()) => true,
+                Ok(()) => match warp_to_pinned_pointer(state) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!("failed to warp pointer after remote switch: {err:#}");
+                        if let Err(restore_err) = host_mouse::set_pointer_dissociation(false) {
+                            warn!(
+                                "failed to restore pointer association after lock activation failure: {restore_err:#}"
+                            );
+                        }
+                        false
+                    }
+                },
                 Err(err) => {
                     warn!("failed to enable pointer dissociation: {err:#}");
                     false
                 }
             }
-        } else {
-            true
         }
     } else {
         if (was_locked || previous_target.to_side().is_some())
@@ -303,9 +309,121 @@ pub(crate) fn apply_target_change(state: &HostState, target: ActiveTarget, conte
             .lock()
             .expect("pinned pointer mutex poisoned");
         *pinned = None;
+    } else if !lock_active {
+        schedule_pointer_lock_recovery(state, target);
     }
 
     info!("switched active target to {} via {}", target, context);
+}
+
+const POINTER_LOCK_RECOVERY_ATTEMPTS: u8 = 10;
+const POINTER_LOCK_RECOVERY_DELAY: Duration = Duration::from_millis(10);
+
+fn ensure_pointer_pinned(state: &HostState) -> Result<()> {
+    let mut pinned = state
+        .pinned_pointer_pos
+        .lock()
+        .expect("pinned pointer mutex poisoned");
+    if pinned.is_none() {
+        *pinned = Some(
+            host_mouse::current_pointer_position()
+                .context("failed reading current pointer position")?,
+        );
+    }
+    Ok(())
+}
+
+fn warp_to_pinned_pointer(state: &HostState) -> Result<()> {
+    let position = *state
+        .pinned_pointer_pos
+        .lock()
+        .expect("pinned pointer mutex poisoned");
+    let Some((x, y)) = position else {
+        return Err(anyhow!("pointer position was not pinned"));
+    };
+    host_mouse::warp_pointer(x, y)
+        .with_context(|| format!("failed to warp pointer to pinned position ({x:.2},{y:.2})"))
+}
+
+fn should_continue_pointer_lock_recovery(
+    active_target: ActiveTarget,
+    expected_target: ActiveTarget,
+) -> bool {
+    active_target == expected_target && expected_target.to_side().is_some()
+}
+
+fn schedule_pointer_lock_recovery(state: &HostState, expected_target: ActiveTarget) {
+    state
+        .pointer_lock_recovery_target
+        .store(expected_target.to_u8(), Ordering::Release);
+    let generation = state
+        .pointer_lock_recovery_generation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    if state
+        .pointer_lock_recovery_running
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+
+    let state = state.clone();
+    thread::spawn(move || {
+        for attempt in 1..=POINTER_LOCK_RECOVERY_ATTEMPTS {
+            thread::sleep(POINTER_LOCK_RECOVERY_DELAY);
+            let _transition_guard = TARGET_TRANSITION_LOCK
+                .lock()
+                .expect("target transition mutex poisoned");
+            let expected_target =
+                ActiveTarget::from_u8(state.pointer_lock_recovery_target.load(Ordering::Acquire));
+            let active_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire));
+            if state.shutdown_requested.load(Ordering::Acquire)
+                || !should_continue_pointer_lock_recovery(active_target, expected_target)
+            {
+                break;
+            }
+            if state.pointer_lock_active.load(Ordering::Acquire) {
+                break;
+            }
+
+            if let Err(err) = ensure_pointer_pinned(&state)
+                .and_then(|()| host_mouse::set_pointer_dissociation(true))
+                .and_then(|()| warp_to_pinned_pointer(&state))
+            {
+                warn!(
+                    "pointer lock recovery attempt {attempt}/{POINTER_LOCK_RECOVERY_ATTEMPTS} failed: {err:#}"
+                );
+                let _ = host_mouse::set_pointer_dissociation(false);
+                continue;
+            }
+
+            state.pointer_lock_active.store(true, Ordering::Release);
+            let was_hidden = state.pointer_hidden.swap(true, Ordering::AcqRel);
+            if !was_hidden && let Err(err) = host_mouse::set_pointer_visible(false) {
+                warn!("failed to hide pointer during lock recovery: {err:#}");
+                state.pointer_hidden.store(false, Ordering::Release);
+            }
+            info!("pointer lock recovered for remote target {expected_target}");
+            break;
+        }
+
+        state
+            .pointer_lock_recovery_running
+            .store(false, Ordering::Release);
+        let newer_recovery_requested = state
+            .pointer_lock_recovery_generation
+            .load(Ordering::Acquire)
+            != generation;
+        let active_target = ActiveTarget::from_u8(state.active_target.load(Ordering::Acquire));
+        let expected_target =
+            ActiveTarget::from_u8(state.pointer_lock_recovery_target.load(Ordering::Acquire));
+        if newer_recovery_requested
+            && should_continue_pointer_lock_recovery(active_target, expected_target)
+            && !state.pointer_lock_active.load(Ordering::Acquire)
+        {
+            schedule_pointer_lock_recovery(&state, expected_target);
+        }
+    });
 }
 
 async fn status_payload(state: &HostState) -> StatusPayload {
@@ -345,6 +463,12 @@ async fn status_payload(state: &HostState) -> StatusPayload {
             .runtime_stats
             .writer_queue_full_forced_local
             .load(Ordering::Relaxed),
+        pointer_lock_active: state.pointer_lock_active.load(Ordering::Acquire),
+        pointer_tap_healthy: state.pointer_tap_healthy.load(Ordering::Acquire),
+        capture_tap_stopped: state
+            .runtime_stats
+            .capture_tap_stopped
+            .load(Ordering::Acquire),
     }
 }
 
@@ -384,6 +508,10 @@ mod tests {
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(std::sync::Mutex::new(None)),
+            pointer_lock_recovery_running: Arc::new(AtomicBool::new(false)),
+            pointer_lock_recovery_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            pointer_lock_recovery_generation: Arc::new(AtomicU64::new(0)),
+            pointer_tap_healthy: Arc::new(AtomicBool::new(false)),
             remotes: Arc::new(RwLock::new(std::collections::HashMap::new())),
             next_remote_generation: Arc::new(AtomicU64::new(1)),
             pending_release_sides: Arc::new(AtomicU8::new(0)),
@@ -438,6 +566,13 @@ mod tests {
         apply_target_change(&state, ActiveTarget::Right, "test attach");
         assert_eq!(state.pending_release_sides.load(Ordering::Acquire), 0);
         assert!(state.pointer_lock_active.load(Ordering::Acquire));
+        assert!(
+            state
+                .pinned_pointer_pos
+                .lock()
+                .expect("pinned pointer mutex poisoned")
+                .is_some()
+        );
         assert_eq!(state.target_epoch.load(Ordering::Acquire), 1);
         assert!(
             state
@@ -449,6 +584,13 @@ mod tests {
 
         apply_target_change(&state, ActiveTarget::Local, "test detach");
         assert!(!state.pointer_lock_active.load(Ordering::Acquire));
+        assert!(
+            state
+                .pinned_pointer_pos
+                .lock()
+                .expect("pinned pointer mutex poisoned")
+                .is_none()
+        );
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit()
@@ -458,6 +600,10 @@ mod tests {
         apply_target_change(&state, ActiveTarget::Right, "test first side");
         apply_target_change(&state, ActiveTarget::Left, "test second side");
         apply_target_change(&state, ActiveTarget::Right, "test return side");
+        assert_eq!(
+            ActiveTarget::from_u8(state.pointer_lock_recovery_target.load(Ordering::Acquire)),
+            ActiveTarget::Right
+        );
         assert_eq!(
             state.pending_release_sides.load(Ordering::Acquire),
             Side::Right.release_bit() | Side::Left.release_bit()
@@ -476,6 +622,22 @@ mod tests {
             ActiveTarget::Local
         );
         assert!(!state.pointer_lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pointer_lock_recovery_stops_for_local_or_stale_targets() {
+        assert!(should_continue_pointer_lock_recovery(
+            ActiveTarget::Right,
+            ActiveTarget::Right
+        ));
+        assert!(!should_continue_pointer_lock_recovery(
+            ActiveTarget::Local,
+            ActiveTarget::Right
+        ));
+        assert!(!should_continue_pointer_lock_recovery(
+            ActiveTarget::Right,
+            ActiveTarget::Local
+        ));
     }
 
     #[tokio::test]
@@ -533,6 +695,9 @@ mod tests {
             captured_queue_full_non_mouse_dropped: 7,
             writer_queue_full_dropped: 5,
             writer_queue_full_forced_local: 3,
+            pointer_lock_active: true,
+            pointer_tap_healthy: true,
+            capture_tap_stopped: 2,
         };
 
         let encoded = serde_json::to_vec(&payload).expect("serialize payload");
@@ -543,5 +708,8 @@ mod tests {
         assert_eq!(decoded.writer_queue_full_dropped, 5);
         assert_eq!(decoded.writer_queue_full_forced_local, 3);
         assert_eq!(decoded.capture_tap_user_disabled, 4);
+        assert!(decoded.pointer_lock_active);
+        assert!(decoded.pointer_tap_healthy);
+        assert_eq!(decoded.capture_tap_stopped, 2);
     }
 }

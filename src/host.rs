@@ -102,6 +102,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
     let pointer_lock_active = Arc::new(AtomicBool::new(false));
     let pointer_hidden = Arc::new(AtomicBool::new(false));
     let pinned_pointer_pos = Arc::new(Mutex::new(None));
+    let pointer_lock_recovery_running = Arc::new(AtomicBool::new(false));
+    let pointer_lock_recovery_target = Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8()));
+    let pointer_lock_recovery_generation = Arc::new(AtomicU64::new(0));
+    let pointer_tap_healthy = Arc::new(AtomicBool::new(false));
     let remotes = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let next_remote_generation = Arc::new(AtomicU64::new(1));
     let pending_release_sides = Arc::new(AtomicU8::new(0));
@@ -127,6 +131,10 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         pointer_lock_active: pointer_lock_active.clone(),
         pointer_hidden: pointer_hidden.clone(),
         pinned_pointer_pos: pinned_pointer_pos.clone(),
+        pointer_lock_recovery_running: pointer_lock_recovery_running.clone(),
+        pointer_lock_recovery_target: pointer_lock_recovery_target.clone(),
+        pointer_lock_recovery_generation: pointer_lock_recovery_generation.clone(),
+        pointer_tap_healthy: pointer_tap_healthy.clone(),
         remotes: remotes.clone(),
         next_remote_generation: next_remote_generation.clone(),
         pending_release_sides: pending_release_sides.clone(),
@@ -193,17 +201,47 @@ pub(crate) async fn run_host(args: HostArgs) -> Result<()> {
         let mouse_delta_pinned_pointer_pos = pinned_pointer_pos.clone();
         let mouse_delta_pending_release_sides = pending_release_sides.clone();
         let mouse_delta_runtime_stats = runtime_stats.clone();
+        let mouse_delta_pointer_tap_healthy = pointer_tap_healthy.clone();
+        let mouse_delta_shutdown_requested = shutdown_requested.clone();
         std::thread::spawn(move || {
-            if let Err(err) = run_macos_mouse_delta_capture(
-                mouse_delta_tx,
-                mouse_delta_runtime_stats,
-                mouse_delta_active_target,
-                mouse_delta_pointer_lock_active,
-                mouse_delta_pointer_hidden,
-                mouse_delta_pinned_pointer_pos,
-                mouse_delta_pending_release_sides,
-            ) {
-                error!("macOS mouse delta capture stopped: {err:#}");
+            #[cfg(target_os = "macos")]
+            loop {
+                let result = run_macos_mouse_delta_capture(
+                    mouse_delta_tx.clone(),
+                    mouse_delta_runtime_stats.clone(),
+                    mouse_delta_active_target.clone(),
+                    mouse_delta_pointer_lock_active.clone(),
+                    mouse_delta_pointer_hidden.clone(),
+                    mouse_delta_pinned_pointer_pos.clone(),
+                    mouse_delta_pending_release_sides.clone(),
+                    mouse_delta_pointer_tap_healthy.clone(),
+                );
+                mouse_delta_pointer_tap_healthy.store(false, Ordering::Release);
+                if let Err(err) = result {
+                    error!("macOS mouse delta capture stopped: {err:#}");
+                } else {
+                    warn!("macOS mouse delta capture run loop exited; restarting");
+                }
+                if mouse_delta_shutdown_requested.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let Err(err) = run_macos_mouse_delta_capture(
+                    mouse_delta_tx,
+                    mouse_delta_runtime_stats,
+                    mouse_delta_active_target,
+                    mouse_delta_pointer_lock_active,
+                    mouse_delta_pointer_hidden,
+                    mouse_delta_pinned_pointer_pos,
+                    mouse_delta_pending_release_sides,
+                    mouse_delta_pointer_tap_healthy,
+                ) {
+                    error!("macOS mouse delta capture stopped: {err:#}");
+                }
             }
         });
     }
@@ -1486,6 +1524,10 @@ mod tests {
             pointer_lock_active: Arc::new(AtomicBool::new(false)),
             pointer_hidden: Arc::new(AtomicBool::new(false)),
             pinned_pointer_pos: Arc::new(Mutex::new(None)),
+            pointer_lock_recovery_running: Arc::new(AtomicBool::new(false)),
+            pointer_lock_recovery_target: Arc::new(AtomicU8::new(ActiveTarget::Local.to_u8())),
+            pointer_lock_recovery_generation: Arc::new(AtomicU64::new(0)),
+            pointer_tap_healthy: Arc::new(AtomicBool::new(false)),
             remotes: Arc::new(tokio::sync::RwLock::new(HashMap::from([(
                 side,
                 RemotePeer {
