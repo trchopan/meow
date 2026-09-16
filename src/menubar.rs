@@ -552,6 +552,10 @@ fn host_permission_message(permissions: &macos_permissions::PermissionStatus) ->
     )
 }
 
+fn profile_save_command() -> MenuCommand {
+    MenuCommand::StartClient
+}
+
 fn host_status_label(snapshot: &MenuSnapshot) -> String {
     match snapshot.host.state {
         HostMenuState::Stopped => "This Mac - Host: Stopped".to_string(),
@@ -639,6 +643,11 @@ mod tests {
             "operation failed without exposing credentials"
         );
         assert_eq!(safe_message("host is unavailable"), "host is unavailable");
+    }
+
+    #[test]
+    fn saving_a_client_profile_starts_client_connection() {
+        assert!(matches!(profile_save_command(), MenuCommand::StartClient));
     }
 }
 
@@ -964,6 +973,9 @@ mod ui {
             EDIT_PROFILE_ID => {
                 if let Some(profile) = edit_profile(load_client_profile()?)? {
                     write_client_profile(&profile)?;
+                    return command_tx
+                        .try_send(super::profile_save_command())
+                        .map_err(|_| anyhow!("menu supervisor is unavailable"));
                 }
                 Some(MenuCommand::Refresh)
             }
@@ -971,6 +983,9 @@ mod ui {
                 let imported = parse_invitation(&clipboard::read_text()?)?;
                 if let Some(profile) = edit_profile(Some(imported))? {
                     write_client_profile(&profile)?;
+                    return command_tx
+                        .try_send(super::profile_save_command())
+                        .map_err(|_| anyhow!("menu supervisor is unavailable"));
                 }
                 Some(MenuCommand::Refresh)
             }
@@ -1041,12 +1056,13 @@ mod ui {
         let alert: id = msg_send![alert, init];
         let title = NSString::alloc(nil).init_str("Client Profile");
         let info = NSString::alloc(nil).init_str(
-            "Enter a host ID and attach secret. Paste Invitation imports the canonical attach command.",
+            "Enter a host ID and attach secret. Saving starts the client connection. Paste Invitation imports the canonical attach command.",
         );
         let _: () = msg_send![alert, setMessageText:title];
         let _: () = msg_send![alert, setInformativeText:info];
         let _: () = msg_send![alert, setAccessoryView:view];
-        let _: id = msg_send![alert, addButtonWithTitle:NSString::alloc(nil).init_str("Save")];
+        let _: id =
+            msg_send![alert, addButtonWithTitle:NSString::alloc(nil).init_str("Save & Connect")];
         let _: id = msg_send![alert, addButtonWithTitle:NSString::alloc(nil).init_str("Cancel")];
         let response: i64 = msg_send![alert, runModal];
         if response != 1000 {

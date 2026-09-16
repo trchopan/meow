@@ -56,6 +56,9 @@ are stored in `~/.local/share/meow/client_profile.json` with protected file perm
 The menu never displays the client secret, but copying an invitation can expose it to
 clipboard managers and other local applications.
 
+Saving a client profile or importing an invitation starts the client connection
+automatically. Use `Stop Client` to stop it or `Reconnect Client` after a disconnect.
+
 Grant Accessibility and, for Host mode, Input Monitoring to `Meow.app` in System
 Settings. The menu provides `Open System Settings` and `Check Permissions` actions
 and reports the permission target when permissions are missing. The initial app bundle
