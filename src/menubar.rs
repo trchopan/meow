@@ -667,7 +667,7 @@ mod ui {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod ui {
-    use std::{ffi::CStr, thread, time::Duration};
+    use std::{ffi::CStr, io::Cursor, thread, time::Duration};
 
     use anyhow::{Context, Result, anyhow};
     use cocoa::{
@@ -680,7 +680,7 @@ mod ui {
     use objc::{class, msg_send, sel, sel_impl};
     use tokio::runtime::Runtime;
     use tray_icon::{
-        TrayIconBuilder,
+        Icon, TrayIconBuilder,
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     };
 
@@ -714,6 +714,7 @@ mod ui {
     const CHECK_PERMISSIONS_ID: &str = "check_permissions";
     const REFRESH_ID: &str = "refresh";
     const QUIT_ID: &str = "quit";
+    const MENU_BAR_ICON_PNG: &[u8] = include_bytes!("../resources/macos/meow-menu-bar.png");
 
     struct MenuItems {
         host_status: MenuItem,
@@ -754,9 +755,11 @@ mod ui {
 
             run_onboarding(&command_tx)?;
             let (menu, items) = build_menu()?;
+            let icon = menu_bar_icon()?;
             let _tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu.clone()))
-                .with_title("Meow")
+                .with_icon(icon)
+                .with_icon_as_template(true)
                 .with_tooltip("Meow keyboard and mouse sharing")
                 .build()
                 .context("failed to create macOS menu bar item")?;
@@ -781,6 +784,30 @@ mod ui {
             let _ = supervisor_thread.join();
             Ok(())
         }
+    }
+
+    fn menu_bar_icon() -> Result<Icon> {
+        let decoder = png::Decoder::new(Cursor::new(MENU_BAR_ICON_PNG));
+        let mut reader = decoder
+            .read_info()
+            .context("failed to read the Meow menu bar icon")?;
+        let buffer_size = reader
+            .output_buffer_size()
+            .ok_or_else(|| anyhow!("Meow menu bar icon output is too large"))?;
+        let mut rgba = vec![0; buffer_size];
+        let output = reader
+            .next_frame(&mut rgba)
+            .context("failed to decode the Meow menu bar icon")?;
+        if output.color_type != png::ColorType::Rgba || output.bit_depth != png::BitDepth::Eight {
+            return Err(anyhow!(
+                "Meow menu bar icon must decode to 8-bit RGBA, got {:?} {:?}",
+                output.color_type,
+                output.bit_depth
+            ));
+        }
+        rgba.truncate(output.buffer_size());
+        Icon::from_rgba(rgba, output.width, output.height)
+            .context("failed to create the Meow menu bar icon")
     }
 
     fn build_menu() -> Result<(Menu, MenuItems)> {

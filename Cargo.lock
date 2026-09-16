@@ -2752,6 +2752,7 @@ dependencies = [
  "iroh-blobs",
  "libc",
  "objc",
+ "png",
  "rand 0.8.7",
  "rdev",
  "serde",
