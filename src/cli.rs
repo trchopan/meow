@@ -48,6 +48,10 @@ pub(crate) enum Command {
     PointerMode(PointerModeArgs),
     Status,
     Stop,
+    Doctor(DoctorArgs),
+    Diagnose(DiagnoseArgs),
+    Logs(LogsArgs),
+    Monitor(MonitorArgs),
     Receive(ReceiveArgs),
 }
 
@@ -147,5 +151,34 @@ pub(crate) struct OverlayUiArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct ProbePointerLockArgs {
     #[arg(long, default_value_t = 10)]
+    pub(crate) duration_secs: u64,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DoctorArgs {
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+    #[arg(long, default_value_t = false)]
+    pub(crate) markdown: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DiagnoseArgs {
+    /// Reveal the diagnostic bundle in macOS Finder.
+    #[arg(long, default_value_t = false)]
+    pub(crate) open: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct LogsArgs {
+    #[arg(long, default_value_t = 50)]
+    pub(crate) lines: usize,
+    #[arg(long, default_value_t = false)]
+    pub(crate) follow: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct MonitorArgs {
+    #[arg(long, default_value_t = 0)]
     pub(crate) duration_secs: u64,
 }

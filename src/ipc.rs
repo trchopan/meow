@@ -31,7 +31,7 @@ pub(crate) struct IpcResponse {
     pub(crate) status: Option<StatusPayload>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StatusPayload {
     pub(crate) endpoint_id: String,
     #[serde(default)]

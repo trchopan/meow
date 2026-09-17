@@ -69,6 +69,26 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
     Ok(dir.join("meow.sock"))
 }
 
+pub fn logs_dir() -> Result<PathBuf> {
+    let dir = app_data_dir()?.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn log_file_path() -> Result<PathBuf> {
+    Ok(logs_dir()?.join("meow.log"))
+}
+
+pub fn crash_log_path() -> Result<PathBuf> {
+    Ok(logs_dir()?.join("crash.log"))
+}
+
+pub fn diagnostics_dir() -> Result<PathBuf> {
+    let dir = app_data_dir()?.join("diagnostics");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub(crate) fn client_identity_path() -> Result<PathBuf> {
     Ok(app_data_dir()?.join("client.id"))
 }

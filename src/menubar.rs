@@ -712,6 +712,11 @@ mod ui {
     const IMPORT_INVITATION_ID: &str = "import_invitation";
     const OPEN_SETTINGS_ID: &str = "open_settings";
     const CHECK_PERMISSIONS_ID: &str = "check_permissions";
+    const RUN_DOCTOR_ID: &str = "run_doctor";
+    const OPEN_LOGS_ID: &str = "open_logs";
+    const EXPORT_DIAGNOSTICS_ID: &str = "export_diagnostics";
+    const RESET_PERMISSIONS_ID: &str = "reset_permissions";
+    const REPORT_ISSUE_ID: &str = "report_issue";
     const REFRESH_ID: &str = "refresh";
     const QUIT_ID: &str = "quit";
     const MENU_BAR_ICON_PNG: &[u8] = include_bytes!("../resources/macos/meow-menu-bar.png");
@@ -867,10 +872,35 @@ mod ui {
         let open_settings = MenuItem::with_id(OPEN_SETTINGS_ID, "Open System Settings", true, None);
         let check_permissions =
             MenuItem::with_id(CHECK_PERMISSIONS_ID, "Check Permissions", true, None);
+
+        let troubleshooting = Submenu::with_id("troubleshooting", "Troubleshooting", true);
+        let run_doctor = MenuItem::with_id(RUN_DOCTOR_ID, "Run Self-Check (Doctor)...", true, None);
+        let open_logs = MenuItem::with_id(OPEN_LOGS_ID, "Open Logs Folder", true, None);
+        let export_diag = MenuItem::with_id(
+            EXPORT_DIAGNOSTICS_ID,
+            "Export Diagnostic Bundle...",
+            true,
+            None,
+        );
+        let reset_perms = MenuItem::with_id(
+            RESET_PERMISSIONS_ID,
+            "Reset Permissions Help...",
+            true,
+            None,
+        );
+        let report_issue =
+            MenuItem::with_id(REPORT_ISSUE_ID, "Report Issue on GitHub...", true, None);
+        troubleshooting.append(&run_doctor)?;
+        troubleshooting.append(&open_logs)?;
+        troubleshooting.append(&export_diag)?;
+        troubleshooting.append(&reset_perms)?;
+        troubleshooting.append(&report_issue)?;
+
         let refresh = MenuItem::with_id(REFRESH_ID, "Refresh Status", true, None);
         let quit = MenuItem::with_id(QUIT_ID, "Quit Menu Bar App", true, None);
         menu.append(&open_settings)?;
         menu.append(&check_permissions)?;
+        menu.append(&troubleshooting)?;
         menu.append(&refresh)?;
         menu.append(&error)?;
         menu.append(&quit)?;
@@ -996,6 +1026,53 @@ mod ui {
             CHECK_PERMISSIONS_ID => {
                 show_permissions();
                 Some(MenuCommand::Refresh)
+            }
+            RUN_DOCTOR_ID => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let report = rt.block_on(crate::doctor::run_doctor_checks());
+                let summary = crate::doctor::format_doctor_terminal(&report);
+                simple_alert("Meow Self-Check (Doctor)", &summary, &["OK"]);
+                None
+            }
+            OPEN_LOGS_ID => {
+                let log_dir = crate::state::logs_dir()?;
+                let _ = crate::diagnostics::open_in_finder(&log_dir);
+                None
+            }
+            EXPORT_DIAGNOSTICS_ID => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let zip_path = rt.block_on(crate::diagnostics::export_diagnostic_bundle())?;
+                let report = rt.block_on(crate::doctor::run_doctor_checks());
+                let body = crate::diagnostics::generate_github_issue_body(&report, &zip_path);
+                let _ = clipboard::write_text(&body);
+                let _ = crate::diagnostics::open_in_finder(&zip_path);
+                simple_alert(
+                    "Diagnostics Bundle Exported",
+                    &format!(
+                        "A diagnostic bundle was exported to:\n{}\n\nA sanitized issue report has been copied to your clipboard.\nYou can paste it directly into a new GitHub issue.",
+                        zip_path.display()
+                    ),
+                    &["OK"],
+                );
+                None
+            }
+            RESET_PERMISSIONS_ID => {
+                simple_alert(
+                    "Reset macOS Permissions",
+                    "If macOS permissions are desynced (e.g. after recompiling), run these commands in Terminal:\n\n  tccutil reset Accessibility com.meow.inputsharing\n  tccutil reset ListenEvent com.meow.inputsharing\n\nThen relaunch Meow.",
+                    &["OK"],
+                );
+                None
+            }
+            REPORT_ISSUE_ID => {
+                let _ = std::process::Command::new("/usr/bin/open")
+                    .arg("https://github.com/trchopan/meow/issues/new")
+                    .status();
+                None
             }
             EDIT_PROFILE_ID => {
                 if let Some(profile) = edit_profile(load_client_profile()?)? {

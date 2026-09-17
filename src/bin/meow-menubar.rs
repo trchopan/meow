@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    let _ = meow::logging::init_logging("menubar", true);
+    meow::logging::install_panic_hook(true);
     meow::menubar::run()
 }
 
