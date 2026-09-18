@@ -67,17 +67,6 @@ impl HostRunOptions {
             handle_ctrl_c: true,
         }
     }
-
-    pub(crate) const fn menu() -> Self {
-        Self {
-            print_ready: false,
-            handle_ctrl_c: false,
-        }
-    }
-}
-
-pub(crate) async fn run_host_in_process(args: HostArgs) -> Result<()> {
-    run_host_with_options(args, HostRunOptions::menu()).await
 }
 
 async fn run_host_with_options(args: HostArgs, options: HostRunOptions) -> Result<()> {

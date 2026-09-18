@@ -50,17 +50,6 @@ impl AttachRunOptions {
             handle_ctrl_c: true,
         }
     }
-
-    pub(crate) const fn menu() -> Self {
-        Self {
-            print_connected: false,
-            handle_ctrl_c: false,
-        }
-    }
-}
-
-pub(crate) async fn run_attach_profile_in_process(path: PathBuf) -> Result<()> {
-    run_attach_profile_with_options(path, AttachRunOptions::menu()).await
 }
 
 async fn run_attach_profile_with_options(path: PathBuf, options: AttachRunOptions) -> Result<()> {

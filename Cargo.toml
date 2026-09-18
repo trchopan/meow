@@ -14,7 +14,7 @@ iroh = "1.0.3"
 iroh-blobs = "0.103"
 libc = "0.2"
 rand = "0.8"
-rdev = { git = "https://github.com/LuisJann/rdev", rev = "4d3d2d9d3b1bda08d711fc52c1dc2010c1b2e041", features = ["serialize", "unstable_grab", "macos_physical_key_events"] }
+rdev = { version = "0.5", features = ["serialize", "unstable_grab"] }
 enigo = "0.1"
 core-graphics = "0.23"
 core-foundation = "0.9"

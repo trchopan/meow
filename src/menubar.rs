@@ -1,16 +1,14 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
-use tokio::{sync::mpsc, task::JoinHandle};
+use anyhow::{Context, Result, anyhow, bail};
+use tokio::{process::Child, sync::mpsc};
 
 use crate::{
-    attach,
-    cli::HostArgs,
     client_ipc::{
         ClientLifecycleState, ClientStatusPayload, load_persisted_status,
         request_status as request_client_status, request_stop as request_client_stop,
     },
-    clipboard, host,
+    clipboard,
     input::{DEFAULT_EDGE_DWELL_MS, DEFAULT_EDGE_ZONE_PX},
     ipc::{AttachedPeerStatus, IpcCommand, StatusPayload, request_ipc},
     macos_permissions,
@@ -83,8 +81,8 @@ pub(crate) enum MenuCommand {
 }
 
 pub(crate) struct MenuSupervisor {
-    host_task: Option<JoinHandle<Result<()>>>,
-    client_task: Option<JoinHandle<Result<()>>>,
+    host_child: Option<Child>,
+    client_child: Option<Child>,
     last_error: Option<String>,
     notice: Option<String>,
 }
@@ -92,15 +90,15 @@ pub(crate) struct MenuSupervisor {
 impl MenuSupervisor {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            host_task: None,
-            client_task: None,
+            host_child: None,
+            client_child: None,
             last_error: None,
             notice: None,
         })
     }
 
     pub(crate) async fn refresh(&mut self) -> MenuSnapshot {
-        self.reap_tasks().await;
+        self.reap_children().await;
         let host = self.refresh_host().await;
         let client = self.refresh_client().await;
         let credentials_available = load_existing_host_credentials().ok().flatten().is_some();
@@ -163,7 +161,7 @@ impl MenuSupervisor {
     async fn shutdown(&mut self) {
         let _ = self.ensure_client_stopped().await;
         let _ = self.stop_host().await;
-        self.abort_unfinished_tasks();
+        self.kill_children().await;
     }
 
     async fn refresh_host(&mut self) -> HostMenuStatus {
@@ -188,7 +186,7 @@ impl MenuSupervisor {
                 message: Some(safe_message(&response.message)),
             },
             Err(_) => {
-                if self.host_task.is_some() {
+                if self.host_child.is_some() {
                     return HostMenuStatus {
                         state: HostMenuState::Starting,
                         endpoint_id: None,
@@ -265,11 +263,11 @@ impl MenuSupervisor {
                             | ClientLifecycleState::WaitingForHost
                             | ClientLifecycleState::Authenticating
                             | ClientLifecycleState::Stopping
-                    ) || self.client_task.is_some())
+                    ) || self.client_child.is_some())
                 {
                     return client_status_from_payload(status);
                 }
-                if self.client_task.is_some() {
+                if self.client_child.is_some() {
                     return ClientMenuStatus {
                         state: ClientMenuState::Starting,
                         message: Some("starting client attachment".to_string()),
@@ -304,17 +302,25 @@ impl MenuSupervisor {
         {
             return Ok(());
         }
-        if self.host_task.is_some() {
+        if self.host_child.is_some() {
             bail!("host is already starting");
         }
         let permissions = macos_permissions::check_host_permissions();
         if !permissions.accessibility || !permissions.input_monitoring {
             bail!(host_permission_message(&permissions));
         }
-        self.host_task = Some(tokio::spawn(host::run_host_in_process(HostArgs {
-            edge_zone_px: DEFAULT_EDGE_ZONE_PX,
-            edge_dwell_ms: DEFAULT_EDGE_DWELL_MS,
-        })));
+        let meow_bin = resolve_daemon_executable()?;
+        let mut cmd = tokio::process::Command::new(meow_bin);
+        cmd.arg("host")
+            .arg("--edge-zone-px")
+            .arg(DEFAULT_EDGE_ZONE_PX.to_string())
+            .arg("--edge-dwell-ms")
+            .arg(DEFAULT_EDGE_DWELL_MS.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        let child = cmd.spawn().context("failed to spawn host daemon")?;
+        self.host_child = Some(child);
         let ready = wait_until(Duration::from_secs(5), || async {
             request_ipc(IpcCommand::Status)
                 .await
@@ -322,7 +328,7 @@ impl MenuSupervisor {
         })
         .await;
         if !ready {
-            self.reap_tasks().await;
+            self.reap_children().await;
             bail!("host daemon did not become ready within 5 seconds");
         }
         Ok(())
@@ -342,7 +348,7 @@ impl MenuSupervisor {
         if !stopped {
             bail!("host shutdown was not confirmed");
         }
-        self.await_host_task(Duration::from_secs(5)).await?;
+        self.await_host_child(Duration::from_secs(5)).await?;
         Ok(())
     }
 
@@ -356,16 +362,22 @@ impl MenuSupervisor {
         {
             return Ok(());
         }
-        if self.client_task.is_some() {
+        if self.client_child.is_some() {
             bail!("client is already starting");
         }
         if !macos_permissions::check_client_permissions().accessibility {
             bail!("client Accessibility permission is missing");
         }
         let profile_path = crate::state::client_profile_path()?;
-        self.client_task = Some(tokio::task::spawn_local(
-            attach::run_attach_profile_in_process(profile_path),
-        ));
+        let meow_bin = resolve_daemon_executable()?;
+        let mut cmd = tokio::process::Command::new(meow_bin);
+        cmd.arg("attach-profile")
+            .arg(profile_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        let child = cmd.spawn().context("failed to spawn client daemon")?;
+        self.client_child = Some(child);
         let socket = crate::state::client_socket_path(&profile.host_id, profile.side)?;
         let ready = wait_until(Duration::from_secs(5), || {
             let socket = socket.clone();
@@ -373,7 +385,7 @@ impl MenuSupervisor {
         })
         .await;
         if !ready {
-            self.reap_tasks().await;
+            self.reap_children().await;
             bail!("client attachment did not become ready within 5 seconds");
         }
         Ok(())
@@ -399,7 +411,7 @@ impl MenuSupervisor {
             }
         }
 
-        self.await_client_task(Duration::from_secs(5)).await?;
+        self.await_client_child(Duration::from_secs(5)).await?;
         Ok(())
     }
 
@@ -413,57 +425,98 @@ impl MenuSupervisor {
         Ok(())
     }
 
-    async fn reap_tasks(&mut self) {
-        if self.host_task.as_ref().is_some_and(JoinHandle::is_finished) {
-            let task = self.host_task.take().expect("host task was present");
-            if let Ok(Err(err)) = task.await {
-                self.last_error = Some(safe_error(&err));
-            }
-        }
-        if self
-            .client_task
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
+    async fn reap_children(&mut self) {
+        if let Some(child) = self.host_child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
         {
-            let task = self.client_task.take().expect("client task was present");
-            if let Ok(Err(err)) = task.await {
-                self.last_error = Some(safe_error(&err));
+            self.host_child = None;
+            if !status.success() {
+                self.last_error = Some(format!("host daemon exited unexpectedly: {status}"));
+            }
+        }
+        if let Some(child) = self.client_child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.client_child = None;
+            if !status.success() {
+                self.last_error = Some(format!("client daemon exited unexpectedly: {status}"));
             }
         }
     }
 
-    async fn await_host_task(&mut self, timeout: Duration) -> Result<()> {
-        let Some(task) = self.host_task.take() else {
+    async fn await_host_child(&mut self, timeout: Duration) -> Result<()> {
+        let Some(mut child) = self.host_child.take() else {
             return Ok(());
         };
-        match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(err),
-            Ok(Err(err)) => Err(anyhow!("host runtime task failed: {err}")),
-            Err(_) => bail!("host cleanup was not confirmed"),
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(anyhow!("host daemon wait failed: {err}")),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                bail!("host cleanup was not confirmed (process killed)");
+            }
         }
     }
 
-    async fn await_client_task(&mut self, timeout: Duration) -> Result<()> {
-        let Some(task) = self.client_task.take() else {
+    async fn await_client_child(&mut self, timeout: Duration) -> Result<()> {
+        let Some(mut child) = self.client_child.take() else {
             return Ok(());
         };
-        match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(err),
-            Ok(Err(err)) => Err(anyhow!("client runtime task failed: {err}")),
-            Err(_) => bail!("client cleanup was not confirmed"),
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(anyhow!("client daemon wait failed: {err}")),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                bail!("client cleanup was not confirmed (process killed)");
+            }
         }
     }
 
-    fn abort_unfinished_tasks(&mut self) {
-        if let Some(task) = self.host_task.take() {
-            task.abort();
+    async fn kill_children(&mut self) {
+        if let Some(mut child) = self.host_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
-        if let Some(task) = self.client_task.take() {
-            task.abort();
+        if let Some(mut child) = self.client_child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
     }
+}
+
+fn resolve_daemon_executable() -> Result<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("MEOW_BIN").map(std::path::PathBuf::from)
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let sibling = parent.join("meow");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    if let Ok(output) = std::process::Command::new("/usr/bin/which")
+        .arg("meow")
+        .output()
+        && output.status.success()
+    {
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path_str.is_empty() {
+            let p = std::path::PathBuf::from(path_str);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+    bail!(
+        "could not locate the `meow` daemon executable (searched sibling of {:?} and PATH)",
+        std::env::current_exe().ok()
+    )
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut condition: F) -> bool
@@ -648,6 +701,15 @@ mod tests {
     #[test]
     fn saving_a_client_profile_starts_client_connection() {
         assert!(matches!(profile_save_command(), MenuCommand::StartClient));
+    }
+
+    #[test]
+    fn daemon_resolution_uses_env_override_when_set() {
+        let current = std::env::current_exe().expect("current exe");
+        unsafe { std::env::set_var("MEOW_BIN", &current) };
+        let resolved = resolve_daemon_executable().expect("resolved");
+        assert_eq!(resolved, current);
+        unsafe { std::env::remove_var("MEOW_BIN") };
     }
 }
 
